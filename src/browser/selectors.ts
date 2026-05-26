@@ -36,71 +36,78 @@ export interface SelectorSet {
   fileUpload: string[];
 }
 
+/**
+ * Verified against chatgpt.com as of April 27, 2026.
+ *
+ * OpenAI removed most data-message-* attributes and many data-testid
+ * values in their late-April 2026 UI rewrite. Assistant messages are
+ * now identified by `[data-message-author-role]` (if still present) OR
+ * by structural selectors inside <article> / the thread container.
+ * data-testid values that survived the rewrite are preferred; the rest
+ * are structural / aria fallbacks.
+ */
 export const SELECTORS: SelectorSet = {
   composer: [
     "#prompt-textarea",
     '[data-testid="prompt-textarea"]',
-    'textarea[placeholder*="Message"]',
-    'textarea[placeholder*="Envoyer"]',
+    'div[contenteditable="true"][id="prompt-textarea"]',
     'div[contenteditable="true"][data-virtualkeyboard="true"]',
+    'div[contenteditable="true"]',
   ],
   sendButton: [
     'button[data-testid="send-button"]',
     'button[data-testid="composer-send-button"]',
-    'button:has(svg[data-testid="send-button"])',
+    'button[aria-label="Send prompt"]',
     'button[aria-label*="Send"]',
     'button[aria-label*="Envoyer"]',
   ],
   stopButton: [
     'button[data-testid="stop-button"]',
+    'button[aria-label="Stop streaming"]',
     'button[aria-label*="Stop"]',
     'button[aria-label*="Arrêter"]',
-    'button:has-text("Stop generating")',
   ],
   modelSwitcher: [
     'button[data-testid="model-switcher-dropdown-button"]',
-    'header button[aria-label*="Model selector"]',
-    'header button[aria-label*="Sélecteur"]',
-    'button[aria-haspopup="menu"]:has(svg)',
+    'button[aria-label="Model selector"]',
+    'button[aria-label*="Model selector"]',
+    'button[aria-label*="Sélecteur"]',
   ],
   webSearchToggle: [
-    // Current chatgpt.com (April 2026): web search is a menuitemradio
-    // inside the "+ Add files and more" composer popover. Has no
-    // aria-label, no data-testid — only the inner text.
     '[role="menuitemradio"]:has-text("Web search")',
     '[role="menuitemradio"]:has-text("Recherche web")',
     'div[role="menuitemradio"]:has-text("Web")',
-    // Older inline-toggle layouts (kept as fallback)
     'button[data-testid="composer-tool-web-search"]',
     'button[aria-label*="Search the web"]',
-    'button[aria-label*="Rechercher sur le web"]',
     'button[aria-label*="web search" i]',
   ],
   accountMenu: [
+    'button[data-testid="accounts-profile-button"]',
     'button[data-testid="profile-button"]',
     'button[data-testid="user-menu-button"]',
-    'header img[alt*="user"]',
     'nav button:has(img[alt])',
   ],
   assistantMessages: [
     'div[data-message-author-role="assistant"]',
     '[data-message-author-role="assistant"]',
-    'main article:has([data-message-author-role="assistant"])',
+    'article[data-testid^="conversation-turn-"] div[data-message-author-role="assistant"]',
+    // Late-April 2026 fallback: article children in the thread container
+    'article:nth-child(even)',
   ],
   anyMessages: [
     "div[data-message-author-role]",
     "[data-message-author-role]",
-    'div[data-testid^="conversation-turn"]',
-    "main article",
+    'article[data-testid^="conversation-turn-"]',
+    "article",
   ],
   assistantActionBar: [
-    'div[role="group"][aria-label*="Actions sur la"]',
-    'div[role="group"][aria-label*="Actions on"]',
     'div[role="group"][aria-label*="Actions"]',
+    '[data-testid="message-actions"]',
   ],
   assistantMarkdown: [
     "div.markdown",
-    '[data-message-author-role="assistant"] .markdown',
+    ".prose",
+    '[class*="markdown"]',
     '[data-message-author-role="assistant"]',
   ],
   conversationList: [
@@ -112,15 +119,16 @@ export const SELECTORS: SelectorSet = {
     '[data-testid^="history-item-"]',
     '[data-testid="conversation-item"]',
     'nav a[href^="/c/"]',
+    'nav li a[href^="/c/"]',
   ],
   newChatButton: [
     'button[data-testid="create-new-chat-button"]',
-    'button[data-testid="new-chat-button"]',
+    'a[data-testid="create-new-chat-button"]',
     'a[href="/"]:has(svg)',
   ],
   fileUpload: [
+    'input[type="file"][data-testid="upload-photos-input"]',
     'input[type="file"][data-testid="file-upload"]',
-    'input[type="file"][data-testid="file-upload-button"]',
     'input[type="file"]',
   ],
 };

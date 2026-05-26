@@ -25,11 +25,12 @@ export async function openConversation(
       timeout: 60_000,
     });
   } else if (opts.gizmoId) {
-    // Land on the project page; the next sendPrompt creates a conv
-    // inside it (the React app reads the gizmo from the URL and
-    // includes the right conversation_mode in the POST body).
+    // Navigate to the project's chat surface (NOT /project which is
+    // the overview page without a composer). The React app reads the
+    // gizmo from the URL and includes the right conversation_mode in
+    // the POST /backend-api/conversation body automatically.
     const slug = opts.gizmoShortUrl ?? opts.gizmoId;
-    const url = new URL(`https://chatgpt.com/g/${encodeURIComponent(slug)}/project`);
+    const url = new URL(`https://chatgpt.com/g/${encodeURIComponent(slug)}`);
     if (opts.model) url.searchParams.set("model", opts.model);
     await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
   } else {
