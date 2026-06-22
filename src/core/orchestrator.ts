@@ -258,7 +258,8 @@ async function attachImages(page: Page, paths: string[]): Promise<void> {
   await inputs.first().setInputFiles(paths).catch(() => {
     /* ignore: composer may not accept this batch */
   });
-  await page.waitForTimeout(750);
+  const settleMs = Number(process.env.CGPRO_UPLOAD_SETTLE_MS ?? 5_000);
+  await page.waitForTimeout(settleMs);
 }
 
 async function* teeEvents(

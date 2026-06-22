@@ -184,35 +184,43 @@ export async function sendPrompt(page: Page, prompt: string): Promise<number> {
     if (i > 0) await page.keyboard.press("Shift+Enter");
     await page.keyboard.type(lines[i], { delay: 4 });
   }
-  // Give React one paint to update the send-button enabled state.
-  await page.waitForTimeout(250);
-
   const priorAssistantCount = await page
     .locator(SELECTORS.assistantMessages.join(", "))
     .count()
     .catch(() => 0);
 
-  const send = await firstResolved(page, SELECTORS.sendButton);
+  const send = await waitForEnabledSendButton(page);
   let clicked = false;
   if (send) {
-    const disabled = await send
-      .getAttribute("disabled")
-      .catch(() => null);
-    const ariaDisabled = await send
-      .getAttribute("aria-disabled")
-      .catch(() => null);
-    if (disabled === null && ariaDisabled !== "true") {
-      await send.click({ timeout: 4_000 }).catch(() => {
-        /* fall through to Enter */
-      });
-      clicked = true;
-    }
+    await send.click({ timeout: 4_000 }).catch(() => {
+      /* fall through to Enter */
+    });
+    clicked = true;
   }
   if (!clicked) {
     // Fall back to pressing Enter while the composer has focus.
     await page.keyboard.press("Enter");
   }
   return priorAssistantCount;
+}
+
+async function waitForEnabledSendButton(page: Page): Promise<Locator | null> {
+  const timeoutMs = Number(process.env.CGPRO_SEND_READY_TIMEOUT_MS ?? 60_000);
+  const deadline = Date.now() + timeoutMs;
+  let last: Locator | null = null;
+  while (Date.now() < deadline) {
+    const send = await firstResolved(page, SELECTORS.sendButton);
+    if (send) {
+      last = send;
+      const disabled = await send.getAttribute("disabled").catch(() => null);
+      const ariaDisabled = await send.getAttribute("aria-disabled").catch(() => null);
+      if (disabled === null && ariaDisabled !== "true") {
+        return send;
+      }
+    }
+    await page.waitForTimeout(500);
+  }
+  return last;
 }
 
 /**
