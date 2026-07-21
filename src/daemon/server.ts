@@ -58,15 +58,31 @@ export class QueueWaitTimeoutError extends Error {
   }
 }
 
+export class QueueCancelledError extends Error {
+  constructor() {
+    super("queue wait cancelled by client disconnect");
+  }
+}
+
+interface WaitingEntry {
+  resolve: () => void;
+  timer: ReturnType<typeof setTimeout>;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+}
+
 /**
  * Bounded FIFO admission for the single browser lane: one ask runs at a
  * time, later arrivals queue in order behind it. A new arrival is rejected
  * outright once the *waiting* line (not counting the one in flight) hits
  * maxDepth; a waiter that sits past maxWaitMs is rejected with a timeout
- * instead of running forever.
+ * instead of running forever. An optional AbortSignal (wired to the
+ * client's socket by the caller) lets a still-queued waiter cancel out
+ * immediately on disconnect instead of holding its slot — and therefore
+ * `depth` — until the timeout or its eventual (wasted) turn (C-092 F1).
  */
 export class AskQueue {
-  private waiting: Array<{ resolve: () => void; timer: ReturnType<typeof setTimeout> }> = [];
+  private waiting: WaitingEntry[] = [];
   private active = false;
 
   constructor(
@@ -84,21 +100,27 @@ export class AskQueue {
     return this.active;
   }
 
-  acquire(): Promise<void> {
+  acquire(signal?: AbortSignal): Promise<void> {
     if (this.waiting.length >= this.maxDepth) {
       return Promise.reject(new QueueFullError(this.waiting.length));
     }
+    if (signal?.aborted) {
+      return Promise.reject(new QueueCancelledError());
+    }
     return new Promise<void>((resolve, reject) => {
-      const entry = {
+      const entry: WaitingEntry = {
         resolve,
         timer: setTimeout(() => {
-          const idx = this.waiting.indexOf(entry);
-          if (idx >= 0) {
-            this.waiting.splice(idx, 1);
-            reject(new QueueWaitTimeoutError());
-          }
+          if (this.removeWaiting(entry)) reject(new QueueWaitTimeoutError());
         }, this.maxWaitMs),
+        signal,
       };
+      if (signal) {
+        entry.onAbort = () => {
+          if (this.removeWaiting(entry)) reject(new QueueCancelledError());
+        };
+        signal.addEventListener("abort", entry.onAbort, { once: true });
+      }
       this.waiting.push(entry);
       this.pump();
     });
@@ -109,16 +131,29 @@ export class AskQueue {
     this.pump();
   }
 
+  /** Removes a still-waiting entry and clears its timer/listener. Returns
+   * false if it was already dequeued (active or resolved by pump). */
+  private removeWaiting(entry: WaitingEntry): boolean {
+    const idx = this.waiting.indexOf(entry);
+    if (idx < 0) return false;
+    this.waiting.splice(idx, 1);
+    clearTimeout(entry.timer);
+    if (entry.signal && entry.onAbort) entry.signal.removeEventListener("abort", entry.onAbort);
+    return true;
+  }
+
   private pump(): void {
     if (this.active || this.waiting.length === 0) return;
     const next = this.waiting.shift()!;
     clearTimeout(next.timer);
+    if (next.signal && next.onAbort) next.signal.removeEventListener("abort", next.onAbort);
     this.active = true;
     next.resolve();
   }
 }
 
-interface ServerState {
+// Exported for the HTTP-level integration test (C-092 P-026 r2).
+export interface ServerState {
   session: Session;
   token: string;
   startedAt: Date;
@@ -272,13 +307,24 @@ async function handleRequest(
   res.end(JSON.stringify({ error: "not_found" }));
 }
 
-async function handleAsk(
+// Exported for the HTTP-level integration test (C-092 P-026 r2 test-gap
+// concession) — not part of the public daemon API otherwise.
+export async function handleAsk(
   req: IncomingMessage,
   res: ServerResponse,
   state: ServerState,
 ): Promise<void> {
+  // Watch for the client disconnecting WHILE queued (before acquire()
+  // resolves) — nothing else observes req/res during that window, so a
+  // gone client used to hold its slot until dequeue or the maxWaitMs
+  // timer, corrupting queueDepth (C-092 F1). Only needed pre-acquire:
+  // once active, the existing res.on("close") below covers disconnects.
+  const disconnectController = new AbortController();
+  const onEarlyDisconnect = (): void => disconnectController.abort();
+  req.on("close", onEarlyDisconnect);
+  req.on("aborted", onEarlyDisconnect);
   try {
-    await state.queue.acquire();
+    await state.queue.acquire(disconnectController.signal);
   } catch (err) {
     if (err instanceof QueueFullError) {
       res.writeHead(429, { "Content-Type": "application/json" });
@@ -290,7 +336,14 @@ async function handleAsk(
       res.end(JSON.stringify({ error: "queue_wait_timeout" }));
       return;
     }
+    if (err instanceof QueueCancelledError) {
+      // Client is already gone — nothing left to write a response to.
+      return;
+    }
     throw err;
+  } finally {
+    req.off("close", onEarlyDisconnect);
+    req.off("aborted", onEarlyDisconnect);
   }
 
   try {
@@ -418,7 +471,10 @@ function makeLogger(): { info: (m: string) => void; error: (m: string) => void }
     }
   })();
   const write = (level: string, m: string): void => {
-    const line = `${new Date().toISOString()} [${level}] ${m}\n`;
+    // Lanes 1 and 2 share DAEMON_LOG (C-092 F6, advisory) — prefix each
+    // line with the daemon's own pid so interleaved lane output stays
+    // attributable without needing a per-lane log file.
+    const line = `${new Date().toISOString()} [pid=${process.pid}] [${level}] ${m}\n`;
     if (fd >= 0) {
       try {
         writeSync(fd, line);

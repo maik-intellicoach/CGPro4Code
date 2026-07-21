@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { AskQueue, QueueFullError, QueueWaitTimeoutError } from "../src/daemon/server.js";
+import { AskQueue, QueueCancelledError, QueueFullError, QueueWaitTimeoutError } from "../src/daemon/server.js";
 
 describe("AskQueue", () => {
   it("admits asks one at a time in arrival order", async () => {
@@ -68,5 +68,37 @@ describe("AskQueue", () => {
 
     queue.release();
     expect(queue.busy).toBe(false);
+  });
+
+  it("drops a queued waiter's slot when its abort signal fires, then admits the next in order (C-092 F1)", async () => {
+    const queue = new AskQueue(8, 60_000);
+    await queue.acquire(); // becomes active, occupying the one running slot
+
+    const controller1 = new AbortController();
+    const waiter1 = queue.acquire(controller1.signal);
+    const order: number[] = [];
+    const waiter2 = queue.acquire().then(() => order.push(2));
+
+    expect(queue.depth).toBe(2);
+
+    controller1.abort(); // simulates waiter1's client socket closing mid-queue
+    await expect(waiter1).rejects.toBeInstanceOf(QueueCancelledError);
+
+    // depth drops immediately — no phantom entry held until the maxWaitMs timer.
+    expect(queue.depth).toBe(1);
+
+    queue.release();
+    await waiter2;
+    expect(order).toEqual([2]); // next waiter admitted in order, not skipped
+    expect(queue.depth).toBe(0);
+  });
+
+  it("rejects immediately with QueueCancelledError when the signal is already aborted", async () => {
+    const queue = new AskQueue(8, 60_000);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(queue.acquire(controller.signal)).rejects.toBeInstanceOf(QueueCancelledError);
+    expect(queue.depth).toBe(0);
   });
 });

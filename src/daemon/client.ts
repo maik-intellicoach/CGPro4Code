@@ -18,6 +18,28 @@ import {
 } from "./protocol.js";
 import type { AskOptions, AskResult, AskRunner } from "../core/orchestrator.js";
 
+// Bounded retry for HTTP 429 ("queue full") against the daemon's bounded
+// FIFO — small and capped so a persistently-full queue still fails
+// promptly instead of hanging the caller (C-092 F5).
+export interface RetryPolicy {
+  maxAttempts: number;
+  totalBudgetMs: number;
+  backoffMs: (attempt: number) => number;
+}
+
+// Injectable so tests can swap in a near-instant policy instead of
+// sleeping through real backoff delays; production callers get this
+// default via askViaDaemon's optional third parameter.
+export const DEFAULT_RETRY_POLICY: RetryPolicy = {
+  maxAttempts: 5,
+  totalBudgetMs: 60_000,
+  backoffMs: (attempt) => Math.min(2 ** attempt * 500, 15_000),
+};
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
 /**
  * Throw a clear error if the daemon owns the cgpro profile. Cold-start
  * commands (`status`, `models`, `doctor`, `adopt`, `login`, `logout`,
@@ -133,7 +155,16 @@ function jsonRequest<T>(
  * and exposes the same `AskRunner` shape as `runAsk` so callers can
  * stay agnostic.
  */
-export function askViaDaemon(info: DaemonInfo, opts: AskOptions): AskRunner {
+type AttemptOutcome =
+  | { kind: "success"; result: AskResult }
+  | { kind: "retry"; message: string }
+  | { kind: "fatal"; error: Error };
+
+export function askViaDaemon(
+  info: DaemonInfo,
+  opts: AskOptions,
+  retryPolicy: RetryPolicy = DEFAULT_RETRY_POLICY,
+): AskRunner {
   const emitter = new StreamEmitter();
   const collected: StreamEvent[] = [];
   let summary: AskSummary | null = null;
@@ -149,77 +180,107 @@ export function askViaDaemon(info: DaemonInfo, opts: AskOptions): AskRunner {
   };
   const payload = JSON.stringify(askBody);
 
-  const result: Promise<AskResult> = new Promise((resolve, reject) => {
-    httpReq = request(
-      {
-        hostname: "127.0.0.1",
-        port: info.port,
-        path: "/ask",
-        method: "POST",
-        // Generous read window: GPT-5.5 Pro can think for many minutes.
-        timeout: Math.max(60_000, (opts.timeoutSec + 30) * 1_000),
-        headers: {
-          Authorization: `Bearer ${info.token}`,
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-          Accept: "text/event-stream",
+  function attemptOnce(): Promise<AttemptOutcome> {
+    return new Promise((resolve) => {
+      httpReq = request(
+        {
+          hostname: "127.0.0.1",
+          port: info.port,
+          path: "/ask",
+          method: "POST",
+          // Generous read window: GPT-5.5 Pro can think for many minutes.
+          timeout: Math.max(60_000, (opts.timeoutSec + 30) * 1_000),
+          headers: {
+            Authorization: `Bearer ${info.token}`,
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(payload),
+            Accept: "text/event-stream",
+          },
         },
-      },
-      (res) => {
-        if ((res.statusCode ?? 0) === 409) {
-          emitter.push({ type: "error", message: "daemon is busy with another turn" });
-          res.resume();
-          resolve({ conversationId: null, finalText: "", events: collected });
-          return;
-        }
-        if ((res.statusCode ?? 0) >= 400) {
-          let buf = "";
-          res.setEncoding("utf-8");
-          res.on("data", (c) => (buf += c));
-          res.on("end", () => {
-            const msg = buf.length > 0 ? buf : `daemon returned ${res.statusCode}`;
-            emitter.push({ type: "error", message: msg });
-            resolve({ conversationId: null, finalText: "", events: collected });
-          });
-          return;
-        }
-        consumeSseStream(res, (event, data) => {
-          if (event === "summary") {
-            summary = data as AskSummary;
+        (res) => {
+          const status = res.statusCode ?? 0;
+          if (status === 429) {
+            res.resume();
+            resolve({ kind: "retry", message: "daemon queue is full" });
             return;
           }
-          // The server emits the same event names as our StreamEvent union.
-          // Validate the type before pushing.
-          const ev = data as StreamEvent;
-          if (ev && typeof ev.type === "string") {
-            emitter.push(ev);
+          if (status === 504) {
+            res.resume();
+            resolve({ kind: "fatal", error: new Error("daemon queue wait timed out") });
+            return;
           }
-        }).then(() => {
-          const finalText = summary?.finalText ?? extractFinalText(collected);
-          const conversationId = summary?.conversationId ?? null;
-          if (!emitter.isFinished()) {
-            emitter.push({ type: "done", finalText });
+          if (status === 409) {
+            // Dead branch against the current server (never returns 409 —
+            // see AskQueue in daemon/server.ts), kept only so an old
+            // still-running daemon gets a graceful message instead of
+            // falling into the generic >=400 body-read branch below.
+            res.resume();
+            resolve({ kind: "fatal", error: new Error("daemon is busy with another turn") });
+            return;
           }
-          resolve({ conversationId, finalText, events: collected });
-        }).catch((err) => {
-          emitter.push({ type: "error", message: (err as Error).message });
-          reject(err);
-        });
-      },
-    );
-    httpReq.on("error", (err) => {
-      emitter.push({ type: "error", message: (err as Error).message });
-      reject(err);
+          if (status >= 400) {
+            let buf = "";
+            res.setEncoding("utf-8");
+            res.on("data", (c) => (buf += c));
+            res.on("end", () => {
+              const msg = buf.length > 0 ? buf : `daemon returned ${status}`;
+              resolve({ kind: "fatal", error: new Error(msg) });
+            });
+            return;
+          }
+          consumeSseStream(res, (event, data) => {
+            if (event === "summary") {
+              summary = data as AskSummary;
+              return;
+            }
+            // The server emits the same event names as our StreamEvent union.
+            // Validate the type before pushing.
+            const ev = data as StreamEvent;
+            if (ev && typeof ev.type === "string") {
+              emitter.push(ev);
+            }
+          }).then(() => {
+            const finalText = summary?.finalText ?? extractFinalText(collected);
+            const conversationId = summary?.conversationId ?? null;
+            if (!emitter.isFinished()) {
+              emitter.push({ type: "done", finalText });
+            }
+            resolve({ kind: "success", result: { conversationId, finalText, events: collected } });
+          }).catch((err) => {
+            resolve({ kind: "fatal", error: err as Error });
+          });
+        },
+      );
+      httpReq.on("error", (err) => resolve({ kind: "fatal", error: err as Error }));
+      httpReq.on("timeout", () => {
+        httpReq?.destroy();
+        resolve({ kind: "fatal", error: new Error("daemon request timed out") });
+      });
+      httpReq.write(payload);
+      httpReq.end();
     });
-    httpReq.on("timeout", () => {
-      httpReq?.destroy();
-      const err = new Error("daemon request timed out");
-      emitter.push({ type: "error", message: err.message });
-      reject(err);
-    });
-    httpReq.write(payload);
-    httpReq.end();
-  });
+  }
+
+  const result: Promise<AskResult> = (async () => {
+    const deadline = Date.now() + retryPolicy.totalBudgetMs;
+    for (let attempt = 1; attempt <= retryPolicy.maxAttempts; attempt++) {
+      const outcome = await attemptOnce();
+      if (outcome.kind === "success") return outcome.result;
+      if (outcome.kind === "fatal") {
+        emitter.push({ type: "error", message: outcome.error.message });
+        return { conversationId: null, finalText: "", events: collected };
+      }
+      const remaining = deadline - Date.now();
+      if (attempt === retryPolicy.maxAttempts || remaining <= 0) {
+        emitter.push({ type: "error", message: `${outcome.message} — giving up after ${attempt} attempt(s)` });
+        return { conversationId: null, finalText: "", events: collected };
+      }
+      await sleep(Math.min(retryPolicy.backoffMs(attempt), remaining));
+    }
+    // Unreachable (loop always returns), kept for TS control-flow analysis.
+    emitter.push({ type: "error", message: "daemon queue is full" });
+    return { conversationId: null, finalText: "", events: collected };
+  })();
 
   return {
     events: teeEvents(emitter, collected),
