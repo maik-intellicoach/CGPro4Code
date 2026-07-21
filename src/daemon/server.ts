@@ -11,7 +11,9 @@
  *   3. On `listen`, we write daemon.json (pid, port, token) so clients
  *      can find us. We accept Bearer-token auth on every protected route.
  *   4. POST /ask → text/event-stream of {delta,thinking,tool,done,error}.
- *      One ask in flight at a time; concurrent calls get 409 Busy.
+ *      One ask in flight at a time; concurrent calls queue FIFO behind it
+ *      (bounded depth + wait, C-092 / C-073 ADR003 p5). No parallel browser
+ *      use — same single Chrome profile, one turn at a time.
  *   5. POST /shutdown closes the browser, deletes daemon.json, exits.
  *
  * Failure model
@@ -41,13 +43,88 @@ import {
 
 const log = makeLogger();
 
+const QUEUE_MAX = Math.max(1, Number(process.env.CGPRO_DAEMON_QUEUE_MAX) || 8);
+const QUEUE_MAX_WAIT_MS = Math.max(1, Number(process.env.CGPRO_DAEMON_QUEUE_MAX_WAIT_MS) || 7_200_000);
+
+export class QueueFullError extends Error {
+  constructor(public readonly depth: number) {
+    super(`queue full at depth ${depth}`);
+  }
+}
+
+export class QueueWaitTimeoutError extends Error {
+  constructor() {
+    super("queue wait timed out");
+  }
+}
+
+/**
+ * Bounded FIFO admission for the single browser lane: one ask runs at a
+ * time, later arrivals queue in order behind it. A new arrival is rejected
+ * outright once the *waiting* line (not counting the one in flight) hits
+ * maxDepth; a waiter that sits past maxWaitMs is rejected with a timeout
+ * instead of running forever.
+ */
+export class AskQueue {
+  private waiting: Array<{ resolve: () => void; timer: ReturnType<typeof setTimeout> }> = [];
+  private active = false;
+
+  constructor(
+    private readonly maxDepth: number,
+    private readonly maxWaitMs: number,
+  ) {}
+
+  /** Requests currently waiting (excludes the one in flight, if any). */
+  get depth(): number {
+    return this.waiting.length;
+  }
+
+  /** True while an ask is running against the browser. */
+  get busy(): boolean {
+    return this.active;
+  }
+
+  acquire(): Promise<void> {
+    if (this.waiting.length >= this.maxDepth) {
+      return Promise.reject(new QueueFullError(this.waiting.length));
+    }
+    return new Promise<void>((resolve, reject) => {
+      const entry = {
+        resolve,
+        timer: setTimeout(() => {
+          const idx = this.waiting.indexOf(entry);
+          if (idx >= 0) {
+            this.waiting.splice(idx, 1);
+            reject(new QueueWaitTimeoutError());
+          }
+        }, this.maxWaitMs),
+      };
+      this.waiting.push(entry);
+      this.pump();
+    });
+  }
+
+  release(): void {
+    this.active = false;
+    this.pump();
+  }
+
+  private pump(): void {
+    if (this.active || this.waiting.length === 0) return;
+    const next = this.waiting.shift()!;
+    clearTimeout(next.timer);
+    this.active = true;
+    next.resolve();
+  }
+}
+
 interface ServerState {
   session: Session;
   token: string;
   startedAt: Date;
   background: boolean;
   profile?: string;
-  busy: boolean;
+  queue: AskQueue;
   currentConversation: string | null;
   lastConversation: string | null;
 }
@@ -85,7 +162,7 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
     startedAt: new Date(),
     background: opts.background ?? true,
     profile: opts.profile,
-    busy: false,
+    queue: new AskQueue(QUEUE_MAX, QUEUE_MAX_WAIT_MS),
     currentConversation: null,
     lastConversation: null,
   };
@@ -148,7 +225,7 @@ async function handleRequest(
   // "this port belongs to a cgpro daemon" before sending the token.
   if (method === "GET" && url.pathname === "/healthz") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ daemon: "cgpro", version: 1 }));
+    res.end(JSON.stringify({ daemon: "cgpro", version: 1, queueDepth: state.queue.depth }));
     return;
   }
 
@@ -165,7 +242,7 @@ async function handleRequest(
       uptimeSec: Math.round((Date.now() - state.startedAt.getTime()) / 1000),
       background: state.background,
       profile: state.profile,
-      busy: state.busy,
+      busy: state.queue.busy,
       currentConversation: state.currentConversation,
       lastConversation: state.lastConversation,
     };
@@ -200,12 +277,21 @@ async function handleAsk(
   res: ServerResponse,
   state: ServerState,
 ): Promise<void> {
-  if (state.busy) {
-    res.writeHead(409, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "busy" }));
-    return;
+  try {
+    await state.queue.acquire();
+  } catch (err) {
+    if (err instanceof QueueFullError) {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "queue_full", depth: err.depth }));
+      return;
+    }
+    if (err instanceof QueueWaitTimeoutError) {
+      res.writeHead(504, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "queue_wait_timeout" }));
+      return;
+    }
+    throw err;
   }
-  state.busy = true;
 
   try {
     const body = await readJsonBody<AskRequest>(req);
@@ -280,7 +366,7 @@ async function handleAsk(
       state.currentConversation = null;
     }
   } finally {
-    state.busy = false;
+    state.queue.release();
   }
 }
 
