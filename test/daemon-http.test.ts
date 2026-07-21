@@ -136,4 +136,59 @@ describe("handleAsk HTTP-level wiring", () => {
     expect(firstWriteOrder).toBeGreaterThan(writeHeadOrder);
     expect(fakeRes.writes.join("")).toContain("event: delta");
   });
+
+  it("drops queueDepth and writes nothing when a queued client closes before acquire() resolves, then admits the next waiter in order (C-092 P-026 r3 G3)", async () => {
+    const state = fakeState({ queue: new AskQueue(8, 60_000) });
+    await state.queue.acquire(); // occupy the running slot so both requests below queue
+
+    // Request A queues behind the running slot, then disconnects while
+    // still waiting — exercises the round-1 blocker wiring (server.ts
+    // req "close"/"aborted" -> disconnectController) that was previously
+    // correct but never regression-tested at the handleAsk HTTP level.
+    const reqA = new FakeReq() as unknown as IncomingMessage;
+    const resA = new FakeRes() as unknown as ServerResponse;
+    const pendingA = handleAsk(reqA, resA as unknown as ServerResponse, state);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(state.queue.depth).toBe(1);
+
+    // Request B queues behind A — still connected, must be admitted next.
+    const reqB = new FakeReq() as unknown as IncomingMessage;
+    const resB = new FakeRes() as unknown as ServerResponse;
+    Object.assign(reqB, { method: "POST" });
+    const pendingB = handleAsk(reqB, resB as unknown as ServerResponse, state);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(state.queue.depth).toBe(2);
+
+    (reqA as unknown as FakeReq).emit("close");
+    await pendingA;
+
+    expect(state.queue.depth).toBe(1); // A's waiting slot released, only B remains
+    const fakeResA = resA as unknown as FakeRes;
+    expect(fakeResA.writeHead).not.toHaveBeenCalled();
+    expect(fakeResA.write).not.toHaveBeenCalled();
+    expect(fakeResA.end).not.toHaveBeenCalled();
+
+    const emitter = new StreamEmitter();
+    emitter.push({ type: "done", finalText: "hi" });
+    runAskOnSession.mockReturnValue({
+      events: emitter,
+      result: Promise.resolve({ conversationId: null, finalText: "hi", events: [] }),
+      cancel: async () => {},
+    });
+
+    state.queue.release(); // free the running slot acquired above
+
+    const reqBEmitter = reqB as unknown as FakeReq;
+    await new Promise((resolve) => setImmediate(resolve));
+    reqBEmitter.emit("data", JSON.stringify({ prompt: "hi" }));
+    reqBEmitter.emit("end");
+    await pendingB;
+
+    const fakeResB = resB as unknown as FakeRes;
+    expect(fakeResB.writeHead).toHaveBeenCalledWith(
+      200,
+      expect.objectContaining({ "Content-Type": "text/event-stream" }),
+    );
+    expect(state.queue.depth).toBe(0); // B was dequeued and admitted, in order
+  });
 });

@@ -108,4 +108,27 @@ describe("askViaDaemon retry/error contract (C-092 F5)", () => {
     expect((errorEvent as { message: string }).message).toMatch(/busy with another turn/i);
     expect(result.finalText).toBe("");
   });
+
+  it("cancel() during a backoff sleep interrupts it and stops further attempts (C-092 G2)", async () => {
+    let attempts = 0;
+    const info = await listen((_req, res) => {
+      attempts++;
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "queue_full" }));
+    });
+
+    const SLOW_RETRY: RetryPolicy = { maxAttempts: 5, totalBudgetMs: 60_000, backoffMs: () => 5_000 };
+    const runner = askViaDaemon(info, { prompt: "hi", timeoutSec: 30, headless: false }, SLOW_RETRY);
+
+    // Let the first 429 land and the 5s backoff sleep begin before cancelling.
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    const started = Date.now();
+    await runner.cancel();
+    const result = await runner.result;
+    const elapsed = Date.now() - started;
+
+    expect(attempts).toBe(1); // cancel during backoff — no second attempt fired
+    expect(elapsed).toBeLessThan(1_000); // sleep was interrupted, not waited out
+    expect(result.finalText).toBe("");
+  });
 });

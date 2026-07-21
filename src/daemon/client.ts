@@ -36,8 +36,42 @@ export const DEFAULT_RETRY_POLICY: RetryPolicy = {
   backoffMs: (attempt) => Math.min(2 ** attempt * 500, 15_000),
 };
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+function sleep(ms: number, token?: CancelToken): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, Math.max(0, ms));
+    token?.onCancel(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+// Lets cancel() interrupt an in-flight backoff sleep instead of only
+// destroying the current httpReq (which no-ops between attempts) — the
+// AskRunner.cancel() contract must stop the retry loop promptly even
+// while it's asleep between a 429 and the next attempt (C-092 P-026 r3 G2).
+class CancelToken {
+  private cancelled = false;
+  private listeners: Array<() => void> = [];
+
+  get isCancelled(): boolean {
+    return this.cancelled;
+  }
+
+  cancel(): void {
+    if (this.cancelled) return;
+    this.cancelled = true;
+    for (const listener of this.listeners) listener();
+    this.listeners = [];
+  }
+
+  onCancel(cb: () => void): void {
+    if (this.cancelled) {
+      cb();
+      return;
+    }
+    this.listeners.push(cb);
+  }
 }
 
 /**
@@ -169,6 +203,7 @@ export function askViaDaemon(
   const collected: StreamEvent[] = [];
   let summary: AskSummary | null = null;
   let httpReq: ReturnType<typeof request> | null = null;
+  const cancelToken = new CancelToken();
 
   const askBody: AskRequest = {
     prompt: opts.prompt,
@@ -264,6 +299,10 @@ export function askViaDaemon(
   const result: Promise<AskResult> = (async () => {
     const deadline = Date.now() + retryPolicy.totalBudgetMs;
     for (let attempt = 1; attempt <= retryPolicy.maxAttempts; attempt++) {
+      if (cancelToken.isCancelled) {
+        emitter.push({ type: "error", message: "cancelled" });
+        return { conversationId: null, finalText: "", events: collected };
+      }
       const outcome = await attemptOnce();
       if (outcome.kind === "success") return outcome.result;
       if (outcome.kind === "fatal") {
@@ -275,7 +314,7 @@ export function askViaDaemon(
         emitter.push({ type: "error", message: `${outcome.message} — giving up after ${attempt} attempt(s)` });
         return { conversationId: null, finalText: "", events: collected };
       }
-      await sleep(Math.min(retryPolicy.backoffMs(attempt), remaining));
+      await sleep(Math.min(retryPolicy.backoffMs(attempt), remaining), cancelToken);
     }
     // Unreachable (loop always returns), kept for TS control-flow analysis.
     emitter.push({ type: "error", message: "daemon queue is full" });
@@ -286,6 +325,7 @@ export function askViaDaemon(
     events: teeEvents(emitter, collected),
     result,
     async cancel(): Promise<void> {
+      cancelToken.cancel();
       try {
         httpReq?.destroy();
       } catch {
