@@ -2,7 +2,9 @@
  * All ChatGPT.com DOM selectors live here. When OpenAI ships a UI change,
  * patch this file. Each entry has a primary selector + ordered fallbacks.
  *
- * Verified against chatgpt.com as of April 25, 2026.
+ * Verified against chatgpt.com as of July 21, 2026 (C-092 drift: the
+ * "Work" area rollout moved the model picker out of the header into an
+ * inline composer pill and added a Chat/Work surface toggle).
  */
 
 export interface SelectorSet {
@@ -12,8 +14,10 @@ export interface SelectorSet {
   sendButton: string[];
   /** Stop-streaming button (visible only while the model is producing tokens). */
   stopButton: string[];
-  /** Model picker / dropdown trigger in the conversation header. */
+  /** Model picker / dropdown trigger (composer-inline pill since the C-092 Work-area rollout). */
   modelSwitcher: string[];
+  /** "Chat" surface radio in the Chat/Work toggle (Work-area rollout, C-092). */
+  chatTabRadio: string[];
   /** Web search composer toggle. */
   webSearchToggle: string[];
   /** Account / profile button — proxy for "logged in" state. */
@@ -58,10 +62,15 @@ export const SELECTORS: SelectorSet = {
     'button:has-text("Stop generating")',
   ],
   modelSwitcher: [
+    'button.__composer-pill[aria-haspopup="menu"]',
     'button[data-testid="model-switcher-dropdown-button"]',
     'header button[aria-label*="Model selector"]',
     'header button[aria-label*="Sélecteur"]',
     'button[aria-haspopup="menu"]:has(svg)',
+  ],
+  chatTabRadio: [
+    'button[role="radio"]:has-text("Chat")',
+    'div[role="radiogroup"] button:has-text("Chat")',
   ],
   webSearchToggle: [
     // Current chatgpt.com (April 2026): web search is a menuitemradio

@@ -40,14 +40,40 @@ export async function openConversation(
 
   await requireSelector(page, SELECTORS.composer, "composer", 20_000);
 
+  // C-092: chatgpt.com's Work-area rollout can land (or leave a
+  // persisted profile) on the "Work" surface, whose composer has its
+  // own model set with no Pro tier. cgpro only ever drives classic
+  // chat, so force the Chat surface before touching the model picker.
+  await ensureChatTab(page);
+
   if (opts.model) {
     await tryEnsureModel(page, opts.model);
   }
 }
 
+async function ensureChatTab(page: Page): Promise<void> {
+  const chatTab = await firstResolved(page, SELECTORS.chatTabRadio);
+  if (!chatTab) return; // No Chat/Work toggle present — single-surface UI.
+  const checked = (await chatTab.getAttribute("aria-checked").catch(() => null)) === "true";
+  if (checked) return;
+  try {
+    await chatTab.click({ timeout: 5_000 });
+    await page.waitForTimeout(300);
+  } catch {
+    console.error(
+      "[cgpro:model] WARNING: found the Chat/Work surface toggle but failed to switch to Chat. The conversation may run on the wrong ChatGPT surface (no Pro tier). Run `cgpro doctor` to audit selectors.",
+    );
+  }
+}
+
 async function tryEnsureModel(page: Page, slug: string): Promise<void> {
   const trigger = await firstResolved(page, SELECTORS.modelSwitcher);
-  if (!trigger) return; // Picker absent — deep link must have stuck.
+  if (!trigger) {
+    console.error(
+      `[cgpro:model] WARNING: model switcher not found in the DOM for "${slug}". Relying on the ?model= URL param alone — it may not have applied. Run \`cgpro doctor\` to audit selectors.`,
+    );
+    return; // Picker absent — deep link must have stuck.
+  }
   const text = (await trigger.textContent())?.toLowerCase() ?? "";
   if (text.includes(slug.toLowerCase()) || text.includes("pro")) {
     return;
@@ -60,17 +86,31 @@ async function tryEnsureModel(page: Page, slug: string): Promise<void> {
       .filter({ hasText: new RegExp(slug.replace(/[.-]/g, "[.-]?"), "i") })
       .first();
     if ((await candidate.count()) > 0) {
-      await candidate.click({ timeout: 5_000 }).catch(() => {});
+      await candidate.click({ timeout: 5_000 }).catch(() => {
+        console.error(
+          `[cgpro:model] WARNING: found a menu item matching "${slug}" but the click failed. Proceeding with current model.`,
+        );
+      });
       return;
     }
     const proItem = page
       .locator(`[role="menuitem"]:has-text("Pro"), li:has-text("5.5 Pro"), li:has-text("5 Pro")`)
       .first();
     if ((await proItem.count()) > 0) {
-      await proItem.click({ timeout: 5_000 }).catch(() => {});
+      await proItem.click({ timeout: 5_000 }).catch(() => {
+        console.error(
+          `[cgpro:model] WARNING: found the "Pro" menu item but the click failed. Proceeding with current model.`,
+        );
+      });
+    } else {
+      console.error(
+        `[cgpro:model] WARNING: model switcher opened but no menu item matched "${slug}" or "Pro". Proceeding with current model. Run \`cgpro doctor\` to audit selectors.`,
+      );
     }
   } catch {
-    // Picker click failed — proceed with current model.
+    console.error(
+      `[cgpro:model] WARNING: failed to open the model switcher for "${slug}". Proceeding with current model.`,
+    );
   } finally {
     // Close the picker if it's still open by pressing Escape.
     await page.keyboard.press("Escape").catch(() => {});
