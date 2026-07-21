@@ -15,7 +15,11 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync, chmodSync } from "
 import { join } from "node:path";
 import { CGPRO_HOME, ensureDirs } from "../store/paths.js";
 
-export const DAEMON_FILE = join(CGPRO_HOME, "daemon.json");
+// CGPRO_DAEMON_JSON overrides the registration file path — lets a second
+// daemon instance (C-073 ADR 004 second browser lane) register at a
+// distinct path instead of colliding with the default single-lane file.
+// Unset (the default) reproduces the prior hardcoded behavior exactly.
+export const DAEMON_FILE = process.env.CGPRO_DAEMON_JSON || join(CGPRO_HOME, "daemon.json");
 export const DAEMON_LOG = join(CGPRO_HOME, "logs", "daemon.log");
 
 export interface DaemonInfo {
