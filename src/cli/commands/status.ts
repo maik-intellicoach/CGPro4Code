@@ -13,7 +13,7 @@ export interface StatusOptions {
 }
 
 export async function statusCommand(opts: StatusOptions): Promise<number> {
-  await assertNoDaemon("status");
+  await assertNoDaemon("status", opts.profile);
   // Default to headed — chatgpt.com challenges headless Chromium even
   // with a warmed-up profile. Pass --headless to override.
   const session = await openSession({

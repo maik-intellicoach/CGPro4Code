@@ -94,7 +94,7 @@ export interface SyncThreadsOptions {
 }
 
 export async function syncThreadsCmd(opts: SyncThreadsOptions): Promise<number> {
-  await assertNoDaemon("thread sync");
+  await assertNoDaemon("thread sync", opts.profile);
   const session = await openSession({
     headed: !opts.headless,
     profilePath: opts.profile,

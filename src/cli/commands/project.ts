@@ -39,7 +39,7 @@ export interface ProjectCmdOpts {
 }
 
 export async function projectListCmd(opts: ProjectCmdOpts): Promise<number> {
-  await assertNoDaemon("project list");
+  await assertNoDaemon("project list", opts.profile);
   const session = await openSession({
     headed: !opts.headless,
     profilePath: opts.profile,
@@ -97,7 +97,7 @@ export async function projectShowCmd(
   nameOrId: string | undefined,
   opts: ProjectCmdOpts,
 ): Promise<number> {
-  await assertNoDaemon("project show");
+  await assertNoDaemon("project show", opts.profile);
   const session = await openSession({
     headed: !opts.headless,
     profilePath: opts.profile,
@@ -173,7 +173,7 @@ export async function projectLinkCmd(
   nameOrId: string,
   opts: ProjectCmdOpts,
 ): Promise<number> {
-  await assertNoDaemon("project link");
+  await assertNoDaemon("project link", opts.profile);
   const here = resolveLocalProject();
   const session = await openSession({
     headed: !opts.headless,
@@ -258,7 +258,7 @@ export interface ProjectDigestOpts extends ProjectCmdOpts {
 }
 
 export async function projectDigestCmd(opts: ProjectDigestOpts): Promise<number> {
-  await assertNoDaemon("project digest");
+  await assertNoDaemon("project digest", opts.profile);
   const here = resolveLocalProject();
   const mapping = findMappingByKey(here.key);
   if (!mapping) {

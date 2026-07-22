@@ -18,7 +18,7 @@
     "test:live": "CGPRO_LIVE=1 vitest run test/live",
     "lint": "eslint src --ext .ts",
     "format": "prettier --write \"src/**/*.ts\"",
-    "audit:selectors": "tsx scripts/audit-selectors.ts",
+    "audit:selectors": "tsx src/cli/index.ts doctor",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {

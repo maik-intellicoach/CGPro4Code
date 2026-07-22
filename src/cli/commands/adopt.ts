@@ -23,7 +23,7 @@ export interface AdoptOptions {
  * signed-in account with no separate login flow.
  */
 export async function adoptCommand(opts: AdoptOptions): Promise<number> {
-  await assertNoDaemon("adopt");
+  await assertNoDaemon("adopt", opts.profile);
   const app = findChatGptApp();
   if (!app) {
     console.error(chalk.red("✖ ChatGPT desktop app not found."));

@@ -35,7 +35,7 @@ export async function chatCommand(opts: ChatCliOptions): Promise<number> {
   // Chat keeps a persistent BrowserContext across many turns; routing
   // it through the daemon would require a streaming multi-turn API
   // that the daemon doesn't expose yet. Until then, refuse cleanly.
-  await assertNoDaemon("chat");
+  await assertNoDaemon("chat", opts.profile);
   const cfg = loadConfig();
   const headless = opts.headed ? false : opts.headless ?? cfg.defaultHeadless;
   // Web search is locked ON for chat — same policy as `ask`.

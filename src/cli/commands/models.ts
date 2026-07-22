@@ -13,7 +13,7 @@ export interface ModelsOptions {
 }
 
 export async function modelsCommand(opts: ModelsOptions): Promise<number> {
-  await assertNoDaemon("models");
+  await assertNoDaemon("models", opts.profile);
   const session = await openSession({
     headed: !opts.headless,
     profilePath: opts.profile,

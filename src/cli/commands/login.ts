@@ -19,7 +19,7 @@ export interface LoginOptions {
  *      see "user-XXX", so the user has all the time they need.
  */
 export async function loginCommand(opts: LoginOptions): Promise<number> {
-  await assertNoDaemon("login");
+  await assertNoDaemon("login", opts.profile);
   const timeoutSec = opts.timeout ?? 300;
   const startedAt = Date.now();
 

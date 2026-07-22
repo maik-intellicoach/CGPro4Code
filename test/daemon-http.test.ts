@@ -10,6 +10,11 @@ vi.mock("../src/core/orchestrator.js", () => ({
   runAskOnSession: (...args: unknown[]) => runAskOnSession(...args),
 }));
 
+// Small bounds so the body-timeout/body-too-large tests don't need to wait
+// out (or allocate) the real production defaults (C-092 P-026 xfam r1 H1).
+process.env.CGPRO_DAEMON_BODY_TIMEOUT_MS = "200";
+process.env.CGPRO_DAEMON_BODY_MAX_BYTES = "64";
+
 const { AskQueue, handleAsk } = await import("../src/daemon/server.js");
 import type { ServerState } from "../src/daemon/server.js";
 import type { Session } from "../src/browser/session.js";
@@ -57,6 +62,14 @@ function parseJsonBody(res: FakeRes): unknown {
   return JSON.parse(res.writes.join(""));
 }
 
+function sendBody(req: IncomingMessage, obj: unknown): void {
+  const emitter = req as unknown as FakeReq;
+  emitter.emit("data", JSON.stringify(obj));
+  emitter.emit("end");
+}
+
+const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
 beforeEach(() => {
   runAskOnSession.mockReset();
 });
@@ -69,7 +82,10 @@ describe("handleAsk HTTP-level wiring", () => {
 
     const req = new FakeReq() as unknown as IncomingMessage;
     const res = new FakeRes() as unknown as ServerResponse;
-    await handleAsk(req, res as unknown as ServerResponse, state);
+    Object.assign(req, { method: "POST" });
+    const pending = handleAsk(req, res as unknown as ServerResponse, state);
+    sendBody(req, { prompt: "hi" }); // body read completes; only then is admission attempted
+    await pending;
 
     const fakeRes = res as unknown as FakeRes;
     expect(fakeRes.statusCode).toBe(429);
@@ -85,7 +101,9 @@ describe("handleAsk HTTP-level wiring", () => {
 
       const req = new FakeReq() as unknown as IncomingMessage;
       const res = new FakeRes() as unknown as ServerResponse;
+      Object.assign(req, { method: "POST" });
       const pending = handleAsk(req, res as unknown as ServerResponse, state);
+      sendBody(req, { prompt: "hi" }); // completes immediately; queue wait starts after
       await vi.advanceTimersByTimeAsync(1_001);
       await pending;
 
@@ -114,14 +132,8 @@ describe("handleAsk HTTP-level wiring", () => {
     const res = new FakeRes() as unknown as ServerResponse;
     Object.assign(req, { method: "POST" });
 
-    const bodyText = JSON.stringify({ prompt: "hi" });
-    const reqEmitter = req as unknown as FakeReq;
     const pending = handleAsk(req, res as unknown as ServerResponse, state);
-    // Let acquire()'s promise chain settle before readJsonBody's data/end
-    // listeners are wired up.
-    await new Promise((resolve) => setImmediate(resolve));
-    reqEmitter.emit("data", bodyText);
-    reqEmitter.emit("end");
+    sendBody(req, { prompt: "hi" }); // readJsonBody's listeners are wired synchronously
     await pending;
 
     const fakeRes = res as unknown as FakeRes;
@@ -141,14 +153,15 @@ describe("handleAsk HTTP-level wiring", () => {
     const state = fakeState({ queue: new AskQueue(8, 60_000) });
     await state.queue.acquire(); // occupy the running slot so both requests below queue
 
-    // Request A queues behind the running slot, then disconnects while
-    // still waiting — exercises the round-1 blocker wiring (server.ts
-    // req "close"/"aborted" -> disconnectController) that was previously
-    // correct but never regression-tested at the handleAsk HTTP level.
+    // Request A finishes sending its body, queues behind the running slot,
+    // then disconnects while still waiting — exercises the round-1 blocker
+    // wiring (server.ts req "close"/"aborted" -> disconnectController).
     const reqA = new FakeReq() as unknown as IncomingMessage;
     const resA = new FakeRes() as unknown as ServerResponse;
+    Object.assign(reqA, { method: "POST" });
     const pendingA = handleAsk(reqA, resA as unknown as ServerResponse, state);
-    await new Promise((resolve) => setImmediate(resolve));
+    sendBody(reqA, { prompt: "hi" });
+    await tick();
     expect(state.queue.depth).toBe(1);
 
     // Request B queues behind A — still connected, must be admitted next.
@@ -156,7 +169,8 @@ describe("handleAsk HTTP-level wiring", () => {
     const resB = new FakeRes() as unknown as ServerResponse;
     Object.assign(reqB, { method: "POST" });
     const pendingB = handleAsk(reqB, resB as unknown as ServerResponse, state);
-    await new Promise((resolve) => setImmediate(resolve));
+    sendBody(reqB, { prompt: "hi" });
+    await tick();
     expect(state.queue.depth).toBe(2);
 
     (reqA as unknown as FakeReq).emit("close");
@@ -177,11 +191,6 @@ describe("handleAsk HTTP-level wiring", () => {
     });
 
     state.queue.release(); // free the running slot acquired above
-
-    const reqBEmitter = reqB as unknown as FakeReq;
-    await new Promise((resolve) => setImmediate(resolve));
-    reqBEmitter.emit("data", JSON.stringify({ prompt: "hi" }));
-    reqBEmitter.emit("end");
     await pendingB;
 
     const fakeResB = resB as unknown as FakeRes;
@@ -190,5 +199,79 @@ describe("handleAsk HTTP-level wiring", () => {
       expect.objectContaining({ "Content-Type": "text/event-stream" }),
     );
     expect(state.queue.depth).toBe(0); // B was dequeued and admitted, in order
+  });
+
+  it("H1: a stalled/never-completing body never occupies a queue slot", async () => {
+    vi.useFakeTimers();
+    try {
+      const state = fakeState({ queue: new AskQueue(1, 60_000) });
+
+      const req = new FakeReq() as unknown as IncomingMessage;
+      const res = new FakeRes() as unknown as ServerResponse;
+      Object.assign(req, { method: "POST" });
+      const pending = handleAsk(req, res as unknown as ServerResponse, state);
+      // readJsonBody's listeners (and its timeout timer) are wired up
+      // synchronously before handleAsk's first await, so no tick is needed.
+
+      // No "data"/"end" ever emitted — the body never arrives, well past
+      // the 200ms test bound, yet the slot stays free the whole time.
+      await vi.advanceTimersByTimeAsync(100);
+      expect(state.queue.depth).toBe(0);
+      expect(state.queue.busy).toBe(false);
+
+      // A second, healthy request must be able to use the (untouched) slot.
+      const acquired = state.queue.acquire();
+      state.queue.release();
+      await acquired;
+
+      await vi.advanceTimersByTimeAsync(200); // let the stalled request's body-read timer fire
+      await pending;
+      expect(state.queue.depth).toBe(0);
+      expect(state.queue.busy).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("H1: body read timeout returns 408 without ever touching the queue", async () => {
+    vi.useFakeTimers();
+    try {
+      const state = fakeState({ queue: new AskQueue(8, 60_000) });
+      const req = new FakeReq() as unknown as IncomingMessage;
+      const res = new FakeRes() as unknown as ServerResponse;
+      Object.assign(req, { method: "POST" });
+      const pending = handleAsk(req, res as unknown as ServerResponse, state);
+
+      await vi.advanceTimersByTimeAsync(201); // > CGPRO_DAEMON_BODY_TIMEOUT_MS=200 set above
+      await pending;
+
+      const fakeRes = res as unknown as FakeRes;
+      expect(fakeRes.statusCode).toBe(408);
+      expect(parseJsonBody(fakeRes)).toMatchObject({ error: "body_timeout" });
+      expect(state.queue.depth).toBe(0);
+      expect(state.queue.busy).toBe(false);
+      expect(runAskOnSession).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("H1: an oversized body returns 413 without ever touching the queue", async () => {
+    const state = fakeState({ queue: new AskQueue(8, 60_000) });
+    const req = new FakeReq() as unknown as IncomingMessage;
+    const res = new FakeRes() as unknown as ServerResponse;
+    Object.assign(req, { method: "POST" });
+    const pending = handleAsk(req, res as unknown as ServerResponse, state);
+
+    const reqEmitter = req as unknown as FakeReq;
+    reqEmitter.emit("data", JSON.stringify({ prompt: "x".repeat(100) })); // > CGPRO_DAEMON_BODY_MAX_BYTES=64
+    await pending;
+
+    const fakeRes = res as unknown as FakeRes;
+    expect(fakeRes.statusCode).toBe(413);
+    expect(parseJsonBody(fakeRes)).toMatchObject({ error: "body_too_large" });
+    expect(state.queue.depth).toBe(0);
+    expect(state.queue.busy).toBe(false);
+    expect(runAskOnSession).not.toHaveBeenCalled();
   });
 });

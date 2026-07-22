@@ -16,6 +16,7 @@ import {
   type DaemonInfo,
   type StatusResponse,
 } from "./protocol.js";
+import { profileDir } from "../store/paths.js";
 import type { AskOptions, AskResult, AskRunner } from "../core/orchestrator.js";
 
 // Bounded retry for HTTP 429 ("queue full") against the daemon's bounded
@@ -82,9 +83,16 @@ class CancelToken {
  * those mutually exclusive. Surface that to the user instead of letting
  * them see `ProfileLockedError`.
  */
-export async function assertNoDaemon(commandName: string): Promise<void> {
+// C-092 P-026 xfam r1 H6: the daemon holds a lock on the browser profile
+// directory it was started against, not on "any profile" — a live daemon
+// on profile A never conflicts with a cold-start command targeting a
+// different profile B. Both sides are normalized through profileDir() so
+// `undefined` (the default profile) compares equal to itself regardless
+// of which call site left it unset.
+export async function assertNoDaemon(commandName: string, targetProfile?: string): Promise<void> {
   const live = await getLiveDaemon();
   if (!live) return;
+  if (profileDir(live.profile) !== profileDir(targetProfile)) return;
   throw new CgproError(
     `\`cgpro ${commandName}\` cannot run while the daemon owns the profile.`,
     8,

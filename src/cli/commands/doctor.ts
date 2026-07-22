@@ -11,7 +11,7 @@ export interface DoctorOptions {
 }
 
 export async function doctorCommand(opts: DoctorOptions): Promise<number> {
-  await assertNoDaemon("doctor");
+  await assertNoDaemon("doctor", opts.profile);
   const session = await openSession({ headed: !!opts.headed, profilePath: opts.profile });
   const spinner = ora("Auditing selectors against chatgpt.com…").start();
   let exitCode = 0;

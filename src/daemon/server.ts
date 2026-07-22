@@ -64,6 +64,30 @@ export class QueueCancelledError extends Error {
   }
 }
 
+export class BodyTimeoutError extends Error {
+  constructor() {
+    super("body read timed out");
+  }
+}
+
+export class BodyTooLargeError extends Error {
+  constructor() {
+    super("body exceeds max size");
+  }
+}
+
+class BodyDisconnectedError extends Error {
+  constructor() {
+    super("client disconnected before body was fully read");
+  }
+}
+
+// C-092 P-026 xfam r1 H1: bounds on receiving the /ask body — these run
+// BEFORE queue admission, so a client that never finishes its body can
+// never occupy a queue slot (see handleAsk). Exported for tests.
+export const BODY_READ_TIMEOUT_MS = Math.max(1, Number(process.env.CGPRO_DAEMON_BODY_TIMEOUT_MS) || 30_000);
+export const BODY_MAX_BYTES = Math.max(1, Number(process.env.CGPRO_DAEMON_BODY_MAX_BYTES) || 20 * 1024 * 1024);
+
 interface WaitingEntry {
   resolve: () => void;
   timer: ReturnType<typeof setTimeout>;
@@ -314,6 +338,37 @@ export async function handleAsk(
   res: ServerResponse,
   state: ServerState,
 ): Promise<void> {
+  // C-092 P-026 xfam r1 H1: the body must be fully received and validated
+  // BEFORE we ever touch the queue. Server-level request timeouts are
+  // disabled (long Pro turns need that), so an authenticated client that
+  // sends headers then stalls the body used to hold its admitted slot
+  // indefinitely once it reached queue.acquire(). Bounding this read here
+  // means a stalled/oversized/malformed body is rejected without ever
+  // consuming a slot.
+  let body: AskRequest | null;
+  try {
+    body = await readJsonBody<AskRequest>(req);
+  } catch (err) {
+    if (err instanceof BodyTimeoutError) {
+      res.writeHead(408, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "body_timeout" }));
+      return;
+    }
+    if (err instanceof BodyTooLargeError) {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "body_too_large" }));
+      return;
+    }
+    // BodyDisconnectedError — client is already gone, nothing to respond to.
+    return;
+  }
+
+  if (!body || typeof body.prompt !== "string" || body.prompt.length === 0) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "invalid_request" }));
+    return;
+  }
+
   // Watch for the client disconnecting WHILE queued (before acquire()
   // resolves) — nothing else observes req/res during that window, so a
   // gone client used to hold its slot until dequeue or the maxWaitMs
@@ -347,12 +402,6 @@ export async function handleAsk(
   }
 
   try {
-    const body = await readJsonBody<AskRequest>(req);
-    if (!body || typeof body.prompt !== "string" || body.prompt.length === 0) {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "invalid_request" }));
-      return;
-    }
     // 4 hours upper bound — covers the longest GPT-5.5 Pro turns we've
     // seen in practice. Browser-side stays alive because the daemon owns
     // the persistent context and Node's http.Server has no inactivity
@@ -437,23 +486,66 @@ function hasValidToken(req: IncomingMessage, token: string): boolean {
   return diff === 0;
 }
 
-async function readJsonBody<T>(req: IncomingMessage): Promise<T | null> {
-  return new Promise((resolve) => {
+function readJsonBody<T>(
+  req: IncomingMessage,
+  timeoutMs: number = BODY_READ_TIMEOUT_MS,
+  maxBytes: number = BODY_MAX_BYTES,
+): Promise<T | null> {
+  return new Promise((resolve, reject) => {
     let buf = "";
-    req.setEncoding("utf-8");
-    req.on("data", (chunk) => (buf += chunk));
-    req.on("end", () => {
+    let bytes = 0;
+    let settled = false;
+
+    const timer = setTimeout(() => settle(() => reject(new BodyTimeoutError())), timeoutMs);
+
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("error", onError);
+      req.off("close", onClose);
+      req.off("aborted", onClose);
+    };
+    function settle(run: () => void): void {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      run();
+    }
+
+    const onData = (chunk: string): void => {
+      bytes += Buffer.byteLength(chunk, "utf-8");
+      if (bytes > maxBytes) {
+        settle(() => reject(new BodyTooLargeError()));
+        return;
+      }
+      buf += chunk;
+    };
+    const onEnd = (): void => {
       if (buf.length === 0) {
-        resolve(null);
+        settle(() => resolve(null));
         return;
       }
       try {
-        resolve(JSON.parse(buf) as T);
+        const parsed = JSON.parse(buf) as T;
+        settle(() => resolve(parsed));
       } catch {
-        resolve(null);
+        settle(() => resolve(null));
       }
-    });
-    req.on("error", () => resolve(null));
+    };
+    const onError = (): void => settle(() => resolve(null));
+    // Fires on a normal completed upload too, but only AFTER "end" has
+    // already settled us (verified: Node emits close after data/end on a
+    // healthy request) — settle() is a no-op past the first call, so this
+    // never cancels a request that finished sending its body.
+    const onClose = (): void => settle(() => reject(new BodyDisconnectedError()));
+
+    req.setEncoding("utf-8");
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onError);
+    req.on("close", onClose);
+    req.on("aborted", onClose);
   });
 }
 

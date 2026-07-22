@@ -229,19 +229,36 @@ export async function sendPrompt(page: Page, prompt: string): Promise<number> {
     .count()
     .catch(() => 0);
 
-  const send = await waitForEnabledSendButton(page);
-  let clicked = false;
-  if (send) {
-    await send.click({ timeout: 4_000 }).catch(() => {
-      /* fall through to Enter */
-    });
-    clicked = true;
-  }
+  const clicked = await clickSendButtonWithRetries(page);
   if (!clicked) {
     // Fall back to pressing Enter while the composer has focus.
     await page.keyboard.press("Enter");
   }
   return priorAssistantCount;
+}
+
+const SEND_CLICK_MAX_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_SEND_CLICK_ATTEMPTS ?? 3));
+
+/**
+ * Clicks the send button, re-resolving it on every attempt. A DOM redraw
+ * between resolving the button and clicking it can make the click throw on
+ * an element that's already gone — re-resolving instead of giving up after
+ * one failure is what makes the Enter fallback below actually reachable
+ * (C-092 H2: `clicked` used to be set unconditionally after the first
+ * attempt, so the fallback was dead code).
+ */
+async function clickSendButtonWithRetries(page: Page): Promise<boolean> {
+  for (let attempt = 0; attempt < SEND_CLICK_MAX_ATTEMPTS; attempt++) {
+    const send = await waitForEnabledSendButton(page);
+    if (!send) return false;
+    try {
+      await send.click({ timeout: 4_000 });
+      return true;
+    } catch {
+      // Stale/intercepted click — re-resolve and retry.
+    }
+  }
+  return false;
 }
 
 async function waitForEnabledSendButton(page: Page): Promise<Locator | null> {

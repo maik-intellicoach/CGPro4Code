@@ -10,7 +10,7 @@ export interface LogoutOptions {
 }
 
 export async function logoutCommand(opts: LogoutOptions): Promise<number> {
-  await assertNoDaemon("logout");
+  await assertNoDaemon("logout", opts.profile);
   const dir = profileDir(opts.profile);
   if (!existsSync(dir)) {
     console.log(chalk.dim("No profile to remove."));
