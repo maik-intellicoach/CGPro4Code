@@ -88,6 +88,52 @@ class BodyDisconnectedError extends Error {
 export const BODY_READ_TIMEOUT_MS = Math.max(1, Number(process.env.CGPRO_DAEMON_BODY_TIMEOUT_MS) || 30_000);
 export const BODY_MAX_BYTES = Math.max(1, Number(process.env.CGPRO_DAEMON_BODY_MAX_BYTES) || 20 * 1024 * 1024);
 
+// C-092 P-026 xfam r2 B1: bound only the PRE-response phase (receiving
+// headers, then the request body) — Node clears both timers once the full
+// request has arrived, so they never touch a long SSE response. The
+// whole-connection idle timeout (`server.timeout`, applied in
+// applyServerTimeouts) stays 0 so a quiet "thinking" gap mid-turn can't
+// get killed.
+export const HEADERS_TIMEOUT_MS = Math.max(1, Number(process.env.CGPRO_DAEMON_HEADERS_TIMEOUT_MS) || 60_000);
+export const REQUEST_TIMEOUT_MS = Math.max(
+  1,
+  Number(process.env.CGPRO_DAEMON_REQUEST_TIMEOUT_MS) || HEADERS_TIMEOUT_MS + BODY_READ_TIMEOUT_MS + 30_000,
+);
+
+// C-092 P-026 xfam r2 B2: caps how many /ask bodies may be read
+// concurrently BEFORE queue admission. Each reader can retain up to
+// BODY_MAX_BYTES for up to BODY_READ_TIMEOUT_MS, so aggregate
+// pre-admission memory is bounded to maxReaders * BODY_MAX_BYTES
+// regardless of QUEUE_MAX (the queue guard only applies once a body has
+// already been fully read — see handleAsk).
+export class ReaderBudgetExceededError extends Error {
+  constructor(public readonly active: number) {
+    super(`pre-admission reader budget exceeded at ${active}`);
+  }
+}
+
+export class PreAdmissionReaderBudget {
+  private active = 0;
+  constructor(private readonly maxReaders: number) {}
+
+  get activeCount(): number {
+    return this.active;
+  }
+
+  acquire(): void {
+    if (this.active >= this.maxReaders) {
+      throw new ReaderBudgetExceededError(this.active);
+    }
+    this.active++;
+  }
+
+  release(): void {
+    if (this.active > 0) this.active--;
+  }
+}
+
+export const PREADMIT_MAX_READERS = Math.max(1, Number(process.env.CGPRO_DAEMON_PREADMIT_MAX_READERS) || 4);
+
 interface WaitingEntry {
   resolve: () => void;
   timer: ReturnType<typeof setTimeout>;
@@ -184,8 +230,50 @@ export interface ServerState {
   background: boolean;
   profile?: string;
   queue: AskQueue;
+  readerBudget: PreAdmissionReaderBudget;
   currentConversation: string | null;
   lastConversation: string | null;
+}
+
+// C-092 P-026 xfam r2 B1: extracted so a lightweight integration test can
+// exercise the real timeout behavior against a bare http.Server, without
+// needing the browser/session stack runDaemonServer depends on.
+//
+// `server.headersTimeout`/`server.requestTimeout` are set below for
+// defense-in-depth, but the ACTUAL enforcement is the manual
+// `socket.setTimeout()` on each raw connection: a standalone repro
+// against this runtime (Node v26.5.0) showed the built-in properties
+// (set either post-construction or via the createServer() options
+// object) never fire — not even after 6s against a 150ms/2000ms
+// config — while `net.Socket#setTimeout()` fires reliably both stand
+// alone and inside an http.Server's "connection" handler. Ground-truth
+// over recall: don't rely on a built-in that verifiably does nothing
+// here. The bound is re-armed after each response finishes so a
+// reused keep-alive connection's NEXT request headers are covered too.
+export function applyServerTimeouts(server: import("node:http").Server): void {
+  server.requestTimeout = REQUEST_TIMEOUT_MS;
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
+  // Whole-connection idle timeout and keep-alive linger stay disabled —
+  // long Pro turns may stream text sporadically across the SSE channel,
+  // and we'd rather rely on waitTurnComplete's deadline than the
+  // http.Server killing the response.
+  server.timeout = 0;
+  server.keepAliveTimeout = 0;
+
+  server.on("connection", (socket) => {
+    socket.setTimeout(HEADERS_TIMEOUT_MS, () => socket.destroy());
+  });
+  server.on("request", (req, res) => {
+    // Headers are fully parsed once "request" fires — release the
+    // header-phase bound so it can't kill a (separately app-bounded)
+    // slow body read or a long-running SSE response.
+    req.socket.setTimeout(0);
+    res.on("finish", () => {
+      if (!req.socket.destroyed) {
+        req.socket.setTimeout(HEADERS_TIMEOUT_MS, () => req.socket.destroy());
+      }
+    });
+  });
 }
 
 export interface DaemonServerOptions {
@@ -222,6 +310,7 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
     background: opts.background ?? true,
     profile: opts.profile,
     queue: new AskQueue(QUEUE_MAX, QUEUE_MAX_WAIT_MS),
+    readerBudget: new PreAdmissionReaderBudget(PREADMIT_MAX_READERS),
     currentConversation: null,
     lastConversation: null,
   };
@@ -235,13 +324,7 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
       }
     });
   });
-  // Disable Node's per-request timeout — long Pro turns may stream text
-  // sporadically across the SSE channel, and we'd rather rely on
-  // waitTurnComplete's deadline than the http.Server killing the response.
-  server.requestTimeout = 0;
-  server.headersTimeout = 0;
-  server.timeout = 0;
-  server.keepAliveTimeout = 0;
+  applyServerTimeouts(server);
 
   // Bind on loopback only; the token covers same-host adversaries.
   server.listen(opts.port ?? 0, "127.0.0.1", () => {
@@ -345,6 +428,22 @@ export async function handleAsk(
   // indefinitely once it reached queue.acquire(). Bounding this read here
   // means a stalled/oversized/malformed body is rejected without ever
   // consuming a slot.
+  // C-092 P-026 xfam r2 B2: bound how many bodies may be read concurrently
+  // BEFORE queue admission — the queue guard below only applies once a
+  // body has already been fully read, so without this a burst of
+  // concurrent authenticated requests could each retain BODY_MAX_BYTES
+  // for up to BODY_READ_TIMEOUT_MS with no aggregate ceiling.
+  try {
+    state.readerBudget.acquire();
+  } catch (err) {
+    if (err instanceof ReaderBudgetExceededError) {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "reader_budget_exceeded", active: err.active }));
+      return;
+    }
+    throw err;
+  }
+
   let body: AskRequest | null;
   try {
     body = await readJsonBody<AskRequest>(req);
@@ -361,6 +460,8 @@ export async function handleAsk(
     }
     // BodyDisconnectedError — client is already gone, nothing to respond to.
     return;
+  } finally {
+    state.readerBudget.release();
   }
 
   if (!body || typeof body.prompt !== "string" || body.prompt.length === 0) {

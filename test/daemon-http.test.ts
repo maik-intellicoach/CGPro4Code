@@ -15,7 +15,7 @@ vi.mock("../src/core/orchestrator.js", () => ({
 process.env.CGPRO_DAEMON_BODY_TIMEOUT_MS = "200";
 process.env.CGPRO_DAEMON_BODY_MAX_BYTES = "64";
 
-const { AskQueue, handleAsk } = await import("../src/daemon/server.js");
+const { AskQueue, PreAdmissionReaderBudget, handleAsk } = await import("../src/daemon/server.js");
 import type { ServerState } from "../src/daemon/server.js";
 import type { Session } from "../src/browser/session.js";
 import { StreamEmitter } from "../src/core/stream.js";
@@ -27,6 +27,7 @@ function fakeState(overrides: Partial<ServerState> = {}): ServerState {
     startedAt: new Date(),
     background: true,
     queue: new AskQueue(8, 60_000),
+    readerBudget: new PreAdmissionReaderBudget(8),
     currentConversation: null,
     lastConversation: null,
     ...overrides,
@@ -273,5 +274,64 @@ describe("handleAsk HTTP-level wiring", () => {
     expect(state.queue.depth).toBe(0);
     expect(state.queue.busy).toBe(false);
     expect(runAskOnSession).not.toHaveBeenCalled();
+  });
+
+  // ---- B2: pre-admission reader budget ----
+
+  it("B2: rejects the Nth+1 concurrent pre-admission reader with 429 while the queue stays empty", async () => {
+    const state = fakeState({ queue: new AskQueue(8, 60_000), readerBudget: new PreAdmissionReaderBudget(2) });
+
+    // Two readers hold their slots by never finishing their body — never
+    // touches the queue at all (H1 still holds: no data sent).
+    const reqA = new FakeReq() as unknown as IncomingMessage;
+    const resA = new FakeRes() as unknown as ServerResponse;
+    Object.assign(reqA, { method: "POST" });
+    const pendingA = handleAsk(reqA, resA as unknown as ServerResponse, state);
+
+    const reqB = new FakeReq() as unknown as IncomingMessage;
+    const resB = new FakeRes() as unknown as ServerResponse;
+    Object.assign(reqB, { method: "POST" });
+    const pendingB = handleAsk(reqB, resB as unknown as ServerResponse, state);
+
+    await tick();
+    expect(state.readerBudget.activeCount).toBe(2);
+
+    // Third concurrent reader is rejected immediately — no queue slot ever
+    // touched, no body ever read.
+    const reqC = new FakeReq() as unknown as IncomingMessage;
+    const resC = new FakeRes() as unknown as ServerResponse;
+    Object.assign(reqC, { method: "POST" });
+    await handleAsk(reqC, resC as unknown as ServerResponse, state);
+
+    const fakeResC = resC as unknown as FakeRes;
+    expect(fakeResC.statusCode).toBe(429);
+    expect(parseJsonBody(fakeResC)).toMatchObject({ error: "reader_budget_exceeded", active: 2 });
+    expect(state.queue.depth).toBe(0);
+    expect(state.queue.busy).toBe(false);
+
+    // Finishing A's body frees its slot; C's rejection didn't consume one.
+    sendBody(reqA, { prompt: "hi" });
+    await pendingA;
+    sendBody(reqB, { prompt: "hi" });
+    await pendingB;
+    expect(state.readerBudget.activeCount).toBe(0);
+  });
+
+  it("B2: the reader budget is released even when the body read times out", async () => {
+    vi.useFakeTimers();
+    try {
+      const state = fakeState({ readerBudget: new PreAdmissionReaderBudget(1) });
+      const req = new FakeReq() as unknown as IncomingMessage;
+      const res = new FakeRes() as unknown as ServerResponse;
+      Object.assign(req, { method: "POST" });
+      const pending = handleAsk(req, res as unknown as ServerResponse, state);
+
+      await vi.advanceTimersByTimeAsync(201); // > CGPRO_DAEMON_BODY_TIMEOUT_MS=200 set above
+      await pending;
+
+      expect(state.readerBudget.activeCount).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
