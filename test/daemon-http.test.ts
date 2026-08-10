@@ -15,7 +15,7 @@ vi.mock("../src/core/orchestrator.js", () => ({
 process.env.CGPRO_DAEMON_BODY_TIMEOUT_MS = "200";
 process.env.CGPRO_DAEMON_BODY_MAX_BYTES = "64";
 
-const { AskQueue, PreAdmissionReaderBudget, handleAsk } = await import("../src/daemon/server.js");
+const { AskQueue, PreAdmissionReaderBudget, handleAsk, handleRequest } = await import("../src/daemon/server.js");
 import type { ServerState } from "../src/daemon/server.js";
 import type { Session } from "../src/browser/session.js";
 import { StreamEmitter } from "../src/core/stream.js";
@@ -73,6 +73,22 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
 
 beforeEach(() => {
   runAskOnSession.mockReset();
+});
+
+it("returns authenticated account facts from daemon status", async () => {
+  const state = fakeState({
+    account: { email: "account@example.test", plan: "pro", proModelAvailable: true },
+  });
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "GET", url: "/status", headers: { authorization: "Bearer test-token" } });
+
+  await handleRequest(req, res, state);
+
+  expect((res as unknown as FakeRes).statusCode).toBe(200);
+  expect(parseJsonBody(res as unknown as FakeRes)).toMatchObject({
+    account: { email: "account@example.test", plan: "pro", proModelAvailable: true },
+  });
 });
 
 describe("handleAsk HTTP-level wiring", () => {

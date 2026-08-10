@@ -29,7 +29,9 @@ import { randomBytes } from "node:crypto";
 import { appendFileSync, openSync, writeSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { openSession, type Session } from "../browser/session.js";
-import { goHome, isLoggedIn } from "../browser/chatgpt.js";
+import { fetchAuthSessionInPage, goHome, isLoggedIn } from "../browser/chatgpt.js";
+import { detectPlan, fetchMe } from "../api/me.js";
+import { fetchModels, findProSlug } from "../api/models.js";
 import { runAskOnSession, type AskOptions } from "../core/orchestrator.js";
 import { NotLoggedInError } from "../errors.js";
 import {
@@ -43,7 +45,7 @@ import {
 
 const log = makeLogger();
 
-const QUEUE_MAX = Math.max(1, Number(process.env.CGPRO_DAEMON_QUEUE_MAX) || 8);
+const QUEUE_MAX = Math.max(1, Number(process.env.CGPRO_DAEMON_QUEUE_MAX) || 4);
 const QUEUE_MAX_WAIT_MS = Math.max(1, Number(process.env.CGPRO_DAEMON_QUEUE_MAX_WAIT_MS) || 7_200_000);
 
 export class QueueFullError extends Error {
@@ -233,6 +235,11 @@ export interface ServerState {
   readerBudget: PreAdmissionReaderBudget;
   currentConversation: string | null;
   lastConversation: string | null;
+  account?: {
+    email?: string;
+    plan: string;
+    proModelAvailable: boolean;
+  };
 }
 
 // C-092 P-026 xfam r2 B1: extracted so a lightweight integration test can
@@ -301,6 +308,21 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
     await session.close().catch(() => {});
     throw new NotLoggedInError();
   }
+  const auth = await fetchAuthSessionInPage(session.page);
+  const [me, models] = await Promise.all([
+    fetchMe(session.page, auth?.accessToken),
+    fetchModels(session.page, auth?.accessToken),
+  ]);
+  const proModelAvailable = findProSlug(models) !== null;
+  const detectedPlan = detectPlan(me);
+  const account = {
+    email: me?.email ?? auth?.user?.email,
+    // ChatGPT currently omits a plan label for this account while returning
+    // the authenticated Pro model catalogue. The entitlement is the stronger
+    // capability fact; never promote a known non-Pro label.
+    plan: detectedPlan === "unknown" && proModelAvailable ? "pro" : detectedPlan,
+    proModelAvailable,
+  };
   log.info("auth verified, starting http listener");
 
   const state: ServerState = {
@@ -313,6 +335,7 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
     readerBudget: new PreAdmissionReaderBudget(PREADMIT_MAX_READERS),
     currentConversation: null,
     lastConversation: null,
+    account,
   };
 
   const server = createServer((req, res) => {
@@ -355,7 +378,7 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
-async function handleRequest(
+export async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
   state: ServerState,
@@ -385,6 +408,7 @@ async function handleRequest(
       background: state.background,
       profile: state.profile,
       busy: state.queue.busy,
+      account: state.account,
       currentConversation: state.currentConversation,
       lastConversation: state.lastConversation,
     };

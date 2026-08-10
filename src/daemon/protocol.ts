@@ -114,6 +114,12 @@ export interface StatusResponse {
   background: boolean;
   profile?: string;
   busy: boolean;
+  /** Authenticated account facts captured when the daemon starts. */
+  account?: {
+    email?: string;
+    plan: string;
+    proModelAvailable: boolean;
+  };
   /** Conversation id of the current turn, if any. */
   currentConversation?: string | null;
   /** UUID of the last completed turn, if any. */
