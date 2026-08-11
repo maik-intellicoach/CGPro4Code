@@ -15,7 +15,7 @@ import {
   StreamEmitter,
   type StreamEvent,
 } from "./stream.js";
-import { NotLoggedInError, TurnTimeoutError } from "../errors.js";
+import { NotLoggedInError } from "../errors.js";
 import { SELECTORS as SELECTORS_DUMP } from "../browser/selectors.js";
 
 export interface AskOptions {
@@ -144,25 +144,29 @@ function runAskInner(
         await waitTurnComplete(page, opts.timeoutSec * 1_000, priorBubbles);
       } catch (err) {
         if (debug) {
-          const screenshotPath = `${process.env.TEMP || "."}/cgpro-debug-${Date.now()}.png`;
-          await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
-          log(`screenshot saved: ${screenshotPath}`);
-          const url = page.url();
-          const composerCount = await page.locator("#prompt-textarea").count();
-          const sendCount = await page.locator('button[data-testid="send-button"]').count();
-          const bubbleCount = await page
-            .locator(SELECTORS_DUMP.assistantMessages.join(", "))
-            .count();
-          const composerText = await page
-            .locator("#prompt-textarea")
-            .first()
-            .innerText()
-            .catch(() => "");
-          log(
-            `state: url=${url} composer=${composerCount} send=${sendCount} bubbles=${bubbleCount} composerText=${JSON.stringify(composerText.slice(0, 80))}`,
-          );
+          try {
+            const screenshotPath = `${process.env.TEMP || "."}/cgpro-debug-${Date.now()}.png`;
+            await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => {});
+            log(`screenshot saved: ${screenshotPath}`);
+            const url = page.url();
+            const composerCount = await page.locator("#prompt-textarea").count();
+            const sendCount = await page.locator('button[data-testid="send-button"]').count();
+            const bubbleCount = await page
+              .locator(SELECTORS_DUMP.assistantMessages.join(", "))
+              .count();
+            const composerText = await page
+              .locator("#prompt-textarea")
+              .first()
+              .innerText()
+              .catch(() => "");
+            log(
+              `state: url=${url} composer=${composerCount} send=${sendCount} bubbles=${bubbleCount} composerText=${JSON.stringify(composerText.slice(0, 80))}`,
+            );
+          } catch (diagnosticErr) {
+            log(`debug diagnostics unavailable: ${(diagnosticErr as Error).message}`);
+          }
         }
-        if (!cancelled) throw new TurnTimeoutError(opts.timeoutSec);
+        if (!cancelled) throw err;
       }
       log(`waitTurnComplete done, url=${page.url()}`);
 

@@ -1,6 +1,7 @@
 import type { Page, Locator } from "patchright";
 import { SELECTORS } from "./selectors.js";
 import { firstResolved, requireSelector } from "./chatgpt.js";
+import { TurnTimeoutError } from "../errors.js";
 
 /**
  * Open a chatgpt.com conversation.
@@ -314,15 +315,12 @@ export async function waitTurnComplete(
 
   // Phase 1: wait for a new assistant bubble.
   while (Date.now() < deadline) {
-    const count = await page
-      .locator(SELECTORS.assistantMessages.join(", "))
-      .count()
-      .catch(() => 0);
+    const count = await page.locator(SELECTORS.assistantMessages.join(", ")).count();
     if (count > priorAssistantCount) break;
     await page.waitForTimeout(250);
   }
   if (Date.now() >= deadline) {
-    throw new Error("Assistant bubble did not appear in time");
+    throw new TurnTimeoutError(Math.ceil(timeoutMs / 1_000));
   }
 
   // Phase 2: poll the bubble's text every 400ms; consider the turn
@@ -369,7 +367,7 @@ export async function waitTurnComplete(
     await page.waitForTimeout(300);
   }
 
-  throw new Error("Turn did not complete in time");
+  throw new TurnTimeoutError(Math.ceil(timeoutMs / 1_000));
 }
 
 export async function latestAssistantBubble(page: Page): Promise<Locator | null> {
@@ -378,7 +376,7 @@ export async function latestAssistantBubble(page: Page): Promise<Locator | null>
   // <article> wrapper be selected instead of the bubble itself.
   for (const sel of SELECTORS.assistantMessages) {
     const all = page.locator(sel);
-    const n = await all.count().catch(() => 0);
+    const n = await all.count();
     if (n > 0) return all.nth(n - 1);
   }
   return null;

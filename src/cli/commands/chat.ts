@@ -156,13 +156,18 @@ export async function chatCommand(opts: ChatCliOptions): Promise<number> {
       })();
 
       await sendPrompt(page, userText);
-      await waitTurnComplete(page, timeoutSec * 1_000).catch(() => {
+      try {
+        await waitTurnComplete(page, timeoutSec * 1_000);
+      } catch (err) {
+        if (!(err instanceof TurnTimeoutError)) {
+          const message = (err as Error).message ?? String(err);
+          emitter.push({ type: "error", message });
+          await drainPromise;
+          throw err;
+        }
         spinner.fail(`Turn timed out after ${timeoutSec}s.`);
-        emitter.push({
-          type: "error",
-          message: new TurnTimeoutError(timeoutSec).message,
-        });
-      });
+        emitter.push({ type: "error", message: err.message });
+      }
 
       // Synthesize a `done` from the DOM if the SSE stream didn't end.
       if (!emitter.isFinished()) {
