@@ -87,6 +87,8 @@ class InterceptorState {
   parser: SseParser = new SseParser();
   emitter: StreamEmitter | null = null;
   expectedReloadNavigation = false;
+  generation = 0;
+  observers = new Map<string, number>();
 }
 
 const STATE = new WeakMap<BrowserContext, InterceptorState>();
@@ -101,7 +103,12 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
   const state = new InterceptorState();
   STATE.set(context, state);
 
-  await context.exposeBinding("__cgproChunk", (_src, raw: string) => {
+  await context.exposeBinding("__cgproStart", (_src, observerId: string) => {
+    state.observers.set(observerId, state.generation);
+  });
+
+  await context.exposeBinding("__cgproChunk", (_src, observerId: string, raw: string) => {
+    if (state.observers.get(observerId) !== state.generation) return;
     const events = state.parser.feed(raw);
     if (state.emitter) {
       for (const ev of events) state.emitter.push(ev);
@@ -110,7 +117,9 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
 
   await context.exposeBinding(
     "__cgproDone",
-    (_src, payload?: { reason?: string }) => {
+    (_src, observerId: string, payload?: { reason?: string }) => {
+      if (state.observers.get(observerId) !== state.generation) return;
+      state.observers.delete(observerId);
       if (!state.emitter) return;
       if (payload?.reason === "error") {
         if (!state.expectedReloadNavigation) {
@@ -133,8 +142,9 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
   await context.addInitScript(() => {
     const w = window as unknown as Window & {
       __cgproInstalled?: boolean;
-      __cgproChunk?: (raw: string) => void;
-      __cgproDone?: (payload?: { reason?: string }) => void;
+      __cgproStart?: (observerId: string) => Promise<void>;
+      __cgproChunk?: (observerId: string, raw: string) => void;
+      __cgproDone?: (observerId: string, payload?: { reason?: string }) => void;
     };
     if (w.__cgproInstalled) return;
     w.__cgproInstalled = true;
@@ -151,15 +161,17 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
       else if (first instanceof URL) url = first.toString();
       else if (first instanceof Request) url = first.url;
 
-      const response = await originalFetch(...args);
-
-      if (!isTargetUrl(url)) return response;
-
       const init = args[1];
       const method =
         (init && (init as RequestInit).method) ||
         (first instanceof Request ? first.method : "GET");
-      if (method.toUpperCase() !== "POST") return response;
+      const observe = isTargetUrl(url) && method.toUpperCase() === "POST";
+      const observerId = observe ? globalThis.crypto.randomUUID() : "";
+      if (observe) await w.__cgproStart?.(observerId);
+
+      const response = await originalFetch(...args);
+
+      if (!observe) return response;
 
       try {
         const cloned = response.clone();
@@ -173,14 +185,14 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
               if (done) break;
               if (value) {
                 const text = decoder.decode(value, { stream: true });
-                if (text) w.__cgproChunk?.(text);
+                if (text) w.__cgproChunk?.(observerId, text);
               }
             }
             const tail = decoder.decode();
-            if (tail) w.__cgproChunk?.(tail);
-            w.__cgproDone?.();
+            if (tail) w.__cgproChunk?.(observerId, tail);
+            w.__cgproDone?.(observerId);
           } catch {
-            w.__cgproDone?.({ reason: "error" });
+            w.__cgproDone?.(observerId, { reason: "error" });
           }
         })();
       } catch {
@@ -204,6 +216,8 @@ export function setActiveEmitter(
   const state = STATE.get(context);
   if (!state) return null;
   const prev = state.emitter;
+  state.generation += 1;
+  state.observers.clear();
   state.emitter = emitter;
   state.parser.reset();
   return prev;

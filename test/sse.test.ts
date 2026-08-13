@@ -89,12 +89,15 @@ describe("SseParser", () => {
 it("suppresses observer failures only during expected reload navigation", async () => {
   const setup = async (): Promise<{
     context: BrowserContext;
-    done: (source: unknown, payload?: { reason?: string }) => void;
+    start: (source: unknown, observerId: string) => void;
+    done: (source: unknown, observerId: string, payload?: { reason?: string }) => void;
     emitter: StreamEmitter;
   }> => {
-    let done: ((source: unknown, payload?: { reason?: string }) => void) | undefined;
+    let start: ((source: unknown, observerId: string) => void) | undefined;
+    let done: ((source: unknown, observerId: string, payload?: { reason?: string }) => void) | undefined;
     const context = {
-      exposeBinding: async (name: string, callback: typeof done) => {
+      exposeBinding: async (name: string, callback: typeof done | typeof start) => {
+        if (name === "__cgproStart") start = callback as typeof start;
         if (name === "__cgproDone") done = callback;
       },
       addInitScript: async () => {},
@@ -102,15 +105,40 @@ it("suppresses observer failures only during expected reload navigation", async 
     await ensureInterceptorInstalled(context);
     const emitter = new StreamEmitter();
     setActiveEmitter(context, emitter);
-    return { context, done: done!, emitter };
+    return { context, start: start!, done: done!, emitter };
   };
 
   const normal = await setup();
-  normal.done({}, { reason: "error" });
+  normal.start({}, "normal");
+  normal.done({}, "normal", { reason: "error" });
   expect(normal.emitter.isFinished()).toBe(true);
 
   const reloading = await setup();
   setExpectedReloadNavigation(reloading.context, true);
-  reloading.done({}, { reason: "error" });
+  reloading.start({}, "reloading");
+  reloading.done({}, "reloading", { reason: "error" });
   expect(reloading.emitter.isFinished()).toBe(false);
+});
+
+it("does not deliver a late observer error to the next turn", async () => {
+  let start: ((source: unknown, observerId: string) => void) | undefined;
+  let done: ((source: unknown, observerId: string, payload?: { reason?: string }) => void) | undefined;
+  const context = {
+    exposeBinding: async (name: string, callback: typeof done | typeof start) => {
+      if (name === "__cgproStart") start = callback as typeof start;
+      if (name === "__cgproDone") done = callback as typeof done;
+    },
+    addInitScript: async () => {},
+  } as unknown as BrowserContext;
+  await ensureInterceptorInstalled(context);
+
+  const first = new StreamEmitter();
+  setActiveEmitter(context, first);
+  start!({}, "old-observer");
+
+  const second = new StreamEmitter();
+  setActiveEmitter(context, second);
+  done!({}, "old-observer", { reason: "error" });
+
+  expect(second.isFinished()).toBe(false);
 });

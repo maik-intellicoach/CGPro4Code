@@ -245,6 +245,7 @@ export interface ServerState {
   profile?: string;
   queue: AskQueue;
   readerBudget: PreAdmissionReaderBudget;
+  askInFlight: boolean;
   currentConversation: string | null;
   lastConversation: string | null;
   reloadConversation: string | null;
@@ -346,6 +347,7 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
     profile: opts.profile,
     queue: new AskQueue(QUEUE_MAX, QUEUE_MAX_WAIT_MS),
     readerBudget: new PreAdmissionReaderBudget(PREADMIT_MAX_READERS),
+    askInFlight: false,
     currentConversation: null,
     lastConversation: null,
     reloadConversation: null,
@@ -476,7 +478,7 @@ export async function handleRequest(
       res.end(JSON.stringify({ error: "invalid_conversation_id" }));
       return;
     }
-    const current = state.currentConversation ?? (state.queue.busy ? currentConversationId(state.session.page) : null);
+    const current = state.currentConversation ?? (state.askInFlight ? currentConversationId(state.session.page) : null);
     if (current && requested && requested !== current) {
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "conversation_mismatch", currentConversation: current }));
@@ -606,6 +608,7 @@ export async function handleAsk(
     req.off("aborted", onEarlyDisconnect);
   }
 
+  state.askInFlight = true;
   try {
     // 4 hours upper bound — covers the longest GPT-5.5 Pro turns we've
     // seen in practice. Browser-side stays alive because the daemon owns
@@ -681,6 +684,7 @@ export async function handleAsk(
       state.currentConversation = null;
     }
   } finally {
+    state.askInFlight = false;
     state.queue.release();
   }
 }

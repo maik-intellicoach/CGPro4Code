@@ -40,6 +40,7 @@ function fakeState(overrides: Partial<ServerState> = {}): ServerState {
     background: true,
     queue: new AskQueue(8, 60_000),
     readerBudget: new PreAdmissionReaderBudget(8),
+    askInFlight: false,
     currentConversation: null,
     lastConversation: null,
     reloadConversation: null,
@@ -129,6 +130,7 @@ it("derives the active conversation from the page URL before the first stream ev
   await queue.acquire();
   const state = fakeState({
     queue,
+    askInFlight: true,
     session: { page: { url: () => `https://chatgpt.com/c/${conversationId}` } } as unknown as Session,
   });
   const req = new FakeReq() as unknown as IncomingMessage;
@@ -166,6 +168,48 @@ it("reserves the browser lane while reopening an idle conversation", async () =>
   expect((res as unknown as FakeRes).statusCode).toBe(200);
   expect(state.queue.busy).toBe(false);
   expect(state.reloadConversation).toBeNull();
+});
+
+it("rejects a second idle reload without leaving stale active state", async () => {
+  const conversationId = "44444444-4444-4444-4444-444444444444";
+  let releaseOpen!: () => void;
+  let markEntered!: () => void;
+  const openGate = new Promise<void>((resolve) => { releaseOpen = resolve; });
+  const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+  const state = fakeState({
+    lastConversation: conversationId,
+    session: { page: { url: () => `https://chatgpt.com/c/${conversationId}` } } as unknown as Session,
+  });
+  browserConversation.openConversation.mockImplementation(async () => {
+    markEntered();
+    await openGate;
+  });
+  browserConversation.turnIsWorking.mockResolvedValue(false);
+  browserConversation.readLatestAssistantText.mockResolvedValue("finished");
+
+  const firstReq = new FakeReq() as unknown as IncomingMessage;
+  const firstRes = new FakeRes() as unknown as ServerResponse;
+  Object.assign(firstReq, { method: "POST", url: "/reload", headers: { authorization: "Bearer test-token" } });
+  const first = handleRequest(firstReq, firstRes, state);
+  sendBody(firstReq, {});
+  await entered;
+
+  const secondReq = new FakeReq() as unknown as IncomingMessage;
+  const secondRes = new FakeRes() as unknown as ServerResponse;
+  Object.assign(secondReq, { method: "POST", url: "/reload", headers: { authorization: "Bearer test-token" } });
+  const second = handleRequest(secondReq, secondRes, state);
+  sendBody(secondReq, {});
+  await second;
+
+  expect((secondRes as unknown as FakeRes).statusCode).toBe(409);
+  expect(parseJsonBody(secondRes as unknown as FakeRes)).toEqual({ error: "current_conversation_pending" });
+  expect(state.currentConversation).toBeNull();
+  expect(state.reloadConversation).toBeNull();
+
+  releaseOpen();
+  await first;
+  expect((firstRes as unknown as FakeRes).statusCode).toBe(200);
+  expect(state.queue.busy).toBe(false);
 });
 
 it("applies the shared pre-admission reader budget to reload bodies", async () => {
