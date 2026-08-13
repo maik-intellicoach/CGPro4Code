@@ -146,9 +146,9 @@ export async function getDaemonStatus(info: DaemonInfo): Promise<StatusResponse 
 
 export async function requestDaemonReload(
   info: DaemonInfo,
-  conversationId: string,
+  conversationId?: string,
 ): Promise<ReloadResponse | null> {
-  return await jsonRequest<ReloadResponse>(info, "POST", "/reload", { conversationId });
+  return await jsonRequest<ReloadResponse>(info, "POST", "/reload", conversationId ? { conversationId } : {});
 }
 
 export async function shutdownDaemon(info: DaemonInfo): Promise<boolean> {

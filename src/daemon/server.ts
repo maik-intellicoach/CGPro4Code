@@ -30,7 +30,12 @@ import { appendFileSync, openSync, writeSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { openSession, type Session } from "../browser/session.js";
 import { fetchAuthSessionInPage, goHome, isLoggedIn } from "../browser/chatgpt.js";
-import { openConversation, readLatestAssistantText, turnIsWorking } from "../browser/conversation.js";
+import {
+  currentConversationId,
+  openConversation,
+  readLatestAssistantText,
+  turnIsWorking,
+} from "../browser/conversation.js";
 import { detectPlan, fetchMe } from "../api/me.js";
 import { fetchModels, findProSlug } from "../api/models.js";
 import { runAskOnSession, type AskOptions } from "../core/orchestrator.js";
@@ -453,19 +458,25 @@ export async function handleRequest(
       res.end(JSON.stringify({ error: "invalid_conversation_id" }));
       return;
     }
-    const current = state.currentConversation;
+    const current = state.currentConversation ?? currentConversationId(state.session.page);
     if (current && requested && requested !== current) {
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "conversation_mismatch", currentConversation: current }));
       return;
     }
     if (current) {
+      state.currentConversation = current;
       state.reloadConversation = current;
       res.writeHead(202, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, conversationId: current, queued: true }));
       return;
     }
 
+    if (state.queue.busy) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "current_conversation_pending" }));
+      return;
+    }
     const target = requested || state.lastConversation;
     if (!target) {
       res.writeHead(409, { "Content-Type": "application/json" });

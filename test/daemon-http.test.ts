@@ -108,6 +108,26 @@ it("queues a reload only for the exact active conversation", async () => {
   expect(parseJsonBody(res as unknown as FakeRes)).toEqual({ ok: true, conversationId, queued: true });
 });
 
+it("derives the active conversation from the page URL before the first stream event", async () => {
+  const conversationId = "22222222-2222-2222-2222-222222222222";
+  const queue = new AskQueue(8, 60_000);
+  await queue.acquire();
+  const state = fakeState({
+    queue,
+    session: { page: { url: () => `https://chatgpt.com/c/${conversationId}` } } as unknown as Session,
+  });
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST", url: "/reload", headers: { authorization: "Bearer test-token" } });
+
+  const pending = handleRequest(req, res, state);
+  sendBody(req, {});
+  await pending;
+
+  expect((res as unknown as FakeRes).statusCode).toBe(202);
+  expect(state.reloadConversation).toBe(conversationId);
+});
+
 describe("handleAsk HTTP-level wiring", () => {
   it("returns 429 with queue_full when the queue's waiting line is full", async () => {
     const state = fakeState({ queue: new AskQueue(1, 60_000) });

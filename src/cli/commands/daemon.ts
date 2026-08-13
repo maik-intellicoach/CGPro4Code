@@ -163,13 +163,13 @@ export async function daemonReloadCmd(conversationId?: string): Promise<number> 
   }
   const status = await getDaemonStatus(live);
   const target = conversationId ?? status?.currentConversation ?? undefined;
-  if (!target) {
+  if (!target && !status?.busy) {
     console.error(chalk.red("No active conversation to reload."));
     return 1;
   }
   const result = await requestDaemonReload(live, target);
   if (!result?.ok) {
-    console.error(chalk.red(`Reload request for ${target} was refused.`));
+    console.error(chalk.red(`Reload request${target ? ` for ${target}` : ""} was refused.`));
     return 1;
   }
   if (result.queued) {
