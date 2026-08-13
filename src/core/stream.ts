@@ -109,15 +109,8 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
 
   await context.exposeBinding(
     "__cgproDone",
-    (_src, payload?: { reason?: string }) => {
+    (_src) => {
       if (!state.emitter) return;
-      if (payload?.reason === "error") {
-        state.emitter.push({
-          type: "error",
-          message: "fetch interceptor caught a stream error",
-        });
-        return;
-      }
       // Only treat this as the terminal `done` if we actually streamed
       // some text. ChatGPT's page issues several taps on
       // /backend-api/conversation per turn (setup, requirements, the
@@ -134,7 +127,7 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
     const w = window as unknown as Window & {
       __cgproInstalled?: boolean;
       __cgproChunk?: (raw: string) => void;
-      __cgproDone?: (payload?: { reason?: string }) => void;
+      __cgproDone?: () => void;
     };
     if (w.__cgproInstalled) return;
     w.__cgproInstalled = true;
@@ -180,7 +173,9 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
             if (tail) w.__cgproChunk?.(tail);
             w.__cgproDone?.();
           } catch {
-            w.__cgproDone?.({ reason: "error" });
+            // The cloned observer stream is auxiliary. Navigation during an
+            // exact-conversation reload aborts it while the original ChatGPT
+            // turn keeps running; authoritative completion comes from the DOM.
           }
         })();
       } catch {
