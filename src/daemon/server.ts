@@ -178,6 +178,12 @@ export class AskQueue {
     return this.active;
   }
 
+  tryAcquire(): boolean {
+    if (this.active || this.waiting.length > 0) return false;
+    this.active = true;
+    return true;
+  }
+
   acquire(signal?: AbortSignal): Promise<void> {
     if (this.waiting.length >= this.maxDepth) {
       return Promise.reject(new QueueFullError(this.waiting.length));
@@ -472,23 +478,27 @@ export async function handleRequest(
       return;
     }
 
-    if (state.queue.busy) {
-      res.writeHead(409, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "current_conversation_pending" }));
-      return;
-    }
     const target = requested || state.lastConversation;
     if (!target) {
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "no_conversation" }));
       return;
     }
-    await openConversation(state.session.page, { conversationId: target });
-    const working = await turnIsWorking(state.session.page);
-    const finalText = working ? "" : await readLatestAssistantText(state.session.page);
-    state.lastConversation = target;
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, conversationId: target, queued: false, working, finalText }));
+    if (!state.queue.tryAcquire()) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "current_conversation_pending" }));
+      return;
+    }
+    try {
+      await openConversation(state.session.page, { conversationId: target });
+      const working = await turnIsWorking(state.session.page);
+      const finalText = working ? "" : await readLatestAssistantText(state.session.page);
+      state.lastConversation = target;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, conversationId: target, queued: false, working, finalText }));
+    } finally {
+      state.queue.release();
+    }
     return;
   }
 

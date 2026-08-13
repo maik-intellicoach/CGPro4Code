@@ -10,6 +10,18 @@ vi.mock("../src/core/orchestrator.js", () => ({
   runAskOnSession: (...args: unknown[]) => runAskOnSession(...args),
 }));
 
+const browserConversation = vi.hoisted(() => ({
+  openConversation: vi.fn(),
+  readLatestAssistantText: vi.fn(),
+  turnIsWorking: vi.fn(),
+}));
+vi.mock("../src/browser/conversation.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/browser/conversation.js")>(
+    "../src/browser/conversation.js",
+  );
+  return { ...actual, ...browserConversation };
+});
+
 // Small bounds so the body-timeout/body-too-large tests don't need to wait
 // out (or allocate) the real production defaults (C-092 P-026 xfam r1 H1).
 process.env.CGPRO_DAEMON_BODY_TIMEOUT_MS = "200";
@@ -74,6 +86,9 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
 
 beforeEach(() => {
   runAskOnSession.mockReset();
+  browserConversation.openConversation.mockReset();
+  browserConversation.readLatestAssistantText.mockReset();
+  browserConversation.turnIsWorking.mockReset();
 });
 
 it("returns authenticated account facts from daemon status", async () => {
@@ -126,6 +141,30 @@ it("derives the active conversation from the page URL before the first stream ev
 
   expect((res as unknown as FakeRes).statusCode).toBe(202);
   expect(state.reloadConversation).toBe(conversationId);
+});
+
+it("reserves the browser lane while reopening an idle conversation", async () => {
+  const conversationId = "33333333-3333-3333-3333-333333333333";
+  const state = fakeState({
+    lastConversation: conversationId,
+    session: { page: { url: () => "https://chatgpt.com/" } } as unknown as Session,
+  });
+  browserConversation.openConversation.mockImplementation(async () => {
+    expect(state.queue.busy).toBe(true);
+    expect(state.queue.tryAcquire()).toBe(false);
+  });
+  browserConversation.turnIsWorking.mockResolvedValue(false);
+  browserConversation.readLatestAssistantText.mockResolvedValue("finished");
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST", url: "/reload", headers: { authorization: "Bearer test-token" } });
+
+  const pending = handleRequest(req, res, state);
+  sendBody(req, {});
+  await pending;
+
+  expect((res as unknown as FakeRes).statusCode).toBe(200);
+  expect(state.queue.busy).toBe(false);
 });
 
 describe("handleAsk HTTP-level wiring", () => {
