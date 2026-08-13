@@ -30,6 +30,7 @@ import { appendFileSync, openSync, writeSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { openSession, type Session } from "../browser/session.js";
 import { fetchAuthSessionInPage, goHome, isLoggedIn } from "../browser/chatgpt.js";
+import { openConversation, readLatestAssistantText, turnIsWorking } from "../browser/conversation.js";
 import { detectPlan, fetchMe } from "../api/me.js";
 import { fetchModels, findProSlug } from "../api/models.js";
 import { runAskOnSession, type AskOptions } from "../core/orchestrator.js";
@@ -235,6 +236,7 @@ export interface ServerState {
   readerBudget: PreAdmissionReaderBudget;
   currentConversation: string | null;
   lastConversation: string | null;
+  reloadConversation: string | null;
   account?: {
     email?: string;
     plan: string;
@@ -335,6 +337,7 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
     readerBudget: new PreAdmissionReaderBudget(PREADMIT_MAX_READERS),
     currentConversation: null,
     lastConversation: null,
+    reloadConversation: null,
     account,
   };
 
@@ -431,6 +434,50 @@ export async function handleRequest(
 
   if (method === "POST" && url.pathname === "/ask") {
     await handleAsk(req, res, state);
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/reload") {
+    let body: { conversationId?: string } | null;
+    try {
+      body = await readJsonBody<{ conversationId?: string }>(req);
+    } catch (err) {
+      const status = err instanceof BodyTimeoutError ? 408 : err instanceof BodyTooLargeError ? 413 : 400;
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: status === 408 ? "body_timeout" : status === 413 ? "body_too_large" : "invalid_request" }));
+      return;
+    }
+    const requested = body?.conversationId?.trim();
+    if (requested && !/^[0-9a-f-]{36}$/i.test(requested)) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_conversation_id" }));
+      return;
+    }
+    const current = state.currentConversation;
+    if (current && requested && requested !== current) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "conversation_mismatch", currentConversation: current }));
+      return;
+    }
+    if (current) {
+      state.reloadConversation = current;
+      res.writeHead(202, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, conversationId: current, queued: true }));
+      return;
+    }
+
+    const target = requested || state.lastConversation;
+    if (!target) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "no_conversation" }));
+      return;
+    }
+    await openConversation(state.session.page, { conversationId: target });
+    const working = await turnIsWorking(state.session.page);
+    const finalText = working ? "" : await readLatestAssistantText(state.session.page);
+    state.lastConversation = target;
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, conversationId: target, queued: false, working, finalText }));
     return;
   }
 
@@ -549,6 +596,12 @@ export async function handleAsk(
       headless: false,
       background: state.background,
       profile: state.profile,
+      consumeReload: () => {
+        if (!state.reloadConversation || state.reloadConversation !== state.currentConversation) return null;
+        const conversationId = state.reloadConversation;
+        state.reloadConversation = null;
+        return conversationId;
+      },
     };
 
     const runner = runAskOnSession(askOpts, state.session);
@@ -584,12 +637,14 @@ export async function handleAsk(
         res.end();
       }
     } catch (err) {
+      state.lastConversation = state.currentConversation ?? state.lastConversation;
       log.error(`ask turn failed: ${(err as Error).message}`);
       if (!clientGone) {
         writeEvent("error", { message: (err as Error).message });
         res.end();
       }
     } finally {
+      state.reloadConversation = null;
       state.currentConversation = null;
     }
   } finally {

@@ -30,6 +30,7 @@ function fakeState(overrides: Partial<ServerState> = {}): ServerState {
     readerBudget: new PreAdmissionReaderBudget(8),
     currentConversation: null,
     lastConversation: null,
+    reloadConversation: null,
     ...overrides,
   };
 }
@@ -89,6 +90,22 @@ it("returns authenticated account facts from daemon status", async () => {
   expect(parseJsonBody(res as unknown as FakeRes)).toMatchObject({
     account: { email: "account@example.test", plan: "pro", proModelAvailable: true },
   });
+});
+
+it("queues a reload only for the exact active conversation", async () => {
+  const conversationId = "11111111-1111-1111-1111-111111111111";
+  const state = fakeState({ currentConversation: conversationId });
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST", url: "/reload", headers: { authorization: "Bearer test-token" } });
+
+  const pending = handleRequest(req, res, state);
+  sendBody(req, { conversationId });
+  await pending;
+
+  expect((res as unknown as FakeRes).statusCode).toBe(202);
+  expect(state.reloadConversation).toBe(conversationId);
+  expect(parseJsonBody(res as unknown as FakeRes)).toEqual({ ok: true, conversationId, queued: true });
 });
 
 describe("handleAsk HTTP-level wiring", () => {

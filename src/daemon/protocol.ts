@@ -125,3 +125,11 @@ export interface StatusResponse {
   /** UUID of the last completed turn, if any. */
   lastConversation?: string | null;
 }
+
+export interface ReloadResponse {
+  ok: boolean;
+  conversationId: string;
+  queued?: boolean;
+  working?: boolean;
+  finalText?: string;
+}

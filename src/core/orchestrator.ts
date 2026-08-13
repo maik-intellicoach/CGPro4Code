@@ -38,6 +38,8 @@ export interface AskOptions {
   /** Hide the browser window off-screen for unobtrusive runs. */
   background?: boolean;
   profile?: string;
+  /** Daemon-only hook: consume a guarded reload request for this turn. */
+  consumeReload?: () => string | null;
 }
 
 export interface AskResult {
@@ -141,7 +143,21 @@ function runAskInner(
       // didn't recognize), we fall back to DOM detection.
       log(`waitTurnComplete (timeout ${opts.timeoutSec}s)…`);
       try {
-        await waitTurnComplete(page, opts.timeoutSec * 1_000, priorBubbles);
+        await waitTurnComplete(page, opts.timeoutSec * 1_000, priorBubbles, undefined, {
+          consumeReload: opts.consumeReload,
+          conversationId: () => {
+            const started = collected.find((event) => event.type === "started");
+            return currentConversationId(page) ??
+              (started?.type === "started" ? started.conversationId ?? null : null);
+          },
+          onReload: ({ conversationId, working, extended }) => {
+            emitter.push({
+              type: "tool",
+              name: extended ? "wait-extended" : "conversation-reloaded",
+              meta: { conversationId, working, waitExtendedSec: extended ? opts.timeoutSec : 0 },
+            });
+          },
+        });
       } catch (err) {
         if (debug) {
           try {

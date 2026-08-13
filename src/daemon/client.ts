@@ -14,6 +14,7 @@ import {
   type AskRequest,
   type AskSummary,
   type DaemonInfo,
+  type ReloadResponse,
   type StatusResponse,
 } from "./protocol.js";
 import { profileDir } from "../store/paths.js";
@@ -141,6 +142,13 @@ async function healthCheck(info: DaemonInfo, timeoutMs: number): Promise<boolean
 
 export async function getDaemonStatus(info: DaemonInfo): Promise<StatusResponse | null> {
   return await jsonRequest<StatusResponse>(info, "GET", "/status", null);
+}
+
+export async function requestDaemonReload(
+  info: DaemonInfo,
+  conversationId: string,
+): Promise<ReloadResponse | null> {
+  return await jsonRequest<ReloadResponse>(info, "POST", "/reload", { conversationId });
 }
 
 export async function shutdownDaemon(info: DaemonInfo): Promise<boolean> {

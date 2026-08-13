@@ -13,6 +13,7 @@ import { doctorCommand } from "./commands/doctor.js";
 import { logoutCommand } from "./commands/logout.js";
 import {
   daemonServerCmd,
+  daemonReloadCmd,
   daemonStartCmd,
   daemonStatusCmd,
   daemonStopCmd,
@@ -239,6 +240,15 @@ daemon
   .option("--json", "emit JSON")
   .action(async (opts) => {
     const code = await runOrExit(() => daemonStatusCmd(opts));
+    process.exit(code);
+  });
+
+daemon
+  .command("reload [conversation-id]")
+  .alias("r")
+  .description("Reload the exact active ChatGPT conversation in the daemon browser.")
+  .action(async (conversationId?: string) => {
+    const code = await runOrExit(() => daemonReloadCmd(conversationId));
     process.exit(code);
   });
 

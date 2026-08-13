@@ -10,6 +10,7 @@ import ora from "ora";
 import {
   getDaemonStatus,
   getLiveDaemon,
+  requestDaemonReload,
   shutdownDaemon,
 } from "../../daemon/client.js";
 import {
@@ -151,6 +152,34 @@ export async function daemonStatusCmd(opts: { json?: boolean }): Promise<number>
     }
   }
   console.log(chalk.dim(`  log:           ${DAEMON_LOG}`));
+  return 0;
+}
+
+export async function daemonReloadCmd(conversationId?: string): Promise<number> {
+  const live = await getLiveDaemon();
+  if (!live) {
+    console.error(chalk.red("Daemon is not running."));
+    return 1;
+  }
+  const status = await getDaemonStatus(live);
+  const target = conversationId ?? status?.currentConversation ?? undefined;
+  if (!target) {
+    console.error(chalk.red("No active conversation to reload."));
+    return 1;
+  }
+  const result = await requestDaemonReload(live, target);
+  if (!result?.ok) {
+    console.error(chalk.red(`Reload request for ${target} was refused.`));
+    return 1;
+  }
+  if (result.queued) {
+    console.log(chalk.green(`Reload requested for ${result.conversationId}.`));
+  } else if (result.working) {
+    console.log(chalk.yellow(`Reloaded ${result.conversationId}; ChatGPT is still working.`));
+  } else {
+    console.log(chalk.green(`Reloaded ${result.conversationId}; the response is ready.`));
+    if (result.finalText) process.stdout.write(result.finalText + "\n");
+  }
   return 0;
 }
 

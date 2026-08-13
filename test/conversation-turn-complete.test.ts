@@ -44,10 +44,43 @@ describe("waitTurnComplete error classification", () => {
     vi.spyOn(Date, "now")
       .mockReturnValueOnce(0)
       .mockReturnValue(1_200_000);
-    const page = {} as Page;
+    const page = { url: () => "https://chatgpt.com/" } as Page;
 
     await expect(waitTurnComplete(page, 1_200_000)).rejects.toEqual(
       new TurnTimeoutError(1_200),
     );
+  });
+
+  it("reloads the exact conversation and extends while ChatGPT is still working", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      let reloaded = false;
+      const bubble = {
+        getAttribute: vi.fn(async () => null),
+        innerText: vi.fn(async () => "ready"),
+      };
+      const locator = {
+        count: vi.fn(async () => reloaded ? 1 : 0),
+        nth: vi.fn(() => bubble),
+      };
+      const page = {
+        locator: vi.fn(() => locator),
+        goto: vi.fn(async () => { reloaded = true; }),
+        waitForTimeout: vi.fn(async (ms: number) => { await vi.advanceTimersByTimeAsync(ms); }),
+      } as unknown as Page;
+      firstResolved.mockResolvedValueOnce({}).mockResolvedValue(null);
+      const onReload = vi.fn();
+
+      await waitTurnComplete(page, 10_000, 0, 100, {
+        conversationId: () => "conv-1",
+        onReload,
+      });
+
+      expect(page.goto).toHaveBeenCalledWith("https://chatgpt.com/c/conv-1", expect.any(Object));
+      expect(onReload).toHaveBeenCalledWith({ conversationId: "conv-1", working: true, extended: true });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

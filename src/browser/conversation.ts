@@ -310,26 +310,56 @@ export async function waitTurnComplete(
   // The Stop button check resets this window when chatgpt.com is still
   // streaming, but we'd rather over-wait than truncate a long answer.
   stableMs = Number(process.env.CGPRO_STABLE_MS ?? 4000),
+  control: {
+    consumeReload?: () => string | null;
+    conversationId?: () => string | null;
+    onReload?: (state: { conversationId: string; working: boolean; extended: boolean }) => void;
+  } = {},
 ): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-
-  // Phase 1: wait for a new assistant bubble.
-  while (Date.now() < deadline) {
-    const count = await page.locator(SELECTORS.assistantMessages.join(", ")).count();
-    if (count > priorAssistantCount) break;
-    await page.waitForTimeout(250);
-  }
-  if (Date.now() >= deadline) {
-    throw new TurnTimeoutError(Math.ceil(timeoutMs / 1_000));
-  }
-
-  // Phase 2: poll the bubble's text every 400ms; consider the turn
-  // complete once the text has not changed for `stableMs`.
+  let deadline = Date.now() + timeoutMs;
   let lastText = "";
   let lastChangedAt = Date.now();
 
-  while (Date.now() < deadline) {
-    // Hard signal: the legacy stop button means "still streaming".
+  for (;;) {
+    const requestedConversation = control.consumeReload?.() ?? null;
+    const expired = Date.now() >= deadline;
+    if (requestedConversation || expired) {
+      const conversationId =
+        requestedConversation ?? control.conversationId?.() ?? currentConversationId(page);
+      if (!conversationId) {
+        if (expired) throw new TurnTimeoutError(Math.ceil(timeoutMs / 1_000));
+      } else {
+        await page.goto(`https://chatgpt.com/c/${conversationId}`, {
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
+        });
+        await requireSelector(page, SELECTORS.composer, "composer", 20_000);
+
+        const working = await turnIsWorking(page);
+        if (working) {
+          deadline = Date.now() + timeoutMs;
+          lastChangedAt = Date.now();
+          control.onReload?.({ conversationId, working: true, extended: true });
+          continue;
+        }
+        control.onReload?.({ conversationId, working: false, extended: false });
+        if (expired) {
+          const count = await page.locator(SELECTORS.assistantMessages.join(", ")).count();
+          const bubble = count > priorAssistantCount ? await latestAssistantBubble(page) : null;
+          const text = bubble ? ((await bubble.innerText().catch(() => "")) ?? "") : "";
+          if (!text) throw new TurnTimeoutError(Math.ceil(timeoutMs / 1_000));
+        }
+        lastText = "";
+        lastChangedAt = Date.now();
+      }
+    }
+
+    const count = await page.locator(SELECTORS.assistantMessages.join(", ")).count();
+    if (count <= priorAssistantCount) {
+      await page.waitForTimeout(250);
+      continue;
+    }
+
     const stop = await firstResolved(page, SELECTORS.stopButton);
     if (stop) {
       await page.waitForTimeout(400);
@@ -366,8 +396,12 @@ export async function waitTurnComplete(
 
     await page.waitForTimeout(300);
   }
+}
 
-  throw new TurnTimeoutError(Math.ceil(timeoutMs / 1_000));
+export async function turnIsWorking(page: Page): Promise<boolean> {
+  if (await firstResolved(page, SELECTORS.stopButton)) return true;
+  const bubble = await latestAssistantBubble(page);
+  return (await bubble?.getAttribute("data-message-streaming").catch(() => null)) === "true";
 }
 
 export async function latestAssistantBubble(page: Page): Promise<Locator | null> {

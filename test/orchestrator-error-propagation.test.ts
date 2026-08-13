@@ -70,7 +70,13 @@ describe("runAskOnSession wait failure propagation", () => {
 
     expect(await result).toBe(closed);
     expect(events).toEqual([{ type: "error", message: closed.message }]);
-    expect(waitTurnComplete).toHaveBeenCalledWith(activeSession.page, 1_200_000, 0);
+    expect(waitTurnComplete).toHaveBeenCalledWith(
+      activeSession.page,
+      1_200_000,
+      0,
+      undefined,
+      expect.objectContaining({ consumeReload: undefined }),
+    );
   });
 
   it("keeps the existing cancellation path non-terminal when a wait rejects afterwards", async () => {

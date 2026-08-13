@@ -52,9 +52,9 @@ export class SelectorBrokenError extends CgproError {
 export class TurnTimeoutError extends CgproError {
   constructor(seconds: number) {
     super(
-      `Timed out waiting for the model after ${seconds}s.`,
+      `The refreshed conversation showed neither a completed response nor active generation after ${seconds}s.`,
       6,
-      "Try `--timeout <bigger>` or check your network.",
+      "Check the conversation in ChatGPT or your network before retrying the prompt.",
     );
     this.name = "TurnTimeoutError";
   }
