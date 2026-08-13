@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { SseParser } from "../src/core/stream.js";
+import type { BrowserContext } from "patchright";
+import {
+  ensureInterceptorInstalled,
+  setActiveEmitter,
+  setExpectedReloadNavigation,
+  SseParser,
+  StreamEmitter,
+} from "../src/core/stream.js";
 
 describe("SseParser", () => {
   it("parses simple {v: text} append deltas", () => {
@@ -77,4 +84,33 @@ describe("SseParser", () => {
     expect(text).toBe(" world");
     expect(p.cumulativeText()).toBe("hello world");
   });
+});
+
+it("suppresses observer failures only during expected reload navigation", async () => {
+  const setup = async (): Promise<{
+    context: BrowserContext;
+    done: (source: unknown, payload?: { reason?: string }) => void;
+    emitter: StreamEmitter;
+  }> => {
+    let done: ((source: unknown, payload?: { reason?: string }) => void) | undefined;
+    const context = {
+      exposeBinding: async (name: string, callback: typeof done) => {
+        if (name === "__cgproDone") done = callback;
+      },
+      addInitScript: async () => {},
+    } as unknown as BrowserContext;
+    await ensureInterceptorInstalled(context);
+    const emitter = new StreamEmitter();
+    setActiveEmitter(context, emitter);
+    return { context, done: done!, emitter };
+  };
+
+  const normal = await setup();
+  normal.done({}, { reason: "error" });
+  expect(normal.emitter.isFinished()).toBe(true);
+
+  const reloading = await setup();
+  setExpectedReloadNavigation(reloading.context, true);
+  reloading.done({}, { reason: "error" });
+  expect(reloading.emitter.isFinished()).toBe(false);
 });

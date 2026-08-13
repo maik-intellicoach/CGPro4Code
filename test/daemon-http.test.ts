@@ -147,7 +147,7 @@ it("reserves the browser lane while reopening an idle conversation", async () =>
   const conversationId = "33333333-3333-3333-3333-333333333333";
   const state = fakeState({
     lastConversation: conversationId,
-    session: { page: { url: () => "https://chatgpt.com/" } } as unknown as Session,
+    session: { page: { url: () => `https://chatgpt.com/c/${conversationId}` } } as unknown as Session,
   });
   browserConversation.openConversation.mockImplementation(async () => {
     expect(state.queue.busy).toBe(true);
@@ -165,6 +165,21 @@ it("reserves the browser lane while reopening an idle conversation", async () =>
 
   expect((res as unknown as FakeRes).statusCode).toBe(200);
   expect(state.queue.busy).toBe(false);
+  expect(state.reloadConversation).toBeNull();
+});
+
+it("applies the shared pre-admission reader budget to reload bodies", async () => {
+  const readerBudget = new PreAdmissionReaderBudget(1);
+  readerBudget.acquire();
+  const state = fakeState({ readerBudget });
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST", url: "/reload", headers: { authorization: "Bearer test-token" } });
+
+  await handleRequest(req, res, state);
+
+  expect((res as unknown as FakeRes).statusCode).toBe(429);
+  expect(parseJsonBody(res as unknown as FakeRes)).toMatchObject({ error: "reader_budget_exceeded" });
 });
 
 describe("handleAsk HTTP-level wiring", () => {

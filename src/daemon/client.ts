@@ -148,7 +148,13 @@ export async function requestDaemonReload(
   info: DaemonInfo,
   conversationId?: string,
 ): Promise<ReloadResponse | null> {
-  return await jsonRequest<ReloadResponse>(info, "POST", "/reload", conversationId ? { conversationId } : {});
+  return await jsonRequest<ReloadResponse>(
+    info,
+    "POST",
+    "/reload",
+    conversationId ? { conversationId } : {},
+    90_000,
+  );
 }
 
 export async function shutdownDaemon(info: DaemonInfo): Promise<boolean> {
@@ -161,6 +167,7 @@ function jsonRequest<T>(
   method: string,
   path: string,
   body: unknown,
+  timeoutMs = 5_000,
 ): Promise<T | null> {
   return new Promise((resolve) => {
     const payload = body === null ? undefined : JSON.stringify(body);
@@ -170,7 +177,7 @@ function jsonRequest<T>(
         port: info.port,
         path,
         method,
-        timeout: 5_000,
+        timeout: timeoutMs,
         headers: {
           Authorization: `Bearer ${info.token}`,
           ...(payload ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) } : {}),

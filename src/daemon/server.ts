@@ -451,12 +451,24 @@ export async function handleRequest(
   if (method === "POST" && url.pathname === "/reload") {
     let body: { conversationId?: string } | null;
     try {
+      state.readerBudget.acquire();
+    } catch (err) {
+      if (err instanceof ReaderBudgetExceededError) {
+        res.writeHead(429, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "reader_budget_exceeded", active: err.active }));
+        return;
+      }
+      throw err;
+    }
+    try {
       body = await readJsonBody<{ conversationId?: string }>(req);
     } catch (err) {
       const status = err instanceof BodyTimeoutError ? 408 : err instanceof BodyTooLargeError ? 413 : 400;
       res.writeHead(status, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: status === 408 ? "body_timeout" : status === 413 ? "body_too_large" : "invalid_request" }));
       return;
+    } finally {
+      state.readerBudget.release();
     }
     const requested = body?.conversationId?.trim();
     if (requested && !/^[0-9a-f-]{36}$/i.test(requested)) {
@@ -464,7 +476,7 @@ export async function handleRequest(
       res.end(JSON.stringify({ error: "invalid_conversation_id" }));
       return;
     }
-    const current = state.currentConversation ?? currentConversationId(state.session.page);
+    const current = state.currentConversation ?? (state.queue.busy ? currentConversationId(state.session.page) : null);
     if (current && requested && requested !== current) {
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "conversation_mismatch", currentConversation: current }));

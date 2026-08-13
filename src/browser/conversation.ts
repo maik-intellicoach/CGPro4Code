@@ -2,6 +2,7 @@ import type { Page, Locator } from "patchright";
 import { SELECTORS } from "./selectors.js";
 import { firstResolved, requireSelector } from "./chatgpt.js";
 import { TurnTimeoutError } from "../errors.js";
+import { setExpectedReloadNavigation } from "../core/stream.js";
 
 /**
  * Open a chatgpt.com conversation.
@@ -329,11 +330,16 @@ export async function waitTurnComplete(
       if (!conversationId) {
         if (expired) throw new TurnTimeoutError(Math.ceil(timeoutMs / 1_000));
       } else {
-        await page.goto(`https://chatgpt.com/c/${conversationId}`, {
-          waitUntil: "domcontentloaded",
-          timeout: 60_000,
-        });
-        await requireSelector(page, SELECTORS.composer, "composer", 20_000);
+        setExpectedReloadNavigation(page.context(), true);
+        try {
+          await page.goto(`https://chatgpt.com/c/${conversationId}`, {
+            waitUntil: "domcontentloaded",
+            timeout: 60_000,
+          });
+          await requireSelector(page, SELECTORS.composer, "composer", 20_000);
+        } finally {
+          setExpectedReloadNavigation(page.context(), false);
+        }
 
         const working = await turnIsWorking(page);
         if (working) {

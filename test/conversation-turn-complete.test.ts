@@ -67,6 +67,7 @@ describe("waitTurnComplete error classification", () => {
       const page = {
         locator: vi.fn(() => locator),
         goto: vi.fn(async () => { reloaded = true; }),
+        context: vi.fn(() => ({})),
         waitForTimeout: vi.fn(async (ms: number) => { await vi.advanceTimersByTimeAsync(ms); }),
       } as unknown as Page;
       firstResolved.mockResolvedValueOnce({}).mockResolvedValue(null);

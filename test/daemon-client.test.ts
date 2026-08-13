@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { askViaDaemon, type RetryPolicy } from "../src/daemon/client.js";
+import { askViaDaemon, requestDaemonReload, type RetryPolicy } from "../src/daemon/client.js";
 import type { DaemonInfo } from "../src/daemon/protocol.js";
 import type { StreamEvent } from "../src/core/stream.js";
 
@@ -132,3 +132,14 @@ describe("askViaDaemon retry/error contract (C-092 F5)", () => {
     expect(result.finalText).toBe("");
   });
 });
+
+it("allows an idle conversation reload to outlast the five-second status timeout", async () => {
+  const info = await listen((_req, res) => {
+    setTimeout(() => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, conversationId: "c1", queued: false, working: false }));
+    }, 5_500);
+  });
+
+  await expect(requestDaemonReload(info, "c1")).resolves.toMatchObject({ ok: true, conversationId: "c1" });
+}, 10_000);
