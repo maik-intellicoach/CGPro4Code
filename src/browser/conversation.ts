@@ -290,6 +290,20 @@ export async function setConnector(page: Page, name: string): Promise<void> {
 
   let connector = await visibleComposerTool(page, connectorName);
   if (!connector) {
+    // Personal Pro custom MCP connectors live behind the distinct
+    // "Developer mode" entry in the plus menu. They are connected apps but
+    // do not appear in the ordinary installed-plugin search surface.
+    const developerMode = page
+      .locator('[role="menuitem"], [role="menuitemradio"], button')
+      .filter({ hasText: /^\s*Developer mode\s*$/i })
+      .first();
+    if ((await developerMode.count().catch(() => 0)) > 0 && (await developerMode.isVisible().catch(() => false))) {
+      await developerMode.click({ timeout: 5_000 });
+      await page.waitForTimeout(300);
+      connector = await waitForComposerTool(page, connectorName);
+    }
+  }
+  if (!connector) {
     // Current ChatGPT Pro builds expose installed connectors as Plugins
     // behind a search field in the plus menu. The initial list is only a
     // short set of suggestions, so absence there is not absence from the
