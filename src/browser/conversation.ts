@@ -224,6 +224,16 @@ async function visibleComposerTool(page: Page, name: string): Promise<Locator | 
   return null;
 }
 
+async function waitForComposerTool(page: Page, name: string, timeoutMs = 8_000): Promise<Locator | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const tool = await visibleComposerTool(page, name);
+    if (tool) return tool;
+    await page.waitForTimeout(250);
+  }
+  return null;
+}
+
 async function recordConnectorDiagnostics(page: Page): Promise<void> {
   if (process.env.CGPRO_DEBUG !== "1") return;
   const surfaces = page.locator('[role="menu"]:visible, [role="dialog"]:visible, [role="listbox"]:visible');
@@ -294,8 +304,7 @@ export async function setConnector(page: Page, name: string): Promise<void> {
       // root; it has no fillable textbox in the DOM.
       await page.keyboard.type(connectorName);
     }
-    await page.waitForTimeout(500);
-    connector = await visibleComposerTool(page, connectorName);
+    connector = await waitForComposerTool(page, connectorName);
   }
   if (!connector) {
     // Some ChatGPT builds put installed apps one level below the main
