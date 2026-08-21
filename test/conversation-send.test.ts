@@ -54,6 +54,8 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     expect(clickA).toHaveBeenCalledTimes(1);
     expect(clickB).toHaveBeenCalledTimes(1); // the fallback chain WAS reachable
     expect(firstResolved).toHaveBeenCalledTimes(2); // re-resolved, not reused stale locator
+    expect(page.keyboard.press).toHaveBeenCalledWith("Meta+A");
+    expect(page.keyboard.press).toHaveBeenCalledWith("Backspace");
     expect((page.keyboard.press as ReturnType<typeof vi.fn>)).not.toHaveBeenCalledWith("Enter");
   });
 

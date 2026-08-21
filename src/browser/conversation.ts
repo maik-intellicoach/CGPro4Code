@@ -358,6 +358,11 @@ export async function sendPrompt(page: Page, prompt: string): Promise<number> {
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
   await composer.click();
   await page.waitForTimeout(120);
+  // Connector/plugin menus can route keyboard search text into the composer
+  // on some ChatGPT builds. Always replace the composer contents so a failed
+  // or stale picker query cannot contaminate the actual prompt.
+  await page.keyboard.press("Meta+A");
+  await page.keyboard.press("Backspace");
   // Composer is a contenteditable div on modern chatgpt.com — use the
   // keyboard so React's state listeners actually fire.
   const lines = prompt.split("\n");
