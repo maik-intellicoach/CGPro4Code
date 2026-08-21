@@ -232,6 +232,7 @@ export function askViaDaemon(
     prompt: opts.prompt,
     model: opts.model,
     web: opts.web,
+    connector: opts.connector,
     images: opts.images,
     conversationId: opts.conversationId,
     timeoutSec: opts.timeoutSec,

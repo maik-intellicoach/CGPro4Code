@@ -96,6 +96,7 @@ export interface AskRequest {
   prompt: string;
   model?: string;
   web?: boolean;
+  connector?: string;
   images?: string[];
   conversationId?: string;
   /** Per-turn cap. Daemon rejects above 1800s. */

@@ -626,6 +626,7 @@ export async function handleAsk(
       prompt: body.prompt,
       model: body.model,
       web: body.web,
+      connector: typeof body.connector === "string" ? body.connector : undefined,
       images: body.images ?? [],
       conversationId: body.conversationId,
       timeoutSec,

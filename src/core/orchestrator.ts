@@ -7,6 +7,7 @@ import {
   openConversation,
   readLatestAssistantText,
   sendPrompt,
+  setConnector,
   setWebSearch,
   waitTurnComplete,
 } from "../browser/conversation.js";
@@ -22,6 +23,8 @@ export interface AskOptions {
   prompt: string;
   model?: string;
   web?: boolean;
+  /** Exact ChatGPT connector/app name to select before sending. */
+  connector?: string;
   images?: string[];
   /** Resume a previous conversation by its chatgpt.com UUID. */
   conversationId?: string;
@@ -130,6 +133,12 @@ function runAskInner(
       if (opts.web !== undefined) {
         log(`setWebSearch ${opts.web}…`);
         await setWebSearch(page, opts.web);
+      }
+
+      if (opts.connector !== undefined) {
+        log(`setConnector ${opts.connector}…`);
+        await setConnector(page, opts.connector);
+        emitter.push({ type: "tool", name: "connector-selected", meta: { connector: opts.connector } });
       }
 
       await attachImages(page, opts.images ?? []);

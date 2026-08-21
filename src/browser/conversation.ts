@@ -135,26 +135,11 @@ export async function setWebSearch(page: Page, on: boolean): Promise<boolean> {
   // close. Web search shares a radio group with Create image / Deep
   // research, so toggling it on disables those — that's intentional.
 
-  const openPopover = async (): Promise<boolean> => {
-    const plus = await firstResolved(page, [
-      'button[data-testid="composer-plus-btn"]',
-      'button[aria-label*="Add files" i]',
-      'button[aria-label*="Add" i][aria-haspopup]',
-    ]);
-    if (!plus) return false;
-    const expanded = (await plus.getAttribute("aria-expanded").catch(() => null)) === "true";
-    if (!expanded) {
-      await plus.click({ timeout: 3_000 }).catch(() => undefined);
-      await page.waitForTimeout(300);
-    }
-    return true;
-  };
-
   // Try inline first (older layouts).
   let toggle = await firstResolved(page, SELECTORS.webSearchToggle.slice(3)); // skip the menuitemradio variants
   let viaPopover = false;
   if (!toggle) {
-    if (await openPopover()) {
+    if (await openComposerToolsPopover(page)) {
       viaPopover = true;
       toggle = await firstResolved(page, SELECTORS.webSearchToggle);
     }
@@ -205,6 +190,92 @@ export async function setWebSearch(page: Page, on: boolean): Promise<boolean> {
     return false;
   }
   return on;
+}
+
+function escapeRegex(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function openComposerToolsPopover(page: Page): Promise<boolean> {
+  const plus = await firstResolved(page, [
+    'button[data-testid="composer-plus-btn"]',
+    'button[aria-label*="Add files" i]',
+    'button[aria-label*="Add" i][aria-haspopup]',
+  ]);
+  if (!plus) return false;
+  const expanded = (await plus.getAttribute("aria-expanded").catch(() => null)) === "true";
+  if (!expanded) {
+    await plus.click({ timeout: 3_000 }).catch(() => undefined);
+    await page.waitForTimeout(300);
+  }
+  return true;
+}
+
+async function visibleComposerTool(page: Page, name: string): Promise<Locator | null> {
+  const exactName = new RegExp(`^\\s*${escapeRegex(name)}\\s*$`, "i");
+  const candidates = page
+    .locator('[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"], button')
+    .filter({ hasText: exactName });
+  const count = await candidates.count().catch(() => 0);
+  for (let i = 0; i < count; i++) {
+    const candidate = candidates.nth(i);
+    if (await candidate.isVisible().catch(() => false)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Select a named ChatGPT connector/app in the composer tool picker.
+ *
+ * Connector-backed turns must not silently degrade to an ordinary chat:
+ * absence or an unclickable entry is a hard error. Actual tool use remains
+ * a separate postcondition for the caller because successful UI selection
+ * does not prove that the model invoked a connector tool.
+ */
+export async function setConnector(page: Page, name: string): Promise<void> {
+  const connectorName = name.trim();
+  if (!connectorName) throw new Error("connector name must not be empty");
+  if (!(await openComposerToolsPopover(page))) {
+    throw new Error(`ChatGPT connector picker is unavailable; could not select "${connectorName}".`);
+  }
+
+  let connector = await visibleComposerTool(page, connectorName);
+  if (!connector) {
+    // Some ChatGPT builds put installed apps one level below the main
+    // composer menu. Enter that bounded submenu, then resolve the exact
+    // configured app name rather than guessing a product-specific test id.
+    const gateway = page
+      .locator('[role="menuitem"], [role="menuitemradio"], button')
+      .filter({ hasText: /^\s*(Apps|Connectors|More)\s*$/i })
+      .first();
+    if ((await gateway.count().catch(() => 0)) > 0 && (await gateway.isVisible().catch(() => false))) {
+      await gateway.click({ timeout: 5_000 });
+      await page.waitForTimeout(300);
+      connector = await visibleComposerTool(page, connectorName);
+    }
+  }
+
+  if (!connector) {
+    await page.keyboard.press("Escape").catch(() => undefined);
+    throw new Error(`ChatGPT connector "${connectorName}" is not exposed in the composer tool picker.`);
+  }
+
+  const alreadySelected = ["aria-checked", "aria-pressed", "data-state"];
+  for (const attribute of alreadySelected) {
+    const value = await connector.getAttribute(attribute).catch(() => null);
+    if (value === "true" || value === "checked") {
+      await page.keyboard.press("Escape").catch(() => undefined);
+      return;
+    }
+  }
+
+  try {
+    await connector.click({ timeout: 5_000 });
+    await page.waitForTimeout(300);
+  } catch {
+    await page.keyboard.press("Escape").catch(() => undefined);
+    throw new Error(`ChatGPT connector "${connectorName}" was visible but could not be selected.`);
+  }
 }
 
 /**

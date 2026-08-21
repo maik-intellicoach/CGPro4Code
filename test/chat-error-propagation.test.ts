@@ -14,6 +14,7 @@ const goHome = vi.fn();
 const isLoggedIn = vi.fn();
 const fetchAuthSession = vi.fn();
 const openConversation = vi.fn();
+const setConnector = vi.fn();
 const setWebSearch = vi.fn();
 const sendPrompt = vi.fn();
 const waitTurnComplete = vi.fn();
@@ -34,6 +35,7 @@ vi.mock("../src/browser/conversation.js", () => ({
   openConversation: (...args: unknown[]) => openConversation(...args),
   readLatestAssistantText: vi.fn(),
   sendPrompt: (...args: unknown[]) => sendPrompt(...args),
+  setConnector: (...args: unknown[]) => setConnector(...args),
   setWebSearch: (...args: unknown[]) => setWebSearch(...args),
   waitTurnComplete: (...args: unknown[]) => waitTurnComplete(...args),
 }));
