@@ -242,6 +242,26 @@ async function recordConnectorDiagnostics(page: Page): Promise<void> {
   console.error(`[cgpro:connector] screenshot=${screenshotPath}`);
 }
 
+async function pluginSearchBox(page: Page): Promise<Locator | null> {
+  const candidates = page.locator('input:visible, textarea:visible, [contenteditable="true"]:visible, [role="textbox"]:visible');
+  const count = await candidates.count().catch(() => 0);
+  let fallback: Locator | null = null;
+  for (let i = 0; i < count; i++) {
+    const candidate = candidates.nth(i);
+    const id = await candidate.getAttribute("id").catch(() => null);
+    const testId = await candidate.getAttribute("data-testid").catch(() => null);
+    if (id === "prompt-textarea" || testId === "prompt-textarea") continue;
+    const searchHint = [
+      await candidate.getAttribute("placeholder").catch(() => null),
+      await candidate.getAttribute("data-placeholder").catch(() => null),
+      await candidate.getAttribute("aria-label").catch(() => null),
+    ].filter(Boolean).join(" ");
+    if (/search|plugin|connector|app/i.test(searchHint)) return candidate;
+    fallback ??= candidate;
+  }
+  return fallback;
+}
+
 /**
  * Select a named ChatGPT connector/app in the composer tool picker.
  *
@@ -265,12 +285,8 @@ export async function setConnector(page: Page, name: string): Promise<void> {
     // short set of suggestions, so absence there is not absence from the
     // account. Search the exact configured name before trying older nested
     // menu layouts.
-    const pluginSearch = page
-      .locator(
-        'input[placeholder*="search plugins" i], input[placeholder*="search apps" i], input[placeholder*="search connectors" i], [role="searchbox"]',
-      )
-      .first();
-    if ((await pluginSearch.count().catch(() => 0)) > 0 && (await pluginSearch.isVisible().catch(() => false))) {
+    const pluginSearch = await pluginSearchBox(page);
+    if (pluginSearch) {
       await pluginSearch.fill(connectorName);
       await page.waitForTimeout(500);
       connector = await visibleComposerTool(page, connectorName);
