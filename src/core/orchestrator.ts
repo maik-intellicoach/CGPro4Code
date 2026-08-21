@@ -18,6 +18,7 @@ import {
 } from "./stream.js";
 import { NotLoggedInError } from "../errors.js";
 import { SELECTORS as SELECTORS_DUMP } from "../browser/selectors.js";
+import { fetchLatestTurnToolNames } from "../api/conversations.js";
 
 export interface AskOptions {
   prompt: string;
@@ -210,6 +211,18 @@ function runAskInner(
       }
       const actualModel = await latestAssistantModelSlug(page);
       log(`actualModel=${actualModel ?? "(unknown)"} conv=${conversationId ?? "(none)"}`);
+
+      if (opts.connector !== undefined && conversationId) {
+        const observedNames = new Set(
+          collected.filter((event) => event.type === "tool").map((event) => event.name),
+        );
+        const conversationToolNames = await fetchLatestTurnToolNames(page, conversationId);
+        for (const name of conversationToolNames) {
+          if (observedNames.has(name)) continue;
+          observedNames.add(name);
+          emitter.push({ type: "tool", name, meta: { source: "latest-conversation-turn" } });
+        }
+      }
 
       // GPT-5.5 Pro is policy. If the bubble's model slug doesn't include
       // "pro", warn loudly to stderr — the user almost certainly wanted

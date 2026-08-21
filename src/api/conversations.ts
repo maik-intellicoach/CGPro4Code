@@ -34,6 +34,61 @@ export interface FetchOptions {
   debug?: boolean;
 }
 
+type JsonObject = Record<string, unknown>;
+
+function asObject(value: unknown): JsonObject | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as JsonObject
+    : null;
+}
+
+function invokedResourceToolName(message: JsonObject): string | null {
+  const metadata = asObject(message.metadata);
+  const invokedResource = asObject(metadata?.invoked_resource);
+  const resourceUri = invokedResource?.resource_uri;
+  if (typeof resourceUri !== "string") return null;
+  return resourceUri.split("/").filter(Boolean).at(-1) ?? null;
+}
+
+/**
+ * Extract connector tools from only the latest user turn on the current
+ * conversation branch. Older turns and abandoned branches are excluded.
+ */
+export function extractLatestTurnToolNames(body: unknown): string[] {
+  const root = asObject(body);
+  const mapping = asObject(root?.mapping);
+  let nodeId = typeof root?.current_node === "string" ? root.current_node : null;
+  if (!mapping || !nodeId) return [];
+
+  const reverseChronological: string[] = [];
+  const seenNodes = new Set<string>();
+  while (nodeId && !seenNodes.has(nodeId)) {
+    seenNodes.add(nodeId);
+    const node = asObject(mapping[nodeId]);
+    if (!node) break;
+    const message = asObject(node.message);
+    const author = asObject(message?.author);
+    if (author?.role === "user") break;
+    if (message && author?.role === "tool") {
+      const name = invokedResourceToolName(message);
+      if (name) reverseChronological.push(name);
+    }
+    nodeId = typeof node.parent === "string" ? node.parent : null;
+  }
+  return reverseChronological.reverse();
+}
+
+export async function fetchLatestTurnToolNames(
+  page: Page,
+  conversationId: string,
+): Promise<string[]> {
+  const result = await backendApiFetch(page, `/backend-api/conversation/${conversationId}`);
+  if (!result.ok) {
+    throw new Error(`conversation tool evidence fetch failed with HTTP ${result.status}`);
+  }
+  return extractLatestTurnToolNames(result.body);
+}
+
 export async function fetchRemoteConversations(
   page: Page,
   opts: FetchOptions = {},

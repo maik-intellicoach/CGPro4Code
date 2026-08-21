@@ -84,6 +84,17 @@ describe("SseParser", () => {
     expect(text).toBe(" world");
     expect(p.cumulativeText()).toBe("hello world");
   });
+
+  it("names custom connector tool results from invoked_resource metadata", () => {
+    const p = new SseParser();
+    const events = p.feed(
+      'data: {"message":{"author":{"role":"tool"},"recipient":"all","content":{"content_type":"code","text":"{}"},"metadata":{"invoked_resource":{"resource_uri":"/asdk_app_redacted/link_redacted/search_context","app_name":"p035-low-risk-workstation"}}}}\n\n',
+    );
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "tool",
+      name: "search_context",
+    }));
+  });
 });
 
 it("suppresses observer failures only during expected reload navigation", async () => {

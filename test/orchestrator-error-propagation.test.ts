@@ -13,6 +13,7 @@ const sendPrompt = vi.fn();
 const setConnector = vi.fn();
 const setWebSearch = vi.fn();
 const waitTurnComplete = vi.fn();
+const fetchLatestTurnToolNames = vi.fn();
 
 vi.mock("../src/browser/chatgpt.js", () => ({
   goHome: (...args: unknown[]) => goHome(...args),
@@ -27,6 +28,9 @@ vi.mock("../src/browser/conversation.js", () => ({
   setConnector: (...args: unknown[]) => setConnector(...args),
   setWebSearch: (...args: unknown[]) => setWebSearch(...args),
   waitTurnComplete: (...args: unknown[]) => waitTurnComplete(...args),
+}));
+vi.mock("../src/api/conversations.js", () => ({
+  fetchLatestTurnToolNames: (...args: unknown[]) => fetchLatestTurnToolNames(...args),
 }));
 
 const { runAskOnSession } = await import("../src/core/orchestrator.js");
@@ -56,6 +60,7 @@ beforeEach(() => {
   currentConversationId.mockReturnValue(null);
   latestAssistantModelSlug.mockResolvedValue(null);
   readLatestAssistantText.mockResolvedValue("");
+  fetchLatestTurnToolNames.mockResolvedValue([]);
 });
 
 describe("runAskOnSession connector contract", () => {
@@ -85,6 +90,33 @@ describe("runAskOnSession connector contract", () => {
       name: "connector-selected",
       meta: { connector: "IntelliCoach Context" },
     });
+  });
+
+  it("emits connector tool evidence from the completed conversation branch", async () => {
+    waitTurnComplete.mockResolvedValueOnce(undefined);
+    currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
+    readLatestAssistantText.mockResolvedValueOnce("grounded");
+    fetchLatestTurnToolNames.mockResolvedValueOnce(["search_context", "fetch_excerpt"]);
+    const activeSession = session();
+    const runner = runAskOnSession(
+      {
+        prompt: "test",
+        connector: "p035-low-risk-workstation",
+        timeoutSec: 1_200,
+        headless: false,
+      },
+      activeSession,
+    );
+
+    const result = runner.result;
+    const events = await collect(runner.events);
+    await expect(result).resolves.toMatchObject({ finalText: "grounded" });
+    expect(fetchLatestTurnToolNames).toHaveBeenCalledWith(
+      activeSession.page,
+      "11111111-1111-1111-1111-111111111111",
+    );
+    expect(events).toContainEqual(expect.objectContaining({ type: "tool", name: "search_context" }));
+    expect(events).toContainEqual(expect.objectContaining({ type: "tool", name: "fetch_excerpt" }));
   });
 
   it("fails before sending when the required connector cannot be selected", async () => {

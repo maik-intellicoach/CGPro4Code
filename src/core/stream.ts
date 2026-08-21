@@ -9,6 +9,21 @@ export type StreamEvent =
   | { type: "error"; message: string }
   | { type: "done"; finalText?: string };
 
+function toolNameFromMessage(message: Record<string, unknown>): string {
+  const metadata = message["metadata"];
+  if (metadata && typeof metadata === "object") {
+    const invokedResource = (metadata as Record<string, unknown>)["invoked_resource"];
+    if (invokedResource && typeof invokedResource === "object") {
+      const resourceUri = (invokedResource as Record<string, unknown>)["resource_uri"];
+      if (typeof resourceUri === "string") {
+        const toolName = resourceUri.split("/").filter(Boolean).at(-1);
+        if (toolName) return toolName;
+      }
+    }
+  }
+  return typeof message["recipient"] === "string" ? message["recipient"] : "tool";
+}
+
 interface QueueEntry {
   resolve: (e: StreamEvent | null) => void;
   reject: (e: Error) => void;
@@ -127,15 +142,11 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
         }
         return;
       }
-      // Only treat this as the terminal `done` if we actually streamed
-      // some text. ChatGPT's page issues several taps on
-      // /backend-api/conversation per turn (setup, requirements, the
-      // SSE itself). The setup taps finish empty — we must NOT mark
-      // the emitter complete on them or the orchestrator's authoritative
-      // DOM-derived done gets silently dropped.
-      const text = state.parser.cumulativeText();
-      if (text.length === 0) return;
-      state.emitter.push({ type: "done", finalText: text });
+      // A finished network response is not the end of CGPro's evidence
+      // lifecycle. The orchestrator still reads the authoritative DOM and,
+      // for connector turns, the completed conversation branch. It emits the
+      // sole terminal `done` only after those checks, so late evidence cannot
+      // be silently dropped by StreamEmitter's terminal state.
     },
   );
 
@@ -357,7 +368,7 @@ export class SseParser {
       }
       const author = mm["author"] as { role?: string } | undefined;
       if (author?.role === "tool") {
-        out.push({ type: "tool", name: (mm["recipient"] as string) ?? "tool", meta: mm });
+        out.push({ type: "tool", name: toolNameFromMessage(mm), meta: mm });
       }
     }
 
