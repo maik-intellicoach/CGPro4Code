@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { extractLatestTurnToolNames } from "../src/api/conversations.js";
+import { exactConnectorLabelIndex } from "../src/browser/conversation.js";
 
 describe("extractLatestTurnToolNames", () => {
   it("walks only the current branch back to its latest user message", () => {
@@ -19,7 +20,10 @@ describe("extractLatestTurnToolNames", () => {
           message: {
             author: { role: "tool" },
             metadata: {
-              invoked_resource: { resource_uri: "/app/link/search_context" },
+              invoked_resource: {
+                resource_uri: "/app/link/search_context",
+                app_name: "p035-low-risk-workstation",
+              },
             },
           },
         },
@@ -30,6 +34,41 @@ describe("extractLatestTurnToolNames", () => {
       },
     };
 
-    expect(extractLatestTurnToolNames(body)).toEqual(["search_context"]);
+    expect(extractLatestTurnToolNames(body, "p035-low-risk-workstation")).toEqual(["search_context"]);
+    expect(extractLatestTurnToolNames(body, "wrong-connector")).toEqual([]);
+  });
+
+  it("rejects a correct tool tail from the wrong or missing connector app", () => {
+    const tool = (app_name?: string) => ({
+      current_node: "tool",
+      mapping: {
+        tool: {
+          parent: "user",
+          message: {
+            author: { role: "tool" },
+            metadata: { invoked_resource: { resource_uri: "/app/link/search_context", app_name } },
+          },
+        },
+        user: { parent: null, message: { author: { role: "user" } } },
+      },
+    });
+    expect(extractLatestTurnToolNames(tool("wrong-connector"), "p035-low-risk-workstation")).toEqual([]);
+    expect(extractLatestTurnToolNames(tool(), "p035-low-risk-workstation")).toEqual([]);
+  });
+});
+
+describe("exact connector picker matching", () => {
+  it("chooses the exact label before a suffixed lookalike", () => {
+    expect(exactConnectorLabelIndex(
+      ["p035-low-risk-workstation backup", "  p035-low-risk-workstation  "],
+      "p035-low-risk-workstation",
+    )).toBe(1);
+  });
+
+  it("rejects a suffix-only lookalike", () => {
+    expect(exactConnectorLabelIndex(
+      ["p035-low-risk-workstation backup"],
+      "p035-low-risk-workstation",
+    )).toBe(-1);
   });
 });

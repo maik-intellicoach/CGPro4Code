@@ -97,7 +97,7 @@ function runAskInner(
         background: opts.background,
       });
     }
-    setActiveEmitter(session.context, emitter);
+    setActiveEmitter(session.context, emitter, opts.connector);
     try {
       const page = session.page;
       const debug = process.env.CGPRO_DEBUG === "1";
@@ -216,11 +216,15 @@ function runAskInner(
         const observedNames = new Set(
           collected.filter((event) => event.type === "tool").map((event) => event.name),
         );
-        const conversationToolNames = await fetchLatestTurnToolNames(page, conversationId);
+        const conversationToolNames = await fetchLatestTurnToolNames(page, conversationId, opts.connector);
         for (const name of conversationToolNames) {
           if (observedNames.has(name)) continue;
           observedNames.add(name);
-          emitter.push({ type: "tool", name, meta: { source: "latest-conversation-turn" } });
+          emitter.push({
+            type: "tool",
+            name,
+            meta: { source: "latest-conversation-turn", connector: opts.connector },
+          });
         }
       }
 

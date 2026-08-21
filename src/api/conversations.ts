@@ -42,9 +42,10 @@ function asObject(value: unknown): JsonObject | null {
     : null;
 }
 
-function invokedResourceToolName(message: JsonObject): string | null {
+function invokedResourceToolName(message: JsonObject, expectedAppName?: string): string | null {
   const metadata = asObject(message.metadata);
   const invokedResource = asObject(metadata?.invoked_resource);
+  if (expectedAppName !== undefined && invokedResource?.app_name !== expectedAppName) return null;
   const resourceUri = invokedResource?.resource_uri;
   if (typeof resourceUri !== "string") return null;
   return resourceUri.split("/").filter(Boolean).at(-1) ?? null;
@@ -54,7 +55,7 @@ function invokedResourceToolName(message: JsonObject): string | null {
  * Extract connector tools from only the latest user turn on the current
  * conversation branch. Older turns and abandoned branches are excluded.
  */
-export function extractLatestTurnToolNames(body: unknown): string[] {
+export function extractLatestTurnToolNames(body: unknown, expectedAppName?: string): string[] {
   const root = asObject(body);
   const mapping = asObject(root?.mapping);
   let nodeId = typeof root?.current_node === "string" ? root.current_node : null;
@@ -70,7 +71,7 @@ export function extractLatestTurnToolNames(body: unknown): string[] {
     const author = asObject(message?.author);
     if (author?.role === "user") break;
     if (message && author?.role === "tool") {
-      const name = invokedResourceToolName(message);
+      const name = invokedResourceToolName(message, expectedAppName);
       if (name) reverseChronological.push(name);
     }
     nodeId = typeof node.parent === "string" ? node.parent : null;
@@ -81,12 +82,13 @@ export function extractLatestTurnToolNames(body: unknown): string[] {
 export async function fetchLatestTurnToolNames(
   page: Page,
   conversationId: string,
+  expectedAppName?: string,
 ): Promise<string[]> {
   const result = await backendApiFetch(page, `/backend-api/conversation/${conversationId}`);
   if (!result.ok) {
     throw new Error(`conversation tool evidence fetch failed with HTTP ${result.status}`);
   }
-  return extractLatestTurnToolNames(result.body);
+  return extractLatestTurnToolNames(result.body, expectedAppName);
 }
 
 export async function fetchRemoteConversations(

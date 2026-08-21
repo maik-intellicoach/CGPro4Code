@@ -9,19 +9,33 @@ export type StreamEvent =
   | { type: "error"; message: string }
   | { type: "done"; finalText?: string };
 
-function toolNameFromMessage(message: Record<string, unknown>): string {
+function toolFromMessage(
+  message: Record<string, unknown>,
+  expectedConnector?: string,
+): { name: string; meta?: unknown } | null {
   const metadata = message["metadata"];
   if (metadata && typeof metadata === "object") {
     const invokedResource = (metadata as Record<string, unknown>)["invoked_resource"];
     if (invokedResource && typeof invokedResource === "object") {
       const resourceUri = (invokedResource as Record<string, unknown>)["resource_uri"];
+      const appName = (invokedResource as Record<string, unknown>)["app_name"];
+      if (expectedConnector !== undefined && appName !== expectedConnector) return null;
       if (typeof resourceUri === "string") {
         const toolName = resourceUri.split("/").filter(Boolean).at(-1);
-        if (toolName) return toolName;
+        if (toolName) {
+          return {
+            name: toolName,
+            meta: { source: "sse", connector: typeof appName === "string" ? appName : undefined },
+          };
+        }
       }
     }
   }
-  return typeof message["recipient"] === "string" ? message["recipient"] : "tool";
+  if (expectedConnector !== undefined) return null;
+  return {
+    name: typeof message["recipient"] === "string" ? message["recipient"] : "tool",
+    meta: message,
+  };
 }
 
 interface QueueEntry {
@@ -223,6 +237,7 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
 export function setActiveEmitter(
   context: BrowserContext,
   emitter: StreamEmitter | null,
+  expectedConnector?: string,
 ): StreamEmitter | null {
   const state = STATE.get(context);
   if (!state) return null;
@@ -230,7 +245,7 @@ export function setActiveEmitter(
   state.generation += 1;
   state.observers.clear();
   state.emitter = emitter;
-  state.parser.reset();
+  state.parser.reset(expectedConnector);
   return prev;
 }
 
@@ -249,10 +264,11 @@ export function setExpectedReloadNavigation(context: BrowserContext, expected: b
 export async function installSseInterceptor(
   page: Page,
   emitter: StreamEmitter,
+  expectedConnector?: string,
 ): Promise<void> {
   const ctx = page.context();
   await ensureInterceptorInstalled(ctx);
-  setActiveEmitter(ctx, emitter);
+  setActiveEmitter(ctx, emitter, expectedConnector);
 }
 
 /**
@@ -265,6 +281,8 @@ export class SseParser {
   private latestText = "";
   private startedSent = false;
   private capturedConvId?: string;
+
+  constructor(private expectedConnector?: string) {}
 
   feed(chunk: string): StreamEvent[] {
     const events: StreamEvent[] = [];
@@ -368,7 +386,8 @@ export class SseParser {
       }
       const author = mm["author"] as { role?: string } | undefined;
       if (author?.role === "tool") {
-        out.push({ type: "tool", name: toolNameFromMessage(mm), meta: mm });
+        const tool = toolFromMessage(mm, this.expectedConnector);
+        if (tool) out.push({ type: "tool", name: tool.name, meta: tool.meta });
       }
     }
 
@@ -379,10 +398,11 @@ export class SseParser {
     return this.latestText;
   }
 
-  reset(): void {
+  reset(expectedConnector?: string): void {
     this.leftover = "";
     this.latestText = "";
     this.startedSent = false;
     this.capturedConvId = undefined;
+    this.expectedConnector = expectedConnector;
   }
 }

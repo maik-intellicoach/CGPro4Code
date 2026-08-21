@@ -86,14 +86,23 @@ describe("SseParser", () => {
   });
 
   it("names custom connector tool results from invoked_resource metadata", () => {
-    const p = new SseParser();
+    const p = new SseParser("p035-low-risk-workstation");
     const events = p.feed(
       'data: {"message":{"author":{"role":"tool"},"recipient":"all","content":{"content_type":"code","text":"{}"},"metadata":{"invoked_resource":{"resource_uri":"/asdk_app_redacted/link_redacted/search_context","app_name":"p035-low-risk-workstation"}}}}\n\n',
     );
     expect(events).toContainEqual(expect.objectContaining({
       type: "tool",
       name: "search_context",
+      meta: { source: "sse", connector: "p035-low-risk-workstation" },
     }));
+  });
+
+  it("rejects a correct tool tail from the wrong connector app", () => {
+    const p = new SseParser("p035-low-risk-workstation");
+    const events = p.feed(
+      'data: {"message":{"author":{"role":"tool"},"recipient":"all","metadata":{"invoked_resource":{"resource_uri":"/app/link/search_context","app_name":"wrong-connector"}}}}\n\n',
+    );
+    expect(events.filter((event) => event.type === "tool")).toEqual([]);
   });
 });
 

@@ -114,9 +114,16 @@ describe("runAskOnSession connector contract", () => {
     expect(fetchLatestTurnToolNames).toHaveBeenCalledWith(
       activeSession.page,
       "11111111-1111-1111-1111-111111111111",
+      "p035-low-risk-workstation",
     );
-    expect(events).toContainEqual(expect.objectContaining({ type: "tool", name: "search_context" }));
-    expect(events).toContainEqual(expect.objectContaining({ type: "tool", name: "fetch_excerpt" }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "tool", name: "search_context",
+      meta: { source: "latest-conversation-turn", connector: "p035-low-risk-workstation" },
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "tool", name: "fetch_excerpt",
+      meta: { source: "latest-conversation-turn", connector: "p035-low-risk-workstation" },
+    }));
   });
 
   it("fails before sending when the required connector cannot be selected", async () => {

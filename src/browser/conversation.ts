@@ -192,10 +192,6 @@ export async function setWebSearch(page: Page, on: boolean): Promise<boolean> {
   return on;
 }
 
-function escapeRegex(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 async function openComposerToolsPopover(page: Page): Promise<boolean> {
   const plus = await firstResolved(page, [
     'button[data-testid="composer-plus-btn"]',
@@ -211,24 +207,32 @@ async function openComposerToolsPopover(page: Page): Promise<boolean> {
   return true;
 }
 
+export function exactConnectorLabelIndex(labels: string[], name: string): number {
+  const expected = name.replace(/\s+/g, " ").trim().toLocaleLowerCase();
+  return labels.findIndex(
+    (label) => label.replace(/\s+/g, " ").trim().toLocaleLowerCase() === expected,
+  );
+}
+
 async function visibleComposerTool(page: Page, name: string): Promise<Locator | null> {
-  const connectorName = new RegExp(escapeRegex(name), "i");
-  const exactConnectorName = new RegExp(`^\\s*${escapeRegex(name)}\\s*$`, "i");
   const candidates = page
-    .locator('[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"], button')
-    .filter({ hasText: connectorName });
+    .locator('[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"], button');
   const count = await candidates.count().catch(() => 0);
   for (let i = 0; i < count; i++) {
     const candidate = candidates.nth(i);
-    if (await candidate.isVisible().catch(() => false)) return candidate;
+    if (!(await candidate.isVisible().catch(() => false))) continue;
+    const label = await candidate.innerText().catch(() => "");
+    if (exactConnectorLabelIndex([label], name) === 0) return candidate;
   }
   // The current @ plugin chooser renders the selectable app label as plain
   // spans inside a keyboard-command row with no ARIA option/menuitem role.
-  const labels = page.locator("span").filter({ hasText: exactConnectorName });
+  const labels = page.locator("span");
   const labelCount = await labels.count().catch(() => 0);
   for (let i = 0; i < labelCount; i++) {
     const label = labels.nth(i);
-    if (await label.isVisible().catch(() => false)) return label;
+    if (!(await label.isVisible().catch(() => false))) continue;
+    const text = await label.innerText().catch(() => "");
+    if (exactConnectorLabelIndex([text], name) === 0) return label;
   }
   return null;
 }
