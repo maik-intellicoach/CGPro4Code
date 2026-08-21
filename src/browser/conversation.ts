@@ -224,6 +224,24 @@ async function visibleComposerTool(page: Page, name: string): Promise<Locator | 
   return null;
 }
 
+async function recordConnectorDiagnostics(page: Page): Promise<void> {
+  if (process.env.CGPRO_DEBUG !== "1") return;
+  const surfaces = page.locator('[role="menu"]:visible, [role="dialog"]:visible, [role="listbox"]:visible');
+  const labels = await surfaces
+    .locator('[role="menuitem"], [role="menuitemradio"], [role="option"], button')
+    .allInnerTexts()
+    .catch(() => [] as string[]);
+  const boundedLabels = labels
+    .map((label) => label.replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .slice(0, 30)
+    .map((label) => label.slice(0, 120));
+  console.error(`[cgpro:connector] visible picker entries=${JSON.stringify(boundedLabels)}`);
+  const screenshotPath = `${process.env.TMPDIR || "/tmp"}/cgpro-connector-${Date.now()}.png`;
+  await page.screenshot({ path: screenshotPath, fullPage: false }).catch(() => undefined);
+  console.error(`[cgpro:connector] screenshot=${screenshotPath}`);
+}
+
 /**
  * Select a named ChatGPT connector/app in the composer tool picker.
  *
@@ -236,6 +254,7 @@ export async function setConnector(page: Page, name: string): Promise<void> {
   const connectorName = name.trim();
   if (!connectorName) throw new Error("connector name must not be empty");
   if (!(await openComposerToolsPopover(page))) {
+    await recordConnectorDiagnostics(page);
     throw new Error(`ChatGPT connector picker is unavailable; could not select "${connectorName}".`);
   }
 
@@ -256,6 +275,7 @@ export async function setConnector(page: Page, name: string): Promise<void> {
   }
 
   if (!connector) {
+    await recordConnectorDiagnostics(page);
     await page.keyboard.press("Escape").catch(() => undefined);
     throw new Error(`ChatGPT connector "${connectorName}" is not exposed in the composer tool picker.`);
   }
@@ -273,6 +293,7 @@ export async function setConnector(page: Page, name: string): Promise<void> {
     await connector.click({ timeout: 5_000 });
     await page.waitForTimeout(300);
   } catch {
+    await recordConnectorDiagnostics(page);
     await page.keyboard.press("Escape").catch(() => undefined);
     throw new Error(`ChatGPT connector "${connectorName}" was visible but could not be selected.`);
   }
