@@ -144,7 +144,7 @@ function runAskInner(
       await attachImages(page, opts.images ?? []);
 
       log("sendPrompt…");
-      const priorBubbles = await sendPrompt(page, opts.prompt);
+      const priorBubbles = await sendPrompt(page, opts.prompt, opts.connector !== undefined);
       log(`sendPrompt done (priorBubbles=${priorBubbles}), url=${page.url()}`);
 
       // Wait for the turn to settle. The SSE interceptor will normally push

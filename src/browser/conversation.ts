@@ -213,6 +213,7 @@ async function openComposerToolsPopover(page: Page): Promise<boolean> {
 
 async function visibleComposerTool(page: Page, name: string): Promise<Locator | null> {
   const connectorName = new RegExp(escapeRegex(name), "i");
+  const exactConnectorName = new RegExp(`^\\s*${escapeRegex(name)}\\s*$`, "i");
   const candidates = page
     .locator('[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"], button')
     .filter({ hasText: connectorName });
@@ -220,6 +221,14 @@ async function visibleComposerTool(page: Page, name: string): Promise<Locator | 
   for (let i = 0; i < count; i++) {
     const candidate = candidates.nth(i);
     if (await candidate.isVisible().catch(() => false)) return candidate;
+  }
+  // The current @ plugin chooser renders the selectable app label as plain
+  // spans inside a keyboard-command row with no ARIA option/menuitem role.
+  const labels = page.locator("span").filter({ hasText: exactConnectorName });
+  const labelCount = await labels.count().catch(() => 0);
+  for (let i = 0; i < labelCount; i++) {
+    const label = labels.nth(i);
+    if (await label.isVisible().catch(() => false)) return label;
   }
   return null;
 }
@@ -283,12 +292,31 @@ async function pluginSearchBox(page: Page): Promise<Locator | null> {
 export async function setConnector(page: Page, name: string): Promise<void> {
   const connectorName = name.trim();
   if (!connectorName) throw new Error("connector name must not be empty");
+  const composer = await requireSelector(page, SELECTORS.composer, "composer");
+  await composer.click();
+  await page.keyboard.press("Meta+A");
+  await page.keyboard.press("Backspace");
+  await page.keyboard.type("@");
+  await page.waitForTimeout(300);
+
+  let connector = await waitForComposerTool(page, connectorName);
+  if (connector) {
+    await connector.click({ timeout: 5_000 });
+    await page.waitForTimeout(300);
+    return;
+  }
+
+  // Clear the failed @ query before trying older plus-menu layouts.
+  await page.keyboard.press("Escape").catch(() => undefined);
+  await composer.click();
+  await page.keyboard.press("Meta+A");
+  await page.keyboard.press("Backspace");
   if (!(await openComposerToolsPopover(page))) {
     await recordConnectorDiagnostics(page);
     throw new Error(`ChatGPT connector picker is unavailable; could not select "${connectorName}".`);
   }
 
-  let connector = await visibleComposerTool(page, connectorName);
+  connector = await visibleComposerTool(page, connectorName);
   if (!connector) {
     // Personal Pro custom MCP connectors live behind the distinct
     // "Developer mode" entry in the plus menu. They are connected apps but
@@ -368,15 +396,17 @@ export async function setConnector(page: Page, name: string): Promise<void> {
  * fall back to Enter — some account/locale combos disable the button when
  * the composer is "empty" by their detector even when text is present.
  */
-export async function sendPrompt(page: Page, prompt: string): Promise<number> {
+export async function sendPrompt(page: Page, prompt: string, preserveExisting = false): Promise<number> {
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
   await composer.click();
   await page.waitForTimeout(120);
   // Connector/plugin menus can route keyboard search text into the composer
   // on some ChatGPT builds. Always replace the composer contents so a failed
   // or stale picker query cannot contaminate the actual prompt.
-  await page.keyboard.press("Meta+A");
-  await page.keyboard.press("Backspace");
+  if (!preserveExisting) {
+    await page.keyboard.press("Meta+A");
+    await page.keyboard.press("Backspace");
+  }
   // Composer is a contenteditable div on modern chatgpt.com — use the
   // keyboard so React's state listeners actually fire.
   const lines = prompt.split("\n");

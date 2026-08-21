@@ -83,4 +83,15 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     expect(firstResolved).toHaveBeenCalledTimes(1);
     expect((page.keyboard.press as ReturnType<typeof vi.fn>)).not.toHaveBeenCalledWith("Enter");
   });
+
+  it("preserves an inline connector pill when requested", async () => {
+    firstResolved.mockResolvedValueOnce(fakeLocator());
+    const page = fakePage();
+
+    await sendPrompt(page, "hello", true);
+
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Meta+A");
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Backspace");
+    expect(page.keyboard.type).toHaveBeenCalledWith("hello", { delay: 4 });
+  });
 });
