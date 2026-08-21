@@ -243,9 +243,10 @@ async function recordConnectorDiagnostics(page: Page): Promise<void> {
 }
 
 async function pluginSearchBox(page: Page): Promise<Locator | null> {
-  const candidates = page.locator('input:visible, textarea:visible, [contenteditable="true"]:visible, [role="textbox"]:visible');
+  const candidates = page.locator(
+    'input:not([type="file"]):not([aria-hidden="true"]):visible, textarea:visible, [contenteditable="true"]:visible, [role="textbox"]:visible',
+  );
   const count = await candidates.count().catch(() => 0);
-  let fallback: Locator | null = null;
   for (let i = 0; i < count; i++) {
     const candidate = candidates.nth(i);
     const id = await candidate.getAttribute("id").catch(() => null);
@@ -257,9 +258,8 @@ async function pluginSearchBox(page: Page): Promise<Locator | null> {
       await candidate.getAttribute("aria-label").catch(() => null),
     ].filter(Boolean).join(" ");
     if (/search|plugin|connector|app/i.test(searchHint)) return candidate;
-    fallback ??= candidate;
   }
-  return fallback;
+  return null;
 }
 
 /**
@@ -288,9 +288,14 @@ export async function setConnector(page: Page, name: string): Promise<void> {
     const pluginSearch = await pluginSearchBox(page);
     if (pluginSearch) {
       await pluginSearch.fill(connectorName);
-      await page.waitForTimeout(500);
-      connector = await visibleComposerTool(page, connectorName);
+    } else {
+      // The current command-menu build renders only instructional text
+      // ("Type to search plugins…") and captures key events at the menu
+      // root; it has no fillable textbox in the DOM.
+      await page.keyboard.type(connectorName);
     }
+    await page.waitForTimeout(500);
+    connector = await visibleComposerTool(page, connectorName);
   }
   if (!connector) {
     // Some ChatGPT builds put installed apps one level below the main
