@@ -212,10 +212,10 @@ async function openComposerToolsPopover(page: Page): Promise<boolean> {
 }
 
 async function visibleComposerTool(page: Page, name: string): Promise<Locator | null> {
-  const exactName = new RegExp(`^\\s*${escapeRegex(name)}\\s*$`, "i");
+  const connectorName = new RegExp(escapeRegex(name), "i");
   const candidates = page
     .locator('[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"], button')
-    .filter({ hasText: exactName });
+    .filter({ hasText: connectorName });
   const count = await candidates.count().catch(() => 0);
   for (let i = 0; i < count; i++) {
     const candidate = candidates.nth(i);
@@ -259,6 +259,23 @@ export async function setConnector(page: Page, name: string): Promise<void> {
   }
 
   let connector = await visibleComposerTool(page, connectorName);
+  if (!connector) {
+    // Current ChatGPT Pro builds expose installed connectors as Plugins
+    // behind a search field in the plus menu. The initial list is only a
+    // short set of suggestions, so absence there is not absence from the
+    // account. Search the exact configured name before trying older nested
+    // menu layouts.
+    const pluginSearch = page
+      .locator(
+        'input[placeholder*="search plugins" i], input[placeholder*="search apps" i], input[placeholder*="search connectors" i], [role="searchbox"]',
+      )
+      .first();
+    if ((await pluginSearch.count().catch(() => 0)) > 0 && (await pluginSearch.isVisible().catch(() => false))) {
+      await pluginSearch.fill(connectorName);
+      await page.waitForTimeout(500);
+      connector = await visibleComposerTool(page, connectorName);
+    }
+  }
   if (!connector) {
     // Some ChatGPT builds put installed apps one level below the main
     // composer menu. Enter that bounded submenu, then resolve the exact
