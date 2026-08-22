@@ -166,7 +166,6 @@ function runAskInner(
         const now = Date.now();
         if (!force) {
           if (now < connectorEvidenceBackoffUntil || now - lastConnectorEvidencePollAt < CONNECTOR_EVIDENCE_POLL_MS) return;
-          lastConnectorEvidencePollAt = now;
         }
         for (const event of collected) {
           if (event.type !== "tool" || !event.meta || typeof event.meta !== "object") continue;
@@ -177,6 +176,7 @@ function runAskInner(
         const conversationId = currentConversationId(page) ??
           (started?.type === "started" ? started.conversationId ?? null : null);
         if (!conversationId) return;
+        if (!force) lastConnectorEvidencePollAt = now;
         let calls;
         try {
           calls = await fetchLatestTurnToolCalls(

@@ -158,11 +158,15 @@ describe("runAskOnSession connector contract", () => {
     waitTurnComplete.mockImplementationOnce(
       async (_page, _timeout, _prior, _stable, control: { pollEvidence?: () => Promise<void> }) => {
         await control.pollEvidence?.();
+        await vi.waitFor(() => expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(1));
+        await Promise.resolve();
         clock.mockReturnValue(1_029_999);
         await control.pollEvidence?.();
         expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(1);
         clock.mockReturnValue(1_030_000);
         await control.pollEvidence?.();
+        await vi.waitFor(() => expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(2));
+        await Promise.resolve();
       },
     );
     readLatestAssistantText.mockResolvedValueOnce("grounded");
@@ -192,11 +196,15 @@ describe("runAskOnSession connector contract", () => {
     waitTurnComplete.mockImplementationOnce(
       async (_page, _timeout, _prior, _stable, control: { pollEvidence?: () => Promise<void> }) => {
         await control.pollEvidence?.();
-        clock.mockReturnValue(2_119_999);
+        await vi.waitFor(() => expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(1));
+        await Promise.resolve();
+        clock.mockReturnValue(2_060_000);
         await control.pollEvidence?.();
         expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(1);
         clock.mockReturnValue(2_120_000);
         await control.pollEvidence?.();
+        await vi.waitFor(() => expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(2));
+        await Promise.resolve();
       },
     );
     const runner = runAskOnSession(
