@@ -149,16 +149,15 @@ describe("runAskOnSession connector contract", () => {
     expect(events.filter((event) => event.type === "tool" && event.name === "search_context")).toHaveLength(2);
   });
 
-  it("polls connector call evidence while the turn is still active", async () => {
+  it("reads conversation-branch evidence once after completion, not while the turn is active", async () => {
     currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
     fetchLatestTurnToolCalls.mockResolvedValueOnce([
-      { id: "active-call-1", name: "search_context" },
-    ]).mockResolvedValueOnce([
       { id: "active-call-1", name: "search_context" },
     ]);
     waitTurnComplete.mockImplementationOnce(
       async (_page, _timeout, _prior, _stable, control: { pollEvidence?: () => Promise<void> }) => {
-        await control.pollEvidence?.();
+        expect(control.pollEvidence).toBeUndefined();
+        expect(fetchLatestTurnToolCalls).not.toHaveBeenCalled();
       },
     );
     readLatestAssistantText.mockResolvedValueOnce("grounded");
@@ -175,7 +174,30 @@ describe("runAskOnSession connector contract", () => {
     const events = await collect(runner.events);
     await expect(runner.result).resolves.toMatchObject({ finalText: "grounded" });
     expect(events.filter((event) => event.type === "tool" && event.name === "search_context")).toHaveLength(1);
-    expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(2);
+    expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(1);
+  });
+
+  it("propagates a terminal conversation-evidence rate limit instead of reporting no connector use", async () => {
+    currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
+    waitTurnComplete.mockResolvedValueOnce(undefined);
+    fetchLatestTurnToolCalls.mockRejectedValueOnce(
+      new Error("conversation tool evidence fetch failed with HTTP 429"),
+    );
+    const runner = runAskOnSession(
+      {
+        prompt: "test",
+        connector: "p035-low-risk-workstation",
+        timeoutSec: 1_200,
+        headless: false,
+      },
+      session(),
+    );
+
+    await expect(runner.result).rejects.toThrow("conversation tool evidence fetch failed with HTTP 429");
+    expect(await collect(runner.events)).toContainEqual({
+      type: "error",
+      message: "conversation tool evidence fetch failed with HTTP 429",
+    });
   });
 
   it("fails before sending when the required connector cannot be selected", async () => {
@@ -248,34 +270,6 @@ describe("runAskOnSession connector contract", () => {
 });
 
 describe("runAskOnSession wait failure propagation", () => {
-  it("cancels promptly while an active connector evidence poll is stalled", async () => {
-    currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
-    fetchLatestTurnToolCalls.mockReturnValueOnce(new Promise(() => {}));
-    waitTurnComplete.mockImplementationOnce(
-      async (_page, _timeout, _prior, _stable, control: {
-        cancelled?: () => boolean;
-        pollEvidence?: () => Promise<void>;
-      }) => {
-        await control.pollEvidence?.();
-        while (!control.cancelled?.()) await new Promise((resolve) => setTimeout(resolve, 0));
-      },
-    );
-    const runner = runAskOnSession(
-      {
-        prompt: "test",
-        connector: "p035-low-risk-workstation",
-        timeoutSec: 1_200,
-        headless: false,
-      },
-      session(),
-    );
-
-    await vi.waitFor(() => expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(1));
-    await runner.cancel();
-    await expect(runner.result).resolves.toMatchObject({ finalText: "" });
-    expect(await collect(runner.events)).toContainEqual({ type: "done", finalText: "" });
-  });
-
   it("keeps the 588-second browser closure distinct from a configured 1200-second timeout", async () => {
     const closed = new Error("Target page, context or browser has been closed");
     waitTurnComplete.mockRejectedValueOnce(closed);

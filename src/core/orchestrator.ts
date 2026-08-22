@@ -92,8 +92,6 @@ function runAskInner(
   let session: Session | null = providedSession;
   let cancelled = false;
   const observedConnectorCallIds = new Set<string>();
-  let lastConnectorEvidencePollAt = 0;
-  let connectorEvidencePollInFlight: Promise<void> | null = null;
 
   const result: Promise<AskResult> = (async () => {
     if (!session) {
@@ -157,11 +155,8 @@ function runAskInner(
       }
       log(`sendPrompt done (priorBubbles=${priorBubbles}), url=${page.url()}`);
 
-      const runConnectorEvidencePoll = async (force = false): Promise<void> => {
+      const collectCompletedConnectorEvidence = async (): Promise<void> => {
         if (opts.connector === undefined || cancelled) return;
-        const now = Date.now();
-        if (!force && now - lastConnectorEvidencePollAt < 2_000) return;
-        lastConnectorEvidencePollAt = now;
         for (const event of collected) {
           if (event.type !== "tool" || !event.meta || typeof event.meta !== "object") continue;
           const callId = (event.meta as Record<string, unknown>).callId;
@@ -175,8 +170,8 @@ function runAskInner(
           page,
           conversationId,
           opts.connector,
-          force ? 10_000 : 1_000,
-        ).catch(() => []);
+          10_000,
+        );
         for (const call of calls) {
           if (observedConnectorCallIds.has(call.id)) continue;
           observedConnectorCallIds.add(call.id);
@@ -186,25 +181,6 @@ function runAskInner(
             meta: { source: "latest-conversation-turn", connector: opts.connector, callId: call.id },
           });
         }
-      };
-
-      const pollConnectorEvidence = async (force = false): Promise<void> => {
-        if (force) {
-          if (connectorEvidencePollInFlight) {
-            await new Promise<void>((resolve) => {
-              const timer = setTimeout(resolve, 2_500);
-              connectorEvidencePollInFlight?.catch(() => undefined).finally(() => {
-                clearTimeout(timer);
-                resolve();
-              });
-            });
-          }
-          await runConnectorEvidencePoll(true);
-          return;
-        }
-        if (connectorEvidencePollInFlight) return;
-        connectorEvidencePollInFlight = runConnectorEvidencePoll(false)
-          .finally(() => { connectorEvidencePollInFlight = null; });
       };
 
       // Wait for the turn to settle. The SSE interceptor will normally push
@@ -227,7 +203,6 @@ function runAskInner(
             });
           },
           cancelled: () => cancelled,
-          pollEvidence: () => pollConnectorEvidence(false),
         });
       } catch (err) {
         if (debug) {
@@ -286,7 +261,7 @@ function runAskInner(
       log(`actualModel=${actualModel ?? "(unknown)"} conv=${conversationId ?? "(none)"}`);
 
       if (opts.connector !== undefined && conversationId) {
-        await pollConnectorEvidence(true);
+        await collectCompletedConnectorEvidence();
       }
 
       // GPT-5.5 Pro is policy. If the bubble's model slug doesn't include
