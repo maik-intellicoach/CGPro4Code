@@ -292,11 +292,39 @@ async function pluginSearchBox(page: Page): Promise<Locator | null> {
  */
 const ATTACHED_STATE_ATTRIBUTES = ["aria-checked", "aria-pressed", "data-state"] as const;
 
-/** Read the attached-state attribute value when the row reports attached, else null. */
-async function attachedState(row: Locator): Promise<string | null> {
+/** How many ancestor levels `attachedState` walks before failing closed. */
+const ATTACHED_STATE_ANCESTOR_DEPTH = 3;
+
+/** Read the first present attached-state attribute value on a row, without interpreting it. */
+async function presentState(row: Locator): Promise<string | null> {
   for (const attribute of ATTACHED_STATE_ATTRIBUTES) {
     const value = await row.getAttribute(attribute).catch(() => null);
-    if (value === "true" || value === "checked") return value;
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+/**
+ * Read the attached-state attribute value when the row or its nearest
+ * state-bearing ancestor reports attached, else null.
+ *
+ * The chatgpt.com picker can render the exact label as a plain span while
+ * its enclosing interactive row carries the state attribute (live lane-1
+ * acceptance evidence), so reading only the label row is not enough. The
+ * walk stops at the nearest row that carries one of the accepted state
+ * attributes; only the exact values "true" / "checked" accept, anything
+ * else stays fail-closed. Patchright resolves `..` as the parent element.
+ */
+async function attachedState(row: Locator): Promise<string | null> {
+  const accept = (value: string | null): string | null =>
+    value === "true" || value === "checked" ? value : null;
+  const own = await presentState(row);
+  if (own !== null) return accept(own);
+  let ancestor: Locator = row;
+  for (let depth = 0; depth < ATTACHED_STATE_ANCESTOR_DEPTH; depth++) {
+    ancestor = ancestor.locator("..");
+    const raw = await presentState(ancestor);
+    if (raw !== null) return accept(raw);
   }
   return null;
 }

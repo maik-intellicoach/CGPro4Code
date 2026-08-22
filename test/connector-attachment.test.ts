@@ -17,6 +17,8 @@ interface FakeRow {
   visible: boolean;
   /** Accessible attributes the row reports via getAttribute. */
   attrs?: Record<string, string | null>;
+  /** Nearest enclosing row, resolved via `locator("..")` (acceptance DOM shape). */
+  parent?: FakeRow;
   /** Invoked when the picker row is clicked (e.g. "the picker closes"). */
   onSelected?: () => void;
 }
@@ -74,6 +76,9 @@ function makePage() {
     isVisible: async () => row?.visible ?? false,
     innerText: async () => row?.label ?? "",
     getAttribute: async (attr: string) => row?.attrs?.[attr] ?? null,
+    // `attachedState` walks the bounded ancestor chain via `locator("..")` —
+    // resolve it to the enclosing row.
+    locator: () => rowLoc(row?.parent),
     click: async () => {
       if (row) {
         page.clickedLabels.push(row.label);
@@ -234,5 +239,41 @@ describe("connector selection honest attachment (P-035)", () => {
     expect(devEntered).toBe(false); // Developer mode was never entered
     expect(plus.click).toHaveBeenCalledTimes(1);
     expect(page.keyboard.press).toHaveBeenCalledWith("Escape");
+  });
+
+  it("accepts an exact label whose enclosing row reports the attached state (acceptance DOM shape)", async () => {
+    const scenario = makePage();
+    scenario.setRows([
+      {
+        label: "p035-low-risk-workstation",
+        visible: true,
+        attrs: {}, // plain label span: no state attributes of its own
+        onSelected: () => scenario.setRows([]), // successful click dismisses the picker
+      },
+    ]);
+    plus.click.mockImplementation(async () => {
+      // The reopened popover renders the exact label as a plain span while
+      // its enclosing interactive row carries the attached state (the live
+      // lane-1 acceptance shape that previously failed).
+      scenario.setRows([
+        {
+          label: "p035-low-risk-workstation",
+          visible: true,
+          attrs: {},
+          parent: {
+            label: "p035-low-risk-workstation row",
+            visible: true,
+            attrs: { "aria-checked": "true" },
+          },
+        },
+      ]);
+    });
+    const { page } = scenario;
+
+    await expect(setConnector(page, "p035-low-risk-workstation")).resolves.toBeUndefined();
+
+    expect(page.clickedLabels).toEqual(["p035-low-risk-workstation"]);
+    expect(plus.click).toHaveBeenCalledTimes(1); // popover reopened once
+    expect(page.keyboard.press).toHaveBeenCalledWith("Escape"); // accepted via the enclosing row state
   });
 });
