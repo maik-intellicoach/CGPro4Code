@@ -286,12 +286,86 @@ async function pluginSearchBox(page: Page): Promise<Locator | null> {
 }
 
 /**
+ * Accessible attributes that mark a composer tool row as currently attached.
+ * These are the same semantics the picker already reads for an already
+ * selected row and for the web-search toggle inside the composer popover.
+ */
+const ATTACHED_STATE_ATTRIBUTES = ["aria-checked", "aria-pressed", "data-state"] as const;
+
+/** Read the attached-state attribute value when the row reports attached, else null. */
+async function attachedState(row: Locator): Promise<string | null> {
+  for (const attribute of ATTACHED_STATE_ATTRIBUTES) {
+    const value = await row.getAttribute(attribute).catch(() => null);
+    if (value === "true" || value === "checked") return value;
+  }
+  return null;
+}
+
+/**
+ * Honest post-click postcondition for connector selection.
+ *
+ * A visible exact-label row - frequently a plain span with no ARIA role on
+ * recent chatgpt.com builds - can accept a click without ChatGPT attaching
+ * the connector. Selection success is therefore only honest once the
+ * requested connector is observably attached to the composer, i.e. its
+ * exact row reports one of the shared attached-state attributes. The
+ * orchestrator emits `connector-selected` only after this check resolves; a
+ * click that does not attach the connector rejects before prompt submission.
+ *
+ * When the picker dismissed on the click (normal after a successful attach),
+ * the composer "+" tools popover is reopened - the surface where attached
+ * tools render as checked rows, and where Personal Pro MCP connectors live
+ * (some behind the "Developer mode" entry) - and the exact label is
+ * re-resolved there. Parameterized by the connector name, so the same
+ * exact-match machinery covers more connectors and layout variants; no
+ * connector-specific hard-coded selector.
+ */
+async function assertConnectorAttached(page: Page, connectorName: string): Promise<void> {
+  const notAttached = (detail: string): string =>
+    `ChatGPT connector "${connectorName}" was clicked but never became attached to the composer (${detail}).`;
+
+  let row = await visibleComposerTool(page, connectorName);
+  if (!row) {
+    // The picker is gone - reopen the composer "+" tools popover, where an
+    // attached tool row reports its checked state.
+    const composer = await requireSelector(page, SELECTORS.composer, "composer");
+    await composer.click();
+    if (!(await openComposerToolsPopover(page))) {
+      await recordConnectorDiagnostics(page);
+      throw new Error(notAttached("composer tools popover did not open"));
+    }
+    const developerMode = page
+      .locator('[role="menuitem"], [role="menuitemradio"], button')
+      .filter({ hasText: /^\s*Developer mode\s*$/i })
+      .first();
+    if ((await developerMode.count().catch(() => 0)) > 0 &&
+        (await developerMode.isVisible().catch(() => false))) {
+      await developerMode.click({ timeout: 5_000 });
+      await page.waitForTimeout(300);
+    }
+    row = await waitForComposerTool(page, connectorName, 5_000);
+    if (!row) {
+      await recordConnectorDiagnostics(page);
+      throw new Error(notAttached("no exact-label row for the requested tool in the reopened picker"));
+    }
+  }
+  if (await attachedState(row)) {
+    await page.keyboard.press("Escape").catch(() => undefined);
+    return;
+  }
+  await recordConnectorDiagnostics(page);
+  throw new Error(notAttached("the exact label row does not report an attached state after the click"));
+}
+
+/**
  * Select a named ChatGPT connector/app in the composer tool picker.
  *
  * Connector-backed turns must not silently degrade to an ordinary chat:
- * absence or an unclickable entry is a hard error. Actual tool use remains
- * a separate postcondition for the caller because successful UI selection
- * does not prove that the model invoked a connector tool.
+ * absence, an unclickable entry, or a click that never attaches the
+ * connector are hard errors. Selection resolves only after the connector
+ * is observably attached to the composer (see {@link assertConnectorAttached}).
+ * Actual tool use remains a separate postcondition for the caller because
+ * a successful attachment does not prove that the model invoked the tool.
  */
 export async function setConnector(page: Page, name: string): Promise<void> {
   const connectorName = name.trim();
@@ -305,8 +379,15 @@ export async function setConnector(page: Page, name: string): Promise<void> {
 
   let connector = await waitForComposerTool(page, connectorName);
   if (connector) {
+    // Already attached - skip the click (clicking an attached row can
+    // toggle it off) and accept the honest state.
+    if (await attachedState(connector)) {
+      await page.keyboard.press("Escape").catch(() => undefined);
+      return;
+    }
     await connector.click({ timeout: 5_000 });
     await page.waitForTimeout(300);
+    await assertConnectorAttached(page, connectorName);
     return;
   }
 
@@ -373,23 +454,21 @@ export async function setConnector(page: Page, name: string): Promise<void> {
     throw new Error(`ChatGPT connector "${connectorName}" is not exposed in the composer tool picker.`);
   }
 
-  const alreadySelected = ["aria-checked", "aria-pressed", "data-state"];
-  for (const attribute of alreadySelected) {
-    const value = await connector.getAttribute(attribute).catch(() => null);
-    if (value === "true" || value === "checked") {
-      await page.keyboard.press("Escape").catch(() => undefined);
-      return;
-    }
+  // Already attached: the row reports the mounted state - skip the click.
+  if (await attachedState(connector)) {
+    await page.keyboard.press("Escape").catch(() => undefined);
+    return;
   }
 
   try {
     await connector.click({ timeout: 5_000 });
-    await page.waitForTimeout(300);
   } catch {
     await recordConnectorDiagnostics(page);
     await page.keyboard.press("Escape").catch(() => undefined);
     throw new Error(`ChatGPT connector "${connectorName}" was visible but could not be selected.`);
   }
+  await page.waitForTimeout(300);
+  await assertConnectorAttached(page, connectorName);
 }
 
 /**

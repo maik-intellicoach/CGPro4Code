@@ -190,6 +190,25 @@ describe("runAskOnSession connector contract", () => {
     expect(sendPrompt).not.toHaveBeenCalled();
   });
 
+  it("emits no connector-selected and never submits when the picker click did not attach the connector", async () => {
+    setConnector.mockRejectedValueOnce(
+      new Error(
+        'ChatGPT connector "IntelliCoach Context" was clicked but never became attached to the composer (the exact label row does not report an attached state after the click).',
+      ),
+    );
+    const runner = runAskOnSession(
+      { prompt: "test", connector: "IntelliCoach Context", timeoutSec: 1_200, headless: false },
+      session(),
+    );
+
+    await expect(runner.result).rejects.toThrow("never became attached to the composer");
+    const events = await collect(runner.events);
+    expect(events).toEqual([
+      expect.objectContaining({ type: "error", message: expect.stringContaining("never became attached") }),
+    ]);
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
   it("does not emit prompt submission when sending fails", async () => {
     sendPrompt.mockRejectedValueOnce(new Error("send unavailable"));
     const runner = runAskOnSession(
