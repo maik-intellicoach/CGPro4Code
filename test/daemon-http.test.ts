@@ -41,6 +41,8 @@ function fakeState(overrides: Partial<ServerState> = {}): ServerState {
     queue: new AskQueue(8, 60_000),
     readerBudget: new PreAdmissionReaderBudget(8),
     askInFlight: false,
+    currentInvocation: null,
+    currentRunner: null,
     currentConversation: null,
     lastConversation: null,
     reloadConversation: null,
@@ -90,6 +92,41 @@ beforeEach(() => {
   browserConversation.openConversation.mockReset();
   browserConversation.readLatestAssistantText.mockReset();
   browserConversation.turnIsWorking.mockReset();
+});
+
+describe("exact daemon cancellation", () => {
+  it("fails closed for a different invocation and cancels only the exact active runner", async () => {
+    const cancel = vi.fn(async () => {});
+    browserConversation.readLatestAssistantText.mockResolvedValue("recoverable partial");
+    const state = fakeState({
+      askInFlight: true,
+      currentInvocation: "11111111-1111-1111-1111-111111111111",
+      currentRunner: { events: new StreamEmitter(), result: Promise.resolve({ conversationId: null, finalText: "", events: [] }), cancel },
+      currentConversation: "22222222-2222-2222-2222-222222222222",
+    });
+
+    const wrongReq = new FakeReq() as unknown as IncomingMessage;
+    const wrongRes = new FakeRes() as unknown as ServerResponse;
+    Object.assign(wrongReq, { method: "POST", url: "/cancel", headers: { authorization: "Bearer test-token" } });
+    const wrongPending = handleRequest(wrongReq, wrongRes, state);
+    sendBody(wrongReq, { invocationId: "33333333-3333-3333-3333-333333333333" });
+    await wrongPending;
+    expect((wrongRes as unknown as FakeRes).statusCode).toBe(409);
+    expect(cancel).not.toHaveBeenCalled();
+
+    const exactReq = new FakeReq() as unknown as IncomingMessage;
+    const exactRes = new FakeRes() as unknown as ServerResponse;
+    Object.assign(exactReq, { method: "POST", url: "/cancel", headers: { authorization: "Bearer test-token" } });
+    const exactPending = handleRequest(exactReq, exactRes, state);
+    sendBody(exactReq, { invocationId: state.currentInvocation });
+    await exactPending;
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(parseJsonBody(exactRes as unknown as FakeRes)).toMatchObject({
+      ok: true,
+      invocationId: state.currentInvocation,
+      partialText: "recoverable partial",
+    });
+  });
 });
 
 it("returns authenticated account facts from daemon status", async () => {

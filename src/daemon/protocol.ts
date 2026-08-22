@@ -99,7 +99,9 @@ export interface AskRequest {
   connector?: string;
   images?: string[];
   conversationId?: string;
-  /** Per-turn cap. Daemon rejects above 1800s. */
+  /** Stable facade invocation ID used for exact cancellation. */
+  invocationId?: string;
+  /** Per-turn cap. Daemon clamps to 14,400 seconds. */
   timeoutSec: number;
 }
 

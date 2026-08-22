@@ -602,6 +602,26 @@ export async function turnIsWorking(page: Page): Promise<boolean> {
   return (await bubble?.getAttribute("data-message-streaming").catch(() => null)) === "true";
 }
 
+/**
+ * Stop the currently generating turn without closing the shared browser
+ * session.  Daemon callers use this to propagate an exact invocation cancel
+ * all the way to ChatGPT while preserving the warm profile for the next turn.
+ * Returns the best DOM text available after the stop request settles.
+ */
+export async function stopCurrentTurn(page: Page, timeoutMs = 15_000): Promise<string> {
+  const stop = await firstResolved(page, SELECTORS.stopButton);
+  if (stop) {
+    await stop.click({ timeout: 5_000 });
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await turnIsWorking(page))) break;
+    await page.waitForTimeout(250);
+  }
+  return readLatestAssistantText(page).catch(() => "");
+}
+
 export async function latestAssistantBubble(page: Page): Promise<Locator | null> {
   // Walk fallbacks in order so we always pick the deepest, most specific
   // selector that matches — joining them with "," would let the outer

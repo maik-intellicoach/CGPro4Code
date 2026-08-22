@@ -9,6 +9,7 @@ import {
   sendPrompt,
   setConnector,
   setWebSearch,
+  stopCurrentTurn,
   waitTurnComplete,
 } from "../browser/conversation.js";
 import {
@@ -44,6 +45,8 @@ export interface AskOptions {
   profile?: string;
   /** Daemon-only hook: consume a guarded reload request for this turn. */
   consumeReload?: () => string | null;
+  /** Stable facade invocation ID used for exact cancellation attribution. */
+  invocationId?: string;
 }
 
 export interface AskResult {
@@ -282,15 +285,16 @@ function runAskInner(
     result,
     async cancel(): Promise<void> {
       cancelled = true;
-      // In cold-start mode we own the session, so killing it cancels.
-      // In daemon mode we just stop streaming; the daemon decides what
-      // to do with the in-flight turn.
       if (closeOnFinish) {
         try {
           await session?.close();
         } catch {
           /* swallow */
         }
+      } else if (session) {
+        // The daemon owns the persistent browser context.  Stop only the
+        // active ChatGPT turn so the warm profile remains usable.
+        await stopCurrentTurn(session.page).catch(() => "");
       }
     },
   };

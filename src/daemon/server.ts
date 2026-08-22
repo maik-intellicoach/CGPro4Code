@@ -38,7 +38,7 @@ import {
 } from "../browser/conversation.js";
 import { detectPlan, fetchMe } from "../api/me.js";
 import { fetchModels, findProSlug } from "../api/models.js";
-import { runAskOnSession, type AskOptions } from "../core/orchestrator.js";
+import { runAskOnSession, type AskOptions, type AskRunner } from "../core/orchestrator.js";
 import { NotLoggedInError } from "../errors.js";
 import {
   clearDaemonInfo,
@@ -246,6 +246,8 @@ export interface ServerState {
   queue: AskQueue;
   readerBudget: PreAdmissionReaderBudget;
   askInFlight: boolean;
+  currentInvocation: string | null;
+  currentRunner: AskRunner | null;
   currentConversation: string | null;
   lastConversation: string | null;
   reloadConversation: string | null;
@@ -348,6 +350,8 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
     queue: new AskQueue(QUEUE_MAX, QUEUE_MAX_WAIT_MS),
     readerBudget: new PreAdmissionReaderBudget(PREADMIT_MAX_READERS),
     askInFlight: false,
+    currentInvocation: null,
+    currentRunner: null,
     currentConversation: null,
     lastConversation: null,
     reloadConversation: null,
@@ -442,6 +446,39 @@ export async function handleRequest(
       clearDaemonInfo();
       process.exit(0);
     }, 50);
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/cancel") {
+    let body: { invocationId?: string } | null;
+    try {
+      body = await readJsonBody<{ invocationId?: string }>(req);
+    } catch (err) {
+      const status = err instanceof BodyTimeoutError ? 408 : err instanceof BodyTooLargeError ? 413 : 400;
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: status === 408 ? "body_timeout" : status === 413 ? "body_too_large" : "invalid_request" }));
+      return;
+    }
+    const invocationId = body?.invocationId?.trim() ?? "";
+    if (!invocationId) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_invocation_id" }));
+      return;
+    }
+    if (!state.askInFlight || !state.currentRunner || state.currentInvocation !== invocationId) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invocation_not_active" }));
+      return;
+    }
+    await state.currentRunner.cancel();
+    const partialText = await readLatestAssistantText(state.session.page).catch(() => "");
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      invocationId,
+      conversationId: state.currentConversation,
+      partialText,
+    }));
     return;
   }
 
@@ -630,6 +667,7 @@ export async function handleAsk(
       images: body.images ?? [],
       conversationId: body.conversationId,
       timeoutSec,
+      invocationId: typeof body.invocationId === "string" ? body.invocationId : undefined,
       headless: false,
       background: state.background,
       profile: state.profile,
@@ -642,6 +680,8 @@ export async function handleAsk(
     };
 
     const runner = runAskOnSession(askOpts, state.session);
+    state.currentInvocation = askOpts.invocationId ?? null;
+    state.currentRunner = runner;
 
     const writeEvent = (event: string, data: unknown): void => {
       try {
@@ -683,6 +723,8 @@ export async function handleAsk(
     } finally {
       state.reloadConversation = null;
       state.currentConversation = null;
+      state.currentInvocation = null;
+      state.currentRunner = null;
     }
   } finally {
     state.askInFlight = false;

@@ -12,6 +12,7 @@ const readLatestAssistantText = vi.fn();
 const sendPrompt = vi.fn();
 const setConnector = vi.fn();
 const setWebSearch = vi.fn();
+const stopCurrentTurn = vi.fn();
 const waitTurnComplete = vi.fn();
 const fetchLatestTurnToolNames = vi.fn();
 
@@ -27,6 +28,7 @@ vi.mock("../src/browser/conversation.js", () => ({
   sendPrompt: (...args: unknown[]) => sendPrompt(...args),
   setConnector: (...args: unknown[]) => setConnector(...args),
   setWebSearch: (...args: unknown[]) => setWebSearch(...args),
+  stopCurrentTurn: (...args: unknown[]) => stopCurrentTurn(...args),
   waitTurnComplete: (...args: unknown[]) => waitTurnComplete(...args),
 }));
 vi.mock("../src/api/conversations.js", () => ({
@@ -57,6 +59,7 @@ beforeEach(() => {
   sendPrompt.mockResolvedValue(0);
   setWebSearch.mockResolvedValue(true);
   setConnector.mockResolvedValue(undefined);
+  stopCurrentTurn.mockResolvedValue("");
   currentConversationId.mockReturnValue(null);
   latestAssistantModelSlug.mockResolvedValue(null);
   readLatestAssistantText.mockResolvedValue("");
@@ -176,6 +179,7 @@ describe("runAskOnSession wait failure propagation", () => {
 
     await vi.waitFor(() => expect(waitTurnComplete).toHaveBeenCalledTimes(1));
     await runner.cancel();
+    expect(stopCurrentTurn).toHaveBeenCalledTimes(1);
     rejectWait(closed);
 
     await expect(runner.result).resolves.toMatchObject({ finalText: "" });
