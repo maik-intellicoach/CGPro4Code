@@ -330,6 +330,23 @@ async function attachedState(row: Locator): Promise<string | null> {
 }
 
 /**
+ * Whether an exact-label element is mounted in the composer itself.
+ *
+ * Current ChatGPT builds replace the picker row with a visible connector
+ * pill beside the prompt textarea after a successful selection. That pill
+ * carries no checked/pressed attribute, so picker-row state alone produces a
+ * false negative. Requiring the label to share the composer form with the
+ * prompt textarea keeps this proof distinct from same-label sidebar, picker,
+ * or dialog text.
+ */
+async function isComposerMountedTool(row: Locator): Promise<boolean> {
+  return row.evaluate((element) => {
+    const form = element.closest("form");
+    return Boolean(form?.querySelector("#prompt-textarea, [data-testid=\"prompt-textarea\"]"));
+  }).catch(() => false);
+}
+
+/**
  * Honest post-click postcondition for connector selection.
  *
  * A visible exact-label row - frequently a plain span with no ARIA role on
@@ -353,6 +370,7 @@ async function assertConnectorAttached(page: Page, connectorName: string): Promi
     `ChatGPT connector "${connectorName}" was clicked but never became attached to the composer (${detail}).`;
 
   let row = await visibleComposerTool(page, connectorName);
+  if (row && (await isComposerMountedTool(row))) return;
   if (!row) {
     // The picker is gone - reopen the composer "+" tools popover, where an
     // attached tool row reports its checked state.
@@ -366,7 +384,7 @@ async function assertConnectorAttached(page: Page, connectorName: string): Promi
     // attached in the reopened popover alongside a Developer-mode entry.
     // Accept it before entering Developer mode, which can clear the row.
     row = await visibleComposerTool(page, connectorName);
-    if (row && (await attachedState(row))) {
+    if (row && ((await isComposerMountedTool(row)) || (await attachedState(row)))) {
       await page.keyboard.press("Escape").catch(() => undefined);
       return;
     }
@@ -385,7 +403,7 @@ async function assertConnectorAttached(page: Page, connectorName: string): Promi
       throw new Error(notAttached("no exact-label row for the requested tool in the reopened picker"));
     }
   }
-  if (await attachedState(row)) {
+  if ((await isComposerMountedTool(row)) || (await attachedState(row))) {
     await page.keyboard.press("Escape").catch(() => undefined);
     return;
   }

@@ -21,6 +21,8 @@ interface FakeRow {
   parent?: FakeRow;
   /** Invoked when the picker row is clicked (e.g. "the picker closes"). */
   onSelected?: () => void;
+  /** Exact-label pill mounted in the same form as the prompt textarea. */
+  inComposer?: boolean;
 }
 
 const firstResolved = vi.fn();
@@ -76,6 +78,7 @@ function makePage() {
     isVisible: async () => row?.visible ?? false,
     innerText: async () => row?.label ?? "",
     getAttribute: async (attr: string) => row?.attrs?.[attr] ?? null,
+    evaluate: async () => row?.inComposer ?? false,
     // `attachedState` walks the bounded ancestor chain via `locator("..")` —
     // resolve it to the enclosing row.
     locator: () => rowLoc(row?.parent),
@@ -156,6 +159,31 @@ describe("connector selection honest attachment (P-035)", () => {
     expect(page.clickedLabels).toEqual(["IntelliCoach Context"]);
     expect(plus.click).toHaveBeenCalledTimes(1); // verifier reopened the popover once
     expect(page.keyboard.press).toHaveBeenCalledWith("Escape"); // popover closed after verify
+  });
+
+  it("accepts the exact connector pill mounted in the composer after the picker closes", async () => {
+    const scenario = makePage();
+    scenario.setRows([
+      {
+        label: "p035-low-risk-workstation",
+        visible: true,
+        attrs: {},
+        onSelected: () => scenario.setRows([
+          {
+            label: "p035-low-risk-workstation",
+            visible: true,
+            attrs: {},
+            inComposer: true,
+          },
+        ]),
+      },
+    ]);
+    const { page } = scenario;
+
+    await expect(setConnector(page, "p035-low-risk-workstation")).resolves.toBeUndefined();
+
+    expect(page.clickedLabels).toEqual(["p035-low-risk-workstation"]);
+    expect(firstResolved).not.toHaveBeenCalled();
   });
 
   it("accepts a connector already attached before the click without toggling it", async () => {
