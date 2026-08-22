@@ -149,15 +149,20 @@ describe("runAskOnSession connector contract", () => {
     expect(events.filter((event) => event.type === "tool" && event.name === "search_context")).toHaveLength(2);
   });
 
-  it("reads conversation-branch evidence once after completion, not while the turn is active", async () => {
+  it("rate-limits active branch evidence and performs one final fetch", async () => {
     currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
-    fetchLatestTurnToolCalls.mockResolvedValueOnce([
+    fetchLatestTurnToolCalls.mockResolvedValue([
       { id: "active-call-1", name: "search_context" },
     ]);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
     waitTurnComplete.mockImplementationOnce(
       async (_page, _timeout, _prior, _stable, control: { pollEvidence?: () => Promise<void> }) => {
-        expect(control.pollEvidence).toBeUndefined();
-        expect(fetchLatestTurnToolCalls).not.toHaveBeenCalled();
+        await control.pollEvidence?.();
+        clock.mockReturnValue(1_029_999);
+        await control.pollEvidence?.();
+        expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(1);
+        clock.mockReturnValue(1_030_000);
+        await control.pollEvidence?.();
       },
     );
     readLatestAssistantText.mockResolvedValueOnce("grounded");
@@ -174,7 +179,35 @@ describe("runAskOnSession connector contract", () => {
     const events = await collect(runner.events);
     await expect(runner.result).resolves.toMatchObject({ finalText: "grounded" });
     expect(events.filter((event) => event.type === "tool" && event.name === "search_context")).toHaveLength(1);
-    expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(1);
+    expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(3);
+    clock.mockRestore();
+  });
+
+  it("backs active evidence polling off for two minutes after HTTP 429", async () => {
+    currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
+    fetchLatestTurnToolCalls
+      .mockRejectedValueOnce(new Error("conversation tool evidence fetch failed with HTTP 429"))
+      .mockResolvedValue([]);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(2_000_000);
+    waitTurnComplete.mockImplementationOnce(
+      async (_page, _timeout, _prior, _stable, control: { pollEvidence?: () => Promise<void> }) => {
+        await control.pollEvidence?.();
+        clock.mockReturnValue(2_119_999);
+        await control.pollEvidence?.();
+        expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(1);
+        clock.mockReturnValue(2_120_000);
+        await control.pollEvidence?.();
+      },
+    );
+    const runner = runAskOnSession(
+      { prompt: "test", connector: "p035-low-risk-workstation", timeoutSec: 1_200, headless: false },
+      session(),
+    );
+
+    await expect(runner.result).resolves.toMatchObject({ finalText: "" });
+    expect(await collect(runner.events)).toContainEqual(expect.objectContaining({ type: "done" }));
+    expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(3);
+    clock.mockRestore();
   });
 
   it("propagates a terminal conversation-evidence rate limit instead of reporting no connector use", async () => {
