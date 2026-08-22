@@ -51,6 +51,20 @@ describe("waitTurnComplete error classification", () => {
     );
   });
 
+  it("returns when cancellation arrives while the turn waiter is active", async () => {
+    let cancelled = false;
+    const page = {
+      locator: vi.fn(() => ({ count: vi.fn(async () => 0) })),
+      waitForTimeout: vi.fn(async () => { cancelled = true; }),
+    } as unknown as Page;
+
+    await expect(
+      waitTurnComplete(page, 1_200_000, 0, undefined, { cancelled: () => cancelled }),
+    ).resolves.toBeUndefined();
+
+    expect(page.waitForTimeout).toHaveBeenCalledTimes(1);
+  });
+
   it("reloads the exact conversation and extends while ChatGPT is still working", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);

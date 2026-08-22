@@ -400,7 +400,17 @@ export async function setConnector(page: Page, name: string): Promise<void> {
  * fall back to Enter — some account/locale combos disable the button when
  * the composer is "empty" by their detector even when text is present.
  */
-export async function sendPrompt(page: Page, prompt: string, preserveExisting = false): Promise<number> {
+export async function sendPrompt(
+  page: Page,
+  prompt: string,
+  preserveExisting = false,
+  cancelled?: () => boolean,
+): Promise<number> {
+  const assistantCount = async (): Promise<number> => page
+    .locator(SELECTORS.assistantMessages.join(", "))
+    .count()
+    .catch(() => 0);
+  if (cancelled?.()) return assistantCount();
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
   await composer.click();
   await page.waitForTimeout(120);
@@ -418,13 +428,11 @@ export async function sendPrompt(page: Page, prompt: string, preserveExisting = 
     if (i > 0) await page.keyboard.press("Shift+Enter");
     await page.keyboard.type(lines[i], { delay: 4 });
   }
-  const priorAssistantCount = await page
-    .locator(SELECTORS.assistantMessages.join(", "))
-    .count()
-    .catch(() => 0);
+  const priorAssistantCount = await assistantCount();
+  if (cancelled?.()) return priorAssistantCount;
 
-  const clicked = await clickSendButtonWithRetries(page);
-  if (!clicked) {
+  const clicked = await clickSendButtonWithRetries(page, cancelled);
+  if (!clicked && !cancelled?.()) {
     // Fall back to pressing Enter while the composer has focus.
     await page.keyboard.press("Enter");
   }
@@ -441,10 +449,12 @@ const SEND_CLICK_MAX_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_SEND_CLICK_
  * (C-092 H2: `clicked` used to be set unconditionally after the first
  * attempt, so the fallback was dead code).
  */
-async function clickSendButtonWithRetries(page: Page): Promise<boolean> {
+async function clickSendButtonWithRetries(page: Page, cancelled?: () => boolean): Promise<boolean> {
   for (let attempt = 0; attempt < SEND_CLICK_MAX_ATTEMPTS; attempt++) {
+    if (cancelled?.()) return false;
     const send = await waitForEnabledSendButton(page);
     if (!send) return false;
+    if (cancelled?.()) return false;
     try {
       await send.click({ timeout: 4_000 });
       return true;
@@ -507,6 +517,7 @@ export async function waitTurnComplete(
     consumeReload?: () => string | null;
     conversationId?: () => string | null;
     onReload?: (state: { conversationId: string; working: boolean; extended: boolean }) => void;
+    cancelled?: () => boolean;
   } = {},
 ): Promise<void> {
   let deadline = Date.now() + timeoutMs;
@@ -514,6 +525,7 @@ export async function waitTurnComplete(
   let lastChangedAt = Date.now();
 
   for (;;) {
+    if (control.cancelled?.()) return;
     const requestedConversation = control.consumeReload?.() ?? null;
     const expired = Date.now() >= deadline;
     if (requestedConversation || expired) {
@@ -528,6 +540,7 @@ export async function waitTurnComplete(
             waitUntil: "domcontentloaded",
             timeout: 60_000,
           });
+          if (control.cancelled?.()) return;
           await requireSelector(page, SELECTORS.composer, "composer", 20_000);
         } finally {
           setExpectedReloadNavigation(page.context(), false);

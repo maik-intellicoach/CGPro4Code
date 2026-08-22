@@ -148,7 +148,7 @@ function runAskInner(
       await attachImages(page, opts.images ?? []);
 
       log("sendPrompt…");
-      const priorBubbles = await sendPrompt(page, opts.prompt, opts.connector !== undefined);
+      const priorBubbles = await sendPrompt(page, opts.prompt, opts.connector !== undefined, () => cancelled);
       log(`sendPrompt done (priorBubbles=${priorBubbles}), url=${page.url()}`);
 
       // Wait for the turn to settle. The SSE interceptor will normally push
@@ -170,6 +170,7 @@ function runAskInner(
               meta: { conversationId, working, waitExtendedSec: extended ? opts.timeoutSec : 0 },
             });
           },
+          cancelled: () => cancelled,
         });
       } catch (err) {
         if (debug) {
@@ -198,6 +199,18 @@ function runAskInner(
         if (!cancelled) throw err;
       }
       log(`waitTurnComplete done, url=${page.url()}`);
+
+      if (cancelled) {
+        const finalText = await readLatestAssistantText(page).catch(() => "");
+        if (!emitter.isFinished()) {
+          emitter.push({ type: "done", finalText });
+        }
+        return {
+          conversationId: currentConversationId(page),
+          finalText,
+          events: collected,
+        };
+      }
 
       // Conversation id can come from two sources:
       //  - the URL once the page navigates to /c/<uuid> (regular chats)

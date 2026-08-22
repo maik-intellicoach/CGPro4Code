@@ -97,11 +97,15 @@ beforeEach(() => {
 describe("exact daemon cancellation", () => {
   it("fails closed for a different invocation and cancels only the exact active runner", async () => {
     const cancel = vi.fn(async () => {});
+    let resolveResult: (value: { conversationId: null; finalText: string; events: [] }) => void = () => {};
+    const result = new Promise<{ conversationId: null; finalText: string; events: [] }>((resolve) => {
+      resolveResult = resolve;
+    });
     browserConversation.readLatestAssistantText.mockResolvedValue("recoverable partial");
     const state = fakeState({
       askInFlight: true,
       currentInvocation: "11111111-1111-1111-1111-111111111111",
-      currentRunner: { events: new StreamEmitter(), result: Promise.resolve({ conversationId: null, finalText: "", events: [] }), cancel },
+      currentRunner: { events: new StreamEmitter(), result, cancel },
       currentConversation: "22222222-2222-2222-2222-222222222222",
     });
 
@@ -119,8 +123,11 @@ describe("exact daemon cancellation", () => {
     Object.assign(exactReq, { method: "POST", url: "/cancel", headers: { authorization: "Bearer test-token" } });
     const exactPending = handleRequest(exactReq, exactRes, state);
     sendBody(exactReq, { invocationId: state.currentInvocation });
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledTimes(1));
+    await tick();
+    expect((exactRes as unknown as FakeRes).ended).toBe(false);
+    resolveResult({ conversationId: null, finalText: "", events: [] });
     await exactPending;
-    expect(cancel).toHaveBeenCalledTimes(1);
     expect(parseJsonBody(exactRes as unknown as FakeRes)).toMatchObject({
       ok: true,
       invocationId: state.currentInvocation,

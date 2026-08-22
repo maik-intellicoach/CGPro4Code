@@ -185,4 +185,31 @@ describe("runAskOnSession wait failure propagation", () => {
     await expect(runner.result).resolves.toMatchObject({ finalText: "" });
     expect(await collect(runner.events)).toEqual([{ type: "done", finalText: "" }]);
   });
+
+  it("lets cancellation resolve the active waiter without a later browser error", async () => {
+    waitTurnComplete.mockImplementationOnce(
+      (_page, _timeout, _prior, _stable, control: { cancelled?: () => boolean }) =>
+        new Promise<void>((resolve) => {
+          const check = (): void => {
+            if (control.cancelled?.()) {
+              resolve();
+              return;
+            }
+            setTimeout(check, 0);
+          };
+          check();
+        }),
+    );
+    const runner = runAskOnSession(
+      { prompt: "test", timeoutSec: 1_200, headless: false },
+      session(),
+    );
+
+    await vi.waitFor(() => expect(waitTurnComplete).toHaveBeenCalledTimes(1));
+    await runner.cancel();
+
+    await expect(runner.result).resolves.toMatchObject({ finalText: "" });
+    expect(stopCurrentTurn).toHaveBeenCalledTimes(1);
+    expect(await collect(runner.events)).toEqual([{ type: "done", finalText: "" }]);
+  });
 });

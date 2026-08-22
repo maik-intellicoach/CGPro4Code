@@ -94,4 +94,14 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     expect(page.keyboard.press).not.toHaveBeenCalledWith("Backspace");
     expect(page.keyboard.type).toHaveBeenCalledWith("hello", { delay: 4 });
   });
+
+  it("does not compose or submit after exact cancellation owns the turn", async () => {
+    const page = fakePage();
+
+    await expect(sendPrompt(page, "hello", false, () => true)).resolves.toBe(0);
+
+    expect(firstResolved).not.toHaveBeenCalled();
+    expect(page.keyboard.type).not.toHaveBeenCalled();
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+  });
 });

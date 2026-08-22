@@ -470,7 +470,12 @@ export async function handleRequest(
       res.end(JSON.stringify({ error: "invocation_not_active" }));
       return;
     }
-    await state.currentRunner.cancel();
+    const runner = state.currentRunner;
+    await runner.cancel();
+    // Do not acknowledge cancellation while the original /ask handler can
+    // still report this lane as busy. Its terminal result closes the event
+    // stream and lets that handler clear askInFlight in its existing finally.
+    await runner.result.catch(() => undefined);
     const partialText = await readLatestAssistantText(state.session.page).catch(() => "");
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
