@@ -205,4 +205,34 @@ describe("connector selection honest attachment (P-035)", () => {
     expect(page.clickedLabels).toEqual(["p035-low-risk-workstation"]);
     expect(plus.click).toHaveBeenCalledTimes(1);
   });
+
+  it("accepts a directly attached row before entering Developer mode (F1)", async () => {
+    const scenario = makePage();
+    scenario.setRows([
+      {
+        label: "IntelliCoach Context",
+        visible: true,
+        attrs: {},
+        onSelected: () => scenario.setRows([]), // successful click dismisses the picker
+      },
+    ]);
+    let devEntered = false;
+    plus.click.mockImplementation(async () => {
+      // The reopened popover contains BOTH the exact checked row and a
+      // visible Developer-mode entry whose click would clear the rows.
+      scenario.setRows([{ label: "IntelliCoach Context", visible: true, attrs: { "aria-checked": "true" } }]);
+    });
+    scenario.setDevMode(true, () => {
+      devEntered = true;
+      scenario.setRows([]); // Developer mode clears the direct row (F1 false-negative shape)
+    });
+    const { page } = scenario;
+
+    await expect(setConnector(page, "IntelliCoach Context")).resolves.toBeUndefined();
+
+    expect(page.clickedLabels).toEqual(["IntelliCoach Context"]);
+    expect(devEntered).toBe(false); // Developer mode was never entered
+    expect(plus.click).toHaveBeenCalledTimes(1);
+    expect(page.keyboard.press).toHaveBeenCalledWith("Escape");
+  });
 });

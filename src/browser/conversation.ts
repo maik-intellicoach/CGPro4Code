@@ -334,6 +334,14 @@ async function assertConnectorAttached(page: Page, connectorName: string): Promi
       await recordConnectorDiagnostics(page);
       throw new Error(notAttached("composer tools popover did not open"));
     }
+    // Direct row first: a non-MCP connector can be directly visible and
+    // attached in the reopened popover alongside a Developer-mode entry.
+    // Accept it before entering Developer mode, which can clear the row.
+    row = await visibleComposerTool(page, connectorName);
+    if (row && (await attachedState(row))) {
+      await page.keyboard.press("Escape").catch(() => undefined);
+      return;
+    }
     const developerMode = page
       .locator('[role="menuitem"], [role="menuitemradio"], button')
       .filter({ hasText: /^\s*Developer mode\s*$/i })
