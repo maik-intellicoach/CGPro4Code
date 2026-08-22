@@ -276,4 +276,47 @@ describe("connector selection honest attachment (P-035)", () => {
     expect(plus.click).toHaveBeenCalledTimes(1); // popover reopened once
     expect(page.keyboard.press).toHaveBeenCalledWith("Escape"); // accepted via the enclosing row state
   });
+
+  it("rejects when the nearest state-bearing ancestor is unchecked even if a farther ancestor is checked", async () => {
+    const scenario = makePage();
+    scenario.setRows([
+      {
+        label: "p035-low-risk-workstation",
+        visible: true,
+        attrs: {},
+        onSelected: () => scenario.setRows([]), // successful click dismisses the picker
+      },
+    ]);
+    plus.click.mockImplementation(async () => {
+      // The reopened popover: the exact label span has no state; its parent
+      // row reports aria-checked=false; its grandparent reports true. The
+      // nearest state-bearing ancestor wins: unchecked => reject, never
+      // overridden by the farther checked ancestor.
+      scenario.setRows([
+        {
+          label: "p035-low-risk-workstation",
+          visible: true,
+          attrs: {},
+          parent: {
+            label: "p035-low-risk-workstation row",
+            visible: true,
+            attrs: { "aria-checked": "false" },
+            parent: {
+              label: "p035-low-risk-workstation container",
+              visible: true,
+              attrs: { "aria-checked": "true" },
+            },
+          },
+        },
+      ]);
+    });
+    const { page } = scenario;
+
+    await expect(setConnector(page, "p035-low-risk-workstation")).rejects.toThrow(
+      /never became attached to the composer/,
+    );
+
+    expect(page.clickedLabels).toEqual(["p035-low-risk-workstation"]);
+    expect(plus.click).toHaveBeenCalledTimes(1); // popover reopened once
+  });
 });
