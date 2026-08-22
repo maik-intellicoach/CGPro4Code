@@ -152,6 +152,9 @@ function runAskInner(
 
       log("sendPrompt…");
       const priorBubbles = await sendPrompt(page, opts.prompt, opts.connector !== undefined, () => cancelled);
+      if (opts.connector !== undefined && !cancelled) {
+        emitter.push({ type: "tool", name: "prompt-submitted", meta: { connector: opts.connector } });
+      }
       log(`sendPrompt done (priorBubbles=${priorBubbles}), url=${page.url()}`);
 
       const runConnectorEvidencePoll = async (force = false): Promise<void> => {

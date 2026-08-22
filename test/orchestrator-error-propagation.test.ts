@@ -67,7 +67,7 @@ beforeEach(() => {
 });
 
 describe("runAskOnSession connector contract", () => {
-  it("selects the exact connector before sending and emits selection evidence", async () => {
+  it("emits exact connector selection and prompt submission evidence in lifecycle order", async () => {
     waitTurnComplete.mockResolvedValueOnce(undefined);
     readLatestAssistantText.mockResolvedValueOnce("grounded");
     const activeSession = session();
@@ -93,6 +93,20 @@ describe("runAskOnSession connector contract", () => {
       name: "connector-selected",
       meta: { connector: "IntelliCoach Context" },
     });
+    expect(events).toContainEqual({
+      type: "tool",
+      name: "prompt-submitted",
+      meta: { connector: "IntelliCoach Context" },
+    });
+    const connectorLifecycle = events.filter(
+      (event) => event.type === "tool" &&
+        (event.name === "connector-selected" || event.name === "prompt-submitted"),
+    );
+    expect(connectorLifecycle).toEqual([
+      { type: "tool", name: "connector-selected", meta: { connector: "IntelliCoach Context" } },
+      { type: "tool", name: "prompt-submitted", meta: { connector: "IntelliCoach Context" } },
+    ]);
+    expect(sendPrompt.mock.invocationCallOrder[0]).toBeLessThan(waitTurnComplete.mock.invocationCallOrder[0]);
   });
 
   it("emits connector tool evidence from the completed conversation branch", async () => {
@@ -174,6 +188,43 @@ describe("runAskOnSession connector contract", () => {
     await expect(runner.result).rejects.toThrow("connector unavailable");
     expect(await collect(runner.events)).toEqual([{ type: "error", message: "connector unavailable" }]);
     expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
+  it("does not emit prompt submission when sending fails", async () => {
+    sendPrompt.mockRejectedValueOnce(new Error("send unavailable"));
+    const runner = runAskOnSession(
+      { prompt: "test", connector: "IntelliCoach Context", timeoutSec: 1_200, headless: false },
+      session(),
+    );
+
+    await expect(runner.result).rejects.toThrow("send unavailable");
+    expect(await collect(runner.events)).toEqual([
+      { type: "tool", name: "connector-selected", meta: { connector: "IntelliCoach Context" } },
+      { type: "error", message: "send unavailable" },
+    ]);
+  });
+
+  it("does not emit prompt submission when cancellation makes sending return without submitting", async () => {
+    let finishSend: (value: number) => void = () => {};
+    sendPrompt.mockImplementationOnce(
+      () => new Promise<number>((resolve) => { finishSend = resolve; }),
+    );
+    waitTurnComplete.mockResolvedValueOnce(undefined);
+    const runner = runAskOnSession(
+      { prompt: "test", connector: "IntelliCoach Context", timeoutSec: 1_200, headless: false },
+      session(),
+    );
+
+    await vi.waitFor(() => expect(sendPrompt).toHaveBeenCalledTimes(1));
+    await runner.cancel();
+    finishSend(0);
+
+    await expect(runner.result).resolves.toMatchObject({ finalText: "" });
+    const events = await collect(runner.events);
+    expect(events).toContainEqual({
+      type: "tool", name: "connector-selected", meta: { connector: "IntelliCoach Context" },
+    });
+    expect(events).not.toContainEqual(expect.objectContaining({ type: "tool", name: "prompt-submitted" }));
   });
 });
 
