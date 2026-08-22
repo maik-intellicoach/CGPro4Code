@@ -93,6 +93,7 @@ function runAskInner(
   let cancelled = false;
   const observedConnectorCallIds = new Set<string>();
   let lastConnectorEvidencePollAt = 0;
+  let connectorEvidencePollInFlight: Promise<void> | null = null;
 
   const result: Promise<AskResult> = (async () => {
     if (!session) {
@@ -153,7 +154,7 @@ function runAskInner(
       const priorBubbles = await sendPrompt(page, opts.prompt, opts.connector !== undefined, () => cancelled);
       log(`sendPrompt done (priorBubbles=${priorBubbles}), url=${page.url()}`);
 
-      const pollConnectorEvidence = async (force = false): Promise<void> => {
+      const runConnectorEvidencePoll = async (force = false): Promise<void> => {
         if (opts.connector === undefined || cancelled) return;
         const now = Date.now();
         if (!force && now - lastConnectorEvidencePollAt < 2_000) return;
@@ -167,7 +168,12 @@ function runAskInner(
         const conversationId = currentConversationId(page) ??
           (started?.type === "started" ? started.conversationId ?? null : null);
         if (!conversationId) return;
-        const calls = await fetchLatestTurnToolCalls(page, conversationId, opts.connector).catch(() => []);
+        const calls = await fetchLatestTurnToolCalls(
+          page,
+          conversationId,
+          opts.connector,
+          force ? 10_000 : 1_000,
+        ).catch(() => []);
         for (const call of calls) {
           if (observedConnectorCallIds.has(call.id)) continue;
           observedConnectorCallIds.add(call.id);
@@ -177,6 +183,25 @@ function runAskInner(
             meta: { source: "latest-conversation-turn", connector: opts.connector, callId: call.id },
           });
         }
+      };
+
+      const pollConnectorEvidence = async (force = false): Promise<void> => {
+        if (force) {
+          if (connectorEvidencePollInFlight) {
+            await new Promise<void>((resolve) => {
+              const timer = setTimeout(resolve, 2_500);
+              connectorEvidencePollInFlight?.catch(() => undefined).finally(() => {
+                clearTimeout(timer);
+                resolve();
+              });
+            });
+          }
+          await runConnectorEvidencePoll(true);
+          return;
+        }
+        if (connectorEvidencePollInFlight) return;
+        connectorEvidencePollInFlight = runConnectorEvidencePoll(false)
+          .finally(() => { connectorEvidencePollInFlight = null; });
       };
 
       // Wait for the turn to settle. The SSE interceptor will normally push

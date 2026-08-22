@@ -122,6 +122,7 @@ describe("runAskOnSession connector contract", () => {
       activeSession.page,
       "11111111-1111-1111-1111-111111111111",
       "p035-low-risk-workstation",
+      10_000,
     );
     expect(events).toContainEqual({
       type: "tool", name: "search_context",
@@ -177,6 +178,34 @@ describe("runAskOnSession connector contract", () => {
 });
 
 describe("runAskOnSession wait failure propagation", () => {
+  it("cancels promptly while an active connector evidence poll is stalled", async () => {
+    currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
+    fetchLatestTurnToolCalls.mockReturnValueOnce(new Promise(() => {}));
+    waitTurnComplete.mockImplementationOnce(
+      async (_page, _timeout, _prior, _stable, control: {
+        cancelled?: () => boolean;
+        pollEvidence?: () => Promise<void>;
+      }) => {
+        await control.pollEvidence?.();
+        while (!control.cancelled?.()) await new Promise((resolve) => setTimeout(resolve, 0));
+      },
+    );
+    const runner = runAskOnSession(
+      {
+        prompt: "test",
+        connector: "p035-low-risk-workstation",
+        timeoutSec: 1_200,
+        headless: false,
+      },
+      session(),
+    );
+
+    await vi.waitFor(() => expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(1));
+    await runner.cancel();
+    await expect(runner.result).resolves.toMatchObject({ finalText: "" });
+    expect(await collect(runner.events)).toContainEqual({ type: "done", finalText: "" });
+  });
+
   it("keeps the 588-second browser closure distinct from a configured 1200-second timeout", async () => {
     const closed = new Error("Target page, context or browser has been closed");
     waitTurnComplete.mockRejectedValueOnce(closed);

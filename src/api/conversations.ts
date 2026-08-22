@@ -95,8 +95,9 @@ export async function fetchLatestTurnToolCalls(
   page: Page,
   conversationId: string,
   expectedAppName?: string,
+  timeoutMs = 10_000,
 ): Promise<ConnectorToolCall[]> {
-  const result = await backendApiFetch(page, `/backend-api/conversation/${conversationId}`);
+  const result = await backendApiFetch(page, `/backend-api/conversation/${conversationId}`, { timeoutMs });
   if (!result.ok) {
     throw new Error(`conversation tool evidence fetch failed with HTTP ${result.status}`);
   }
@@ -107,8 +108,9 @@ export async function fetchLatestTurnToolNames(
   page: Page,
   conversationId: string,
   expectedAppName?: string,
+  timeoutMs = 10_000,
 ): Promise<string[]> {
-  return (await fetchLatestTurnToolCalls(page, conversationId, expectedAppName)).map((call) => call.name);
+  return (await fetchLatestTurnToolCalls(page, conversationId, expectedAppName, timeoutMs)).map((call) => call.name);
 }
 
 export async function fetchRemoteConversations(

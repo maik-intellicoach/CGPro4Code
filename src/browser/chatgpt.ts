@@ -67,20 +67,25 @@ export interface AuthSessionFull {
   sessionToken?: string;
 }
 
-export async function fetchAuthSessionInPage(page: Page): Promise<AuthSessionFull | null> {
+export async function fetchAuthSessionInPage(page: Page, timeoutMs?: number): Promise<AuthSessionFull | null> {
   try {
-    const result = await page.evaluate(async () => {
+    const result = await page.evaluate(async (requestTimeoutMs) => {
+      const controller = typeof requestTimeoutMs === "number" ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), requestTimeoutMs) : null;
       try {
         const r = await fetch("/api/auth/session", {
           headers: { Accept: "application/json" },
           credentials: "include",
+          signal: controller?.signal,
         });
         if (!r.ok) return null;
         return (await r.json()) as Record<string, unknown>;
       } catch {
         return null;
+      } finally {
+        if (timer) clearTimeout(timer);
       }
-    });
+    }, timeoutMs);
     return (result ?? null) as AuthSessionFull | null;
   } catch {
     return null;
@@ -91,8 +96,8 @@ export async function fetchAuthSessionInPage(page: Page): Promise<AuthSessionFul
  * Get a valid Bearer accessToken for /backend-api/* calls.
  * Returns null if the user isn't authenticated.
  */
-export async function getAccessToken(page: Page): Promise<string | null> {
-  const session = await fetchAuthSessionInPage(page);
+export async function getAccessToken(page: Page, timeoutMs?: number): Promise<string | null> {
+  const session = await fetchAuthSessionInPage(page, timeoutMs);
   return session?.accessToken ?? null;
 }
 
@@ -104,31 +109,38 @@ export async function getAccessToken(page: Page): Promise<string | null> {
 export async function backendApiFetch(
   page: Page,
   pathOrUrl: string,
-  init: { method?: string; body?: unknown; headers?: Record<string, string> } = {},
+  init: { method?: string; body?: unknown; headers?: Record<string, string>; timeoutMs?: number } = {},
 ): Promise<{ ok: boolean; status: number; body: unknown }> {
-  const token = await getAccessToken(page);
+  const token = await getAccessToken(page, init.timeoutMs);
   if (!token) return { ok: false, status: 401, body: null };
   return await page.evaluate(
-    async ({ url, method, body, headers, accessToken }) => {
-      const r = await fetch(url, {
-        method,
-        credentials: "include",
-        headers: {
-          Accept: "application/json",
-          "OAI-Language": "en-US",
-          Authorization: `Bearer ${accessToken}`,
-          ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
-          ...(headers ?? {}),
-        },
-        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-      });
-      let parsed: unknown = null;
+    async ({ url, method, body, headers, accessToken, timeoutMs }) => {
+      const controller = typeof timeoutMs === "number" ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
       try {
-        parsed = await r.json();
-      } catch {
-        parsed = null;
+        const r = await fetch(url, {
+          method,
+          credentials: "include",
+          headers: {
+            Accept: "application/json",
+            "OAI-Language": "en-US",
+            Authorization: `Bearer ${accessToken}`,
+            ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+            ...(headers ?? {}),
+          },
+          ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+          signal: controller?.signal,
+        });
+        let parsed: unknown = null;
+        try {
+          parsed = await r.json();
+        } catch {
+          parsed = null;
+        }
+        return { ok: r.ok, status: r.status, body: parsed };
+      } finally {
+        if (timer) clearTimeout(timer);
       }
-      return { ok: r.ok, status: r.status, body: parsed };
     },
     {
       url: pathOrUrl,
@@ -136,6 +148,7 @@ export async function backendApiFetch(
       body: init.body,
       headers: init.headers,
       accessToken: token,
+      timeoutMs: init.timeoutMs,
     },
   );
 }
