@@ -88,12 +88,12 @@ describe("SseParser", () => {
   it("names custom connector tool results from invoked_resource metadata", () => {
     const p = new SseParser("p035-low-risk-workstation");
     const events = p.feed(
-      'data: {"message":{"author":{"role":"tool"},"recipient":"all","content":{"content_type":"code","text":"{}"},"metadata":{"invoked_resource":{"resource_uri":"/asdk_app_redacted/link_redacted/search_context","app_name":"p035-low-risk-workstation"}}}}\n\n',
+      'data: {"message":{"id":"tool-call-1","author":{"role":"tool"},"recipient":"all","content":{"content_type":"code","text":"{}"},"metadata":{"invoked_resource":{"resource_uri":"/asdk_app_redacted/link_redacted/search_context","app_name":"p035-low-risk-workstation"}}}}\n\n',
     );
     expect(events).toContainEqual(expect.objectContaining({
       type: "tool",
       name: "search_context",
-      meta: { source: "sse", connector: "p035-low-risk-workstation" },
+      meta: { source: "sse", connector: "p035-low-risk-workstation", callId: "tool-call-1" },
     }));
   });
 
@@ -104,6 +104,33 @@ describe("SseParser", () => {
     );
     expect(events.filter((event) => event.type === "tool")).toEqual([]);
   });
+});
+
+it("deduplicates the same connector call across branch and SSE evidence", async () => {
+  const emitter = new StreamEmitter();
+  emitter.push({
+    type: "tool",
+    name: "search_context",
+    meta: { source: "latest-conversation-turn", callId: "call-1" },
+  });
+  emitter.push({
+    type: "tool",
+    name: "search_context",
+    meta: { source: "sse", callId: "call-1" },
+  });
+  emitter.push({
+    type: "tool",
+    name: "search_context",
+    meta: { source: "sse", callId: "call-2" },
+  });
+  emitter.push({ type: "done" });
+
+  const events = [];
+  for await (const event of emitter) events.push(event);
+  expect(events.filter((event) => event.type === "tool")).toEqual([
+    expect.objectContaining({ name: "search_context", meta: expect.objectContaining({ callId: "call-1" }) }),
+    expect.objectContaining({ name: "search_context", meta: expect.objectContaining({ callId: "call-2" }) }),
+  ]);
 });
 
 it("suppresses observer failures only during expected reload navigation", async () => {

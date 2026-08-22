@@ -22,10 +22,16 @@ function toolFromMessage(
       if (expectedConnector !== undefined && appName !== expectedConnector) return null;
       if (typeof resourceUri === "string") {
         const toolName = resourceUri.split("/").filter(Boolean).at(-1);
+        const callId = typeof message["id"] === "string" ? message["id"] as string : null;
+        if (expectedConnector !== undefined && !callId) return null;
         if (toolName) {
           return {
             name: toolName,
-            meta: { source: "sse", connector: typeof appName === "string" ? appName : undefined },
+            meta: {
+              source: "sse",
+              connector: typeof appName === "string" ? appName : undefined,
+              callId: callId ?? undefined,
+            },
           };
         }
       }
@@ -50,11 +56,19 @@ interface QueueEntry {
 export class StreamEmitter implements AsyncIterable<StreamEvent> {
   private buffer: StreamEvent[] = [];
   private waiters: QueueEntry[] = [];
+  private seenToolCallIds = new Set<string>();
   private finished = false;
   private errored: Error | null = null;
 
   push(event: StreamEvent): void {
     if (this.finished) return;
+    if (event.type === "tool" && event.meta && typeof event.meta === "object") {
+      const callId = (event.meta as Record<string, unknown>)["callId"];
+      if (typeof callId === "string") {
+        if (this.seenToolCallIds.has(callId)) return;
+        this.seenToolCallIds.add(callId);
+      }
+    }
     if (this.waiters.length > 0) {
       const w = this.waiters.shift()!;
       w.resolve(event);

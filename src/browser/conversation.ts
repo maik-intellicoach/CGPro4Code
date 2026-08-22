@@ -518,6 +518,7 @@ export async function waitTurnComplete(
     conversationId?: () => string | null;
     onReload?: (state: { conversationId: string; working: boolean; extended: boolean }) => void;
     cancelled?: () => boolean;
+    pollEvidence?: () => Promise<void>;
   } = {},
 ): Promise<void> {
   let deadline = Date.now() + timeoutMs;
@@ -525,6 +526,8 @@ export async function waitTurnComplete(
   let lastChangedAt = Date.now();
 
   for (;;) {
+    if (control.cancelled?.()) return;
+    await control.pollEvidence?.();
     if (control.cancelled?.()) return;
     const requestedConversation = control.consumeReload?.() ?? null;
     const expired = Date.now() >= deadline;

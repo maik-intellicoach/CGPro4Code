@@ -34,6 +34,11 @@ export interface FetchOptions {
   debug?: boolean;
 }
 
+export interface ConnectorToolCall {
+  id: string;
+  name: string;
+}
+
 type JsonObject = Record<string, unknown>;
 
 function asObject(value: unknown): JsonObject | null {
@@ -55,13 +60,13 @@ function invokedResourceToolName(message: JsonObject, expectedAppName?: string):
  * Extract connector tools from only the latest user turn on the current
  * conversation branch. Older turns and abandoned branches are excluded.
  */
-export function extractLatestTurnToolNames(body: unknown, expectedAppName?: string): string[] {
+export function extractLatestTurnToolCalls(body: unknown, expectedAppName?: string): ConnectorToolCall[] {
   const root = asObject(body);
   const mapping = asObject(root?.mapping);
   let nodeId = typeof root?.current_node === "string" ? root.current_node : null;
   if (!mapping || !nodeId) return [];
 
-  const reverseChronological: string[] = [];
+  const reverseChronological: ConnectorToolCall[] = [];
   const seenNodes = new Set<string>();
   while (nodeId && !seenNodes.has(nodeId)) {
     seenNodes.add(nodeId);
@@ -72,11 +77,30 @@ export function extractLatestTurnToolNames(body: unknown, expectedAppName?: stri
     if (author?.role === "user") break;
     if (message && author?.role === "tool") {
       const name = invokedResourceToolName(message, expectedAppName);
-      if (name) reverseChronological.push(name);
+      if (name) {
+        const messageId = typeof message.id === "string" ? message.id : nodeId;
+        reverseChronological.push({ id: messageId, name });
+      }
     }
     nodeId = typeof node.parent === "string" ? node.parent : null;
   }
   return reverseChronological.reverse();
+}
+
+export function extractLatestTurnToolNames(body: unknown, expectedAppName?: string): string[] {
+  return extractLatestTurnToolCalls(body, expectedAppName).map((call) => call.name);
+}
+
+export async function fetchLatestTurnToolCalls(
+  page: Page,
+  conversationId: string,
+  expectedAppName?: string,
+): Promise<ConnectorToolCall[]> {
+  const result = await backendApiFetch(page, `/backend-api/conversation/${conversationId}`);
+  if (!result.ok) {
+    throw new Error(`conversation tool evidence fetch failed with HTTP ${result.status}`);
+  }
+  return extractLatestTurnToolCalls(result.body, expectedAppName);
 }
 
 export async function fetchLatestTurnToolNames(
@@ -84,11 +108,7 @@ export async function fetchLatestTurnToolNames(
   conversationId: string,
   expectedAppName?: string,
 ): Promise<string[]> {
-  const result = await backendApiFetch(page, `/backend-api/conversation/${conversationId}`);
-  if (!result.ok) {
-    throw new Error(`conversation tool evidence fetch failed with HTTP ${result.status}`);
-  }
-  return extractLatestTurnToolNames(result.body, expectedAppName);
+  return (await fetchLatestTurnToolCalls(page, conversationId, expectedAppName)).map((call) => call.name);
 }
 
 export async function fetchRemoteConversations(

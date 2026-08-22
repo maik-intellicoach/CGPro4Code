@@ -19,7 +19,7 @@ import {
 } from "./stream.js";
 import { NotLoggedInError } from "../errors.js";
 import { SELECTORS as SELECTORS_DUMP } from "../browser/selectors.js";
-import { fetchLatestTurnToolNames } from "../api/conversations.js";
+import { fetchLatestTurnToolCalls } from "../api/conversations.js";
 
 export interface AskOptions {
   prompt: string;
@@ -91,6 +91,8 @@ function runAskInner(
 
   let session: Session | null = providedSession;
   let cancelled = false;
+  const observedConnectorCallIds = new Set<string>();
+  let lastConnectorEvidencePollAt = 0;
 
   const result: Promise<AskResult> = (async () => {
     if (!session) {
@@ -151,6 +153,32 @@ function runAskInner(
       const priorBubbles = await sendPrompt(page, opts.prompt, opts.connector !== undefined, () => cancelled);
       log(`sendPrompt done (priorBubbles=${priorBubbles}), url=${page.url()}`);
 
+      const pollConnectorEvidence = async (force = false): Promise<void> => {
+        if (opts.connector === undefined || cancelled) return;
+        const now = Date.now();
+        if (!force && now - lastConnectorEvidencePollAt < 2_000) return;
+        lastConnectorEvidencePollAt = now;
+        for (const event of collected) {
+          if (event.type !== "tool" || !event.meta || typeof event.meta !== "object") continue;
+          const callId = (event.meta as Record<string, unknown>).callId;
+          if (typeof callId === "string") observedConnectorCallIds.add(callId);
+        }
+        const started = collected.find((event) => event.type === "started");
+        const conversationId = currentConversationId(page) ??
+          (started?.type === "started" ? started.conversationId ?? null : null);
+        if (!conversationId) return;
+        const calls = await fetchLatestTurnToolCalls(page, conversationId, opts.connector).catch(() => []);
+        for (const call of calls) {
+          if (observedConnectorCallIds.has(call.id)) continue;
+          observedConnectorCallIds.add(call.id);
+          emitter.push({
+            type: "tool",
+            name: call.name,
+            meta: { source: "latest-conversation-turn", connector: opts.connector, callId: call.id },
+          });
+        }
+      };
+
       // Wait for the turn to settle. The SSE interceptor will normally push
       // a `done` event; if the network missed (cached response, schema we
       // didn't recognize), we fall back to DOM detection.
@@ -171,6 +199,7 @@ function runAskInner(
             });
           },
           cancelled: () => cancelled,
+          pollEvidence: () => pollConnectorEvidence(false),
         });
       } catch (err) {
         if (debug) {
@@ -229,19 +258,7 @@ function runAskInner(
       log(`actualModel=${actualModel ?? "(unknown)"} conv=${conversationId ?? "(none)"}`);
 
       if (opts.connector !== undefined && conversationId) {
-        const observedNames = new Set(
-          collected.filter((event) => event.type === "tool").map((event) => event.name),
-        );
-        const conversationToolNames = await fetchLatestTurnToolNames(page, conversationId, opts.connector);
-        for (const name of conversationToolNames) {
-          if (observedNames.has(name)) continue;
-          observedNames.add(name);
-          emitter.push({
-            type: "tool",
-            name,
-            meta: { source: "latest-conversation-turn", connector: opts.connector },
-          });
-        }
+        await pollConnectorEvidence(true);
       }
 
       // GPT-5.5 Pro is policy. If the bubble's model slug doesn't include

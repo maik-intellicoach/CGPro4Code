@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractLatestTurnToolNames } from "../src/api/conversations.js";
+import { extractLatestTurnToolCalls, extractLatestTurnToolNames } from "../src/api/conversations.js";
 import { exactConnectorLabelIndex } from "../src/browser/conversation.js";
 
 describe("extractLatestTurnToolNames", () => {
@@ -54,6 +54,37 @@ describe("extractLatestTurnToolNames", () => {
     });
     expect(extractLatestTurnToolNames(tool("wrong-connector"), "p035-low-risk-workstation")).toEqual([]);
     expect(extractLatestTurnToolNames(tool(), "p035-low-risk-workstation")).toEqual([]);
+  });
+
+  it("preserves repeated tool-call occurrences with stable branch IDs", () => {
+    const body = {
+      current_node: "assistant-final",
+      mapping: {
+        user: { parent: null, message: { author: { role: "user" } } },
+        search1: {
+          parent: "user",
+          message: {
+            id: "message-search-1",
+            author: { role: "tool" },
+            metadata: { invoked_resource: { resource_uri: "/app/link/search_context", app_name: "p035-low-risk-workstation" } },
+          },
+        },
+        search2: {
+          parent: "search1",
+          message: {
+            id: "message-search-2",
+            author: { role: "tool" },
+            metadata: { invoked_resource: { resource_uri: "/app/link/search_context", app_name: "p035-low-risk-workstation" } },
+          },
+        },
+        "assistant-final": { parent: "search2", message: { author: { role: "assistant" } } },
+      },
+    };
+
+    expect(extractLatestTurnToolCalls(body, "p035-low-risk-workstation")).toEqual([
+      { id: "message-search-1", name: "search_context" },
+      { id: "message-search-2", name: "search_context" },
+    ]);
   });
 });
 

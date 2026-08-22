@@ -14,7 +14,7 @@ const setConnector = vi.fn();
 const setWebSearch = vi.fn();
 const stopCurrentTurn = vi.fn();
 const waitTurnComplete = vi.fn();
-const fetchLatestTurnToolNames = vi.fn();
+const fetchLatestTurnToolCalls = vi.fn();
 
 vi.mock("../src/browser/chatgpt.js", () => ({
   goHome: (...args: unknown[]) => goHome(...args),
@@ -32,7 +32,7 @@ vi.mock("../src/browser/conversation.js", () => ({
   waitTurnComplete: (...args: unknown[]) => waitTurnComplete(...args),
 }));
 vi.mock("../src/api/conversations.js", () => ({
-  fetchLatestTurnToolNames: (...args: unknown[]) => fetchLatestTurnToolNames(...args),
+  fetchLatestTurnToolCalls: (...args: unknown[]) => fetchLatestTurnToolCalls(...args),
 }));
 
 const { runAskOnSession } = await import("../src/core/orchestrator.js");
@@ -63,7 +63,7 @@ beforeEach(() => {
   currentConversationId.mockReturnValue(null);
   latestAssistantModelSlug.mockResolvedValue(null);
   readLatestAssistantText.mockResolvedValue("");
-  fetchLatestTurnToolNames.mockResolvedValue([]);
+  fetchLatestTurnToolCalls.mockResolvedValue([]);
 });
 
 describe("runAskOnSession connector contract", () => {
@@ -99,7 +99,11 @@ describe("runAskOnSession connector contract", () => {
     waitTurnComplete.mockResolvedValueOnce(undefined);
     currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
     readLatestAssistantText.mockResolvedValueOnce("grounded");
-    fetchLatestTurnToolNames.mockResolvedValueOnce(["search_context", "fetch_excerpt"]);
+    fetchLatestTurnToolCalls.mockResolvedValueOnce([
+      { id: "call-1", name: "search_context" },
+      { id: "call-2", name: "search_context" },
+      { id: "call-3", name: "fetch_excerpt" },
+    ]);
     const activeSession = session();
     const runner = runAskOnSession(
       {
@@ -114,19 +118,49 @@ describe("runAskOnSession connector contract", () => {
     const result = runner.result;
     const events = await collect(runner.events);
     await expect(result).resolves.toMatchObject({ finalText: "grounded" });
-    expect(fetchLatestTurnToolNames).toHaveBeenCalledWith(
+    expect(fetchLatestTurnToolCalls).toHaveBeenCalledWith(
       activeSession.page,
       "11111111-1111-1111-1111-111111111111",
       "p035-low-risk-workstation",
     );
-    expect(events).toContainEqual(expect.objectContaining({
+    expect(events).toContainEqual({
       type: "tool", name: "search_context",
-      meta: { source: "latest-conversation-turn", connector: "p035-low-risk-workstation" },
-    }));
-    expect(events).toContainEqual(expect.objectContaining({
+      meta: { source: "latest-conversation-turn", connector: "p035-low-risk-workstation", callId: "call-1" },
+    });
+    expect(events).toContainEqual({
       type: "tool", name: "fetch_excerpt",
-      meta: { source: "latest-conversation-turn", connector: "p035-low-risk-workstation" },
-    }));
+      meta: { source: "latest-conversation-turn", connector: "p035-low-risk-workstation", callId: "call-3" },
+    });
+    expect(events.filter((event) => event.type === "tool" && event.name === "search_context")).toHaveLength(2);
+  });
+
+  it("polls connector call evidence while the turn is still active", async () => {
+    currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
+    fetchLatestTurnToolCalls.mockResolvedValueOnce([
+      { id: "active-call-1", name: "search_context" },
+    ]).mockResolvedValueOnce([
+      { id: "active-call-1", name: "search_context" },
+    ]);
+    waitTurnComplete.mockImplementationOnce(
+      async (_page, _timeout, _prior, _stable, control: { pollEvidence?: () => Promise<void> }) => {
+        await control.pollEvidence?.();
+      },
+    );
+    readLatestAssistantText.mockResolvedValueOnce("grounded");
+    const runner = runAskOnSession(
+      {
+        prompt: "test",
+        connector: "p035-low-risk-workstation",
+        timeoutSec: 1_200,
+        headless: false,
+      },
+      session(),
+    );
+
+    const events = await collect(runner.events);
+    await expect(runner.result).resolves.toMatchObject({ finalText: "grounded" });
+    expect(events.filter((event) => event.type === "tool" && event.name === "search_context")).toHaveLength(1);
+    expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(2);
   });
 
   it("fails before sending when the required connector cannot be selected", async () => {
