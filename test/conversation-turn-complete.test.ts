@@ -8,7 +8,7 @@ vi.mock("../src/browser/chatgpt.js", () => ({
   requireSelector: vi.fn(),
 }));
 
-const { waitTurnComplete } = await import("../src/browser/conversation.js");
+const { openConversation, waitTurnComplete } = await import("../src/browser/conversation.js");
 
 afterEach(() => {
   firstResolved.mockReset();
@@ -98,4 +98,18 @@ describe("waitTurnComplete error classification", () => {
       vi.useRealTimers();
     }
   });
+});
+
+it("opens a new conversation inside a Project when only its stable short URL is configured", async () => {
+  firstResolved.mockResolvedValue(null);
+  const page = {
+    goto: vi.fn(async () => {}),
+  } as unknown as Page;
+
+  await openConversation(page, { gizmoShortUrl: "p35-work-team" });
+
+  expect(page.goto).toHaveBeenCalledWith(
+    "https://chatgpt.com/g/p35-work-team/project",
+    expect.objectContaining({ waitUntil: "domcontentloaded" }),
+  );
 });

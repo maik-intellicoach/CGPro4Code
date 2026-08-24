@@ -32,6 +32,36 @@ async function collect(events: AsyncIterable<StreamEvent>): Promise<StreamEvent[
 }
 
 describe("askViaDaemon retry/error contract (C-092 F5)", () => {
+  it("carries ChatGPT Project identity through the daemon request", async () => {
+    let body: Record<string, unknown> = {};
+    const info = await listen((req, res) => {
+      let raw = "";
+      req.setEncoding("utf-8");
+      req.on("data", (chunk) => (raw += chunk));
+      req.on("end", () => {
+        body = JSON.parse(raw) as Record<string, unknown>;
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write('event: summary\ndata: {"conversationId":"c1","finalText":"ok"}\n\n');
+        res.end();
+      });
+    });
+
+    const runner = askViaDaemon(info, {
+      prompt: "hi",
+      gizmoId: "g-p-project",
+      gizmoShortUrl: "p35-work-team",
+      timeoutSec: 30,
+      headless: false,
+    }, FAST_RETRY);
+    await collect(runner.events);
+    await runner.result;
+
+    expect(body).toMatchObject({
+      gizmoId: "g-p-project",
+      gizmoShortUrl: "p35-work-team",
+    });
+  });
+
   it("retries on 429 with backoff then succeeds", async () => {
     let attempts = 0;
     const info = await listen((_req, res) => {

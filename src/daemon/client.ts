@@ -235,6 +235,8 @@ export function askViaDaemon(
     connector: opts.connector,
     images: opts.images,
     conversationId: opts.conversationId,
+    gizmoId: opts.gizmoId,
+    gizmoShortUrl: opts.gizmoShortUrl,
     timeoutSec: opts.timeoutSec,
   };
   const payload = JSON.stringify(askBody);

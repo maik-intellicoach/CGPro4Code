@@ -345,6 +345,45 @@ describe("handleAsk HTTP-level wiring", () => {
     expect(fakeRes.writes.join("")).toContain("event: delta");
   });
 
+  it("passes validated ChatGPT Project identity to the warm browser session", async () => {
+    const emitter = new StreamEmitter();
+    emitter.push({ type: "done", finalText: "hi" });
+    runAskOnSession.mockReturnValue({
+      events: emitter,
+      result: Promise.resolve({ conversationId: null, finalText: "hi", events: [] }),
+      cancel: async () => {},
+    });
+    const state = fakeState();
+    const req = new FakeReq() as unknown as IncomingMessage;
+    const res = new FakeRes() as unknown as ServerResponse;
+    Object.assign(req, { method: "POST" });
+
+    const pending = handleAsk(req, res as unknown as ServerResponse, state);
+    sendBody(req, { prompt: "x", gizmoId: "g-p-a", gizmoShortUrl: "p" });
+    await pending;
+
+    expect(runAskOnSession).toHaveBeenCalledWith(
+      expect.objectContaining({ gizmoId: "g-p-a", gizmoShortUrl: "p" }),
+      state.session,
+    );
+  });
+
+  it("rejects malformed ChatGPT Project identity before queue admission", async () => {
+    const state = fakeState();
+    const req = new FakeReq() as unknown as IncomingMessage;
+    const res = new FakeRes() as unknown as ServerResponse;
+    Object.assign(req, { method: "POST" });
+
+    const pending = handleAsk(req, res as unknown as ServerResponse, state);
+    sendBody(req, { prompt: "x", gizmoId: "wrong" });
+    await pending;
+
+    expect((res as unknown as FakeRes).statusCode).toBe(400);
+    expect(state.queue.depth).toBe(0);
+    expect(state.queue.busy).toBe(false);
+    expect(runAskOnSession).not.toHaveBeenCalled();
+  });
+
   it("drops queueDepth and writes nothing when a queued client closes before acquire() resolves, then admits the next waiter in order (C-092 P-026 r3 G3)", async () => {
     const state = fakeState({ queue: new AskQueue(8, 60_000) });
     await state.queue.acquire(); // occupy the running slot so both requests below queue

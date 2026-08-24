@@ -99,6 +99,10 @@ export interface AskRequest {
   connector?: string;
   images?: string[];
   conversationId?: string;
+  /** ChatGPT Project id (`g-p-...`) for new conversations. */
+  gizmoId?: string;
+  /** Stable project URL slug; may be used without an id. */
+  gizmoShortUrl?: string;
   /** Stable facade invocation ID used for exact cancellation. */
   invocationId?: string;
   /** Per-turn cap. Daemon clamps to 14,400 seconds. */

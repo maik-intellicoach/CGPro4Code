@@ -617,6 +617,18 @@ export async function handleAsk(
     res.end(JSON.stringify({ error: "invalid_request" }));
     return;
   }
+  if (
+    (body.gizmoId !== undefined && (
+      typeof body.gizmoId !== "string" || !/^g-p-[A-Za-z0-9_-]+$/.test(body.gizmoId)
+    )) ||
+    (body.gizmoShortUrl !== undefined && (
+      typeof body.gizmoShortUrl !== "string" || !/^[A-Za-z0-9_-]+$/.test(body.gizmoShortUrl)
+    ))
+  ) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "invalid_project_identity" }));
+    return;
+  }
 
   // Watch for the client disconnecting WHILE queued (before acquire()
   // resolves) — nothing else observes req/res during that window, so a
@@ -671,6 +683,8 @@ export async function handleAsk(
       connector: typeof body.connector === "string" ? body.connector : undefined,
       images: body.images ?? [],
       conversationId: body.conversationId,
+      gizmoId: body.gizmoId,
+      gizmoShortUrl: body.gizmoShortUrl,
       timeoutSec,
       invocationId: typeof body.invocationId === "string" ? body.invocationId : undefined,
       headless: false,
