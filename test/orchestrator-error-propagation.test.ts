@@ -11,6 +11,7 @@ const openConversation = vi.fn();
 const readLatestAssistantText = vi.fn();
 const sendPrompt = vi.fn();
 const setConnector = vi.fn();
+const setDeepResearch = vi.fn();
 const setWebSearch = vi.fn();
 const stopCurrentTurn = vi.fn();
 const waitTurnComplete = vi.fn();
@@ -28,6 +29,7 @@ vi.mock("../src/browser/conversation.js", () => ({
   readLatestAssistantText: (...args: unknown[]) => readLatestAssistantText(...args),
   sendPrompt: (...args: unknown[]) => sendPrompt(...args),
   setConnector: (...args: unknown[]) => setConnector(...args),
+  setDeepResearch: (...args: unknown[]) => setDeepResearch(...args),
   setWebSearch: (...args: unknown[]) => setWebSearch(...args),
   stopCurrentTurn: (...args: unknown[]) => stopCurrentTurn(...args),
   waitTurnComplete: (...args: unknown[]) => waitTurnComplete(...args),
@@ -61,6 +63,7 @@ beforeEach(() => {
   sendPrompt.mockResolvedValue(0);
   setWebSearch.mockResolvedValue(true);
   setConnector.mockResolvedValue(undefined);
+  setDeepResearch.mockResolvedValue(true);
   stopCurrentTurn.mockResolvedValue("");
   currentConversationId.mockReturnValue(null);
   latestAssistantModelSlug.mockResolvedValue(null);
@@ -73,6 +76,53 @@ beforeEach(() => {
     currentEndTurn: true,
     currentContentType: "text",
     currentIsThinkingPreamble: false,
+  });
+});
+
+describe("runAskOnSession native Deep Research contract", () => {
+  it("selects native Deep Research before submission and never enables Web Search", async () => {
+    waitTurnComplete.mockResolvedValueOnce(undefined);
+    readLatestAssistantText.mockResolvedValueOnce("researched");
+    const activeSession = session();
+    const runner = runAskOnSession(
+      {
+        prompt: "research this",
+        deepResearch: true,
+        web: true,
+        timeoutSec: 1_200,
+        headless: false,
+      },
+      activeSession,
+    );
+
+    const events = await collect(runner.events);
+    await expect(runner.result).resolves.toMatchObject({ finalText: "researched" });
+    expect(setDeepResearch).toHaveBeenCalledWith(activeSession.page, true);
+    expect(setWebSearch).not.toHaveBeenCalled();
+    expect(setConnector).not.toHaveBeenCalled();
+    expect(setDeepResearch.mock.invocationCallOrder[0]).toBeLessThan(sendPrompt.mock.invocationCallOrder[0]);
+    expect(events).toContainEqual({ type: "tool", name: "deep-research-selected" });
+  });
+
+  it("rejects connector plus native Deep Research before touching the browser", async () => {
+    const runner = runAskOnSession(
+      {
+        prompt: "invalid mixed turn",
+        connector: "IntelliCoach Context",
+        deepResearch: true,
+        timeoutSec: 1_200,
+        headless: false,
+      },
+      session(),
+    );
+
+    const events = await collect(runner.events);
+    await expect(runner.result).rejects.toThrow("native Deep Research and connectors are mutually exclusive");
+    expect(goHome).not.toHaveBeenCalled();
+    expect(sendPrompt).not.toHaveBeenCalled();
+    expect(events).toEqual([
+      { type: "error", message: "native Deep Research and connectors are mutually exclusive" },
+    ]);
   });
 });
 

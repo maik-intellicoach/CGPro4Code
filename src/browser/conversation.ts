@@ -192,6 +192,99 @@ export async function setWebSearch(page: Page, on: boolean): Promise<boolean> {
   return on;
 }
 
+/**
+ * Select ChatGPT's native Deep Research mode in the composer.
+ *
+ * Deep Research and Web Search/connectors are different execution modes.
+ * The orchestrator enforces that boundary before browser work; this function
+ * then fails closed unless the native radio is observably selected.
+ */
+export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
+  const verifyMaximum = async (): Promise<void> => {
+    const effort = await firstResolved(page, SELECTORS.deepResearchEffort);
+    if (!effort) {
+      throw new Error("ChatGPT native Deep Research maximum-capability control is unavailable");
+    }
+    const label = ((await effort.textContent().catch(() => "")) ?? "").trim();
+    const aria = ((await effort.getAttribute("aria-label").catch(() => "")) ?? "").trim();
+    // The current composer labels its maximum native route either "High"
+    // (reasoning depth) or "Pro" (the highest-capability Deep Research model),
+    // depending on the account/UI rollout.
+    if (!/\b(?:high|pro)\b/i.test(`${label} ${aria}`)) {
+      throw new Error("ChatGPT native Deep Research is not set to the maximum High/Pro route");
+    }
+  };
+
+  // The selected mode is rendered as a blue composer chip. This is the
+  // strongest current-state signal and avoids reopening the picker merely to
+  // inspect an ARIA attribute that the current UI no longer supplies.
+  const alreadySelected = await firstResolved(page, SELECTORS.deepResearchSelected);
+  if (on && alreadySelected) {
+    await verifyMaximum();
+    return true;
+  }
+
+  if (!(await openComposerToolsPopover(page))) {
+    throw new Error("ChatGPT native Deep Research picker is unavailable");
+  }
+
+  let toggle = await firstResolved(page, SELECTORS.deepResearchToggle);
+  if (!toggle) {
+    const visible = await recordConnectorDiagnostics(page);
+    await page.keyboard.press("Escape").catch(() => undefined);
+    const detail = visible.length > 0 ? `; visible entries=${JSON.stringify(visible)}` : "";
+    throw new Error(`ChatGPT native Deep Research is not exposed in the composer tool picker${detail}`);
+  }
+
+  const selected = async (candidate: Locator): Promise<boolean> => {
+    const checked = (await candidate.getAttribute("aria-checked").catch(() => null)) === "true";
+    const pressed = (await candidate.getAttribute("aria-pressed").catch(() => null)) === "true";
+    const state = (await candidate.getAttribute("data-state").catch(() => null)) === "checked";
+    return checked || pressed || state;
+  };
+
+  if ((await selected(toggle)) === on) {
+    await page.keyboard.press("Escape").catch(() => undefined);
+    return on;
+  }
+
+  try {
+    await toggle.click({ timeout: 5_000 });
+  } catch {
+    // Some current ChatGPT builds expose only a nested label while the React
+    // click handler lives on an unroled ancestor. Dispatch through the nearest
+    // interactive row (or let the label's click bubble) and rely on the
+    // composer-chip postcondition below; the fallback alone is never success.
+    const dispatched = await toggle.evaluate((element) => {
+      const target = element.closest(
+        'button, [role="menuitem"], [role="menuitemradio"], [role="option"], [data-radix-collection-item], div.__menu-item[tabindex="0"]',
+      ) as HTMLElement | null;
+      const clickable = target ?? element as HTMLElement;
+      if (typeof clickable.click !== "function") return false;
+      clickable.click();
+      return true;
+    }).catch(() => false);
+    if (!dispatched) {
+      await recordConnectorDiagnostics(page);
+      await page.keyboard.press("Escape").catch(() => undefined);
+      throw new Error("ChatGPT native Deep Research was visible but could not be selected");
+    }
+  }
+
+  // The picker normally closes after selection. Verify the fresh composer
+  // chip instead of trusting a successful click or a stale picker locator.
+  await page.waitForTimeout(300);
+  await page.keyboard.press("Escape").catch(() => undefined);
+  const verified = await firstResolved(page, SELECTORS.deepResearchSelected);
+  if ((verified !== null) !== on) {
+    throw new Error("ChatGPT native Deep Research selection did not become active");
+  }
+  if (on) {
+    await verifyMaximum();
+  }
+  return on;
+}
+
 async function openComposerToolsPopover(page: Page): Promise<boolean> {
   const plus = await firstResolved(page, [
     'button[data-testid="composer-plus-btn"]',
@@ -249,8 +342,8 @@ async function waitForComposerTool(page: Page, name: string, timeoutMs = 8_000):
   return null;
 }
 
-async function recordConnectorDiagnostics(page: Page): Promise<void> {
-  if (process.env.CGPRO_DEBUG !== "1") return;
+async function recordConnectorDiagnostics(page: Page): Promise<string[]> {
+  if (process.env.CGPRO_DEBUG !== "1") return [];
   const surfaces = page.locator('[role="menu"]:visible, [role="dialog"]:visible, [role="listbox"]:visible');
   const labels = await surfaces
     .locator('[role="menuitem"], [role="menuitemradio"], [role="option"], button')
@@ -262,9 +355,35 @@ async function recordConnectorDiagnostics(page: Page): Promise<void> {
     .slice(0, 30)
     .map((label) => label.slice(0, 120));
   console.error(`[cgpro:connector] visible picker entries=${JSON.stringify(boundedLabels)}`);
+  const deepResearchNodes = await page
+    .locator("button, [role], [data-testid], span, div")
+    .filter({ hasText: /^\s*Deep research\s*$/i })
+    .evaluateAll((elements) => elements.slice(0, 20).map((element) => {
+      const describe = (node: Element | null): Record<string, string | null> | null => node ? {
+        tag: node.tagName.toLocaleLowerCase(),
+        role: node.getAttribute("role"),
+        testid: node.getAttribute("data-testid"),
+        ariaLabel: node.getAttribute("aria-label"),
+        tabIndex: node.getAttribute("tabindex"),
+        className: typeof node.className === "string" ? node.className.slice(0, 160) : null,
+      } : null;
+      const ancestors: Array<Record<string, string | null> | null> = [];
+      let ancestor = element.parentElement;
+      for (let depth = 0; depth < 7 && ancestor; depth++) {
+        ancestors.push(describe(ancestor));
+        ancestor = ancestor.parentElement;
+      }
+      return {
+        self: describe(element),
+        ancestors,
+      };
+    }))
+    .catch(() => [] as Array<Record<string, unknown>>);
+  console.error(`[cgpro:connector] deep-research-nodes=${JSON.stringify(deepResearchNodes)}`);
   const screenshotPath = `${process.env.TMPDIR || "/tmp"}/cgpro-connector-${Date.now()}.png`;
   await page.screenshot({ path: screenshotPath, fullPage: false }).catch(() => undefined);
   console.error(`[cgpro:connector] screenshot=${screenshotPath}`);
+  return boundedLabels;
 }
 
 async function pluginSearchBox(page: Page): Promise<Locator | null> {
@@ -673,6 +792,7 @@ export async function waitTurnComplete(
       if (!conversationId) {
         if (expired) throw new TurnTimeoutError(Math.ceil(timeoutMs / 1_000));
       } else {
+        let working = false;
         setExpectedReloadNavigation(page.context(), true);
         try {
           await page.goto(`https://chatgpt.com/c/${conversationId}`, {
@@ -680,12 +800,27 @@ export async function waitTurnComplete(
             timeout: 60_000,
           });
           if (control.cancelled?.()) return;
-          await requireSelector(page, SELECTORS.composer, "composer", 20_000);
+          // Native Deep Research replaces the composer with a progress view
+          // while the report is active. Check the turn state first; requiring
+          // a composer before this check falsely turns a healthy continuation
+          // into "selector composer no longer resolves".
+          const settleDeadline = Date.now() + Math.min(10_000, Math.max(1_000, timeoutMs));
+          do {
+            working = await turnIsWorking(page);
+            if (working) break;
+            const count = await page.locator(SELECTORS.assistantMessages.join(", ")).count();
+            if (count > priorAssistantCount) break;
+            if (Date.now() >= settleDeadline) break;
+            await page.waitForTimeout(250);
+          } while (!control.cancelled?.());
+          if (control.cancelled?.()) return;
+          if (!working) {
+            await requireSelector(page, SELECTORS.composer, "composer", 20_000);
+          }
         } finally {
           setExpectedReloadNavigation(page.context(), false);
         }
 
-        const working = await turnIsWorking(page);
         if (working) {
           deadline = Date.now() + timeoutMs;
           lastChangedAt = Date.now();

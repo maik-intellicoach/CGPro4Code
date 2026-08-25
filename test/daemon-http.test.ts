@@ -27,7 +27,14 @@ vi.mock("../src/browser/conversation.js", async () => {
 process.env.CGPRO_DAEMON_BODY_TIMEOUT_MS = "200";
 process.env.CGPRO_DAEMON_BODY_MAX_BYTES = "64";
 
-const { AskQueue, PreAdmissionReaderBudget, handleAsk, handleRequest } = await import("../src/daemon/server.js");
+const {
+  AskQueue,
+  PreAdmissionReaderBudget,
+  closeDaemonSessionBeforeExit,
+  fetchDaemonAccountCapabilities,
+  handleAsk,
+  handleRequest,
+} = await import("../src/daemon/server.js");
 import type { ServerState } from "../src/daemon/server.js";
 import type { Session } from "../src/browser/session.js";
 import { StreamEmitter } from "../src/core/stream.js";
@@ -92,6 +99,61 @@ beforeEach(() => {
   browserConversation.openConversation.mockReset();
   browserConversation.readLatestAssistantText.mockReset();
   browserConversation.turnIsWorking.mockReset();
+});
+
+describe("daemon account capability startup probe", () => {
+  it("retries a transient browser fetch before registering the daemon", async () => {
+    const page = { waitForTimeout: vi.fn(async () => {}) } as unknown as import("patchright").Page;
+    const me = vi.fn()
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce({ email: "account@example.test", plan: "pro" });
+    const models = vi.fn().mockResolvedValue([{ slug: "gpt-5-6-pro" }]);
+
+    await expect(fetchDaemonAccountCapabilities(page, 3, { me, models })).resolves.toEqual({
+      me: { email: "account@example.test", plan: "pro" },
+      models: [{ slug: "gpt-5-6-pro" }],
+    });
+    expect(me).toHaveBeenCalledTimes(2);
+    expect(page.waitForTimeout).toHaveBeenCalledWith(1_000);
+  });
+
+  it("preserves the exact terminal fetch error after bounded retries", async () => {
+    const page = { waitForTimeout: vi.fn(async () => {}) } as unknown as import("patchright").Page;
+    const me = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    const models = vi.fn().mockResolvedValue([]);
+
+    await expect(fetchDaemonAccountCapabilities(page, 3, { me, models })).rejects.toThrow(
+      "Failed to fetch",
+    );
+    expect(me).toHaveBeenCalledTimes(3);
+    expect(page.waitForTimeout).toHaveBeenCalledTimes(2);
+  });
+});
+
+it("closes the persistent browser before terminating the daemon", async () => {
+  const order: string[] = [];
+  const session = {
+    close: vi.fn(async () => { order.push("close"); }),
+  } as unknown as Session;
+  const exit = vi.fn((_code: number): never => {
+    order.push("exit");
+    throw new Error("synthetic exit");
+  });
+
+  await expect(closeDaemonSessionBeforeExit(session, exit)).rejects.toThrow("synthetic exit");
+  expect(order).toEqual(["close", "exit"]);
+});
+
+it("does not acknowledge daemon termination when persistent browser close fails", async () => {
+  const session = {
+    close: vi.fn(async () => { throw new Error("browser close failed"); }),
+  } as unknown as Session;
+  const exit = vi.fn((_code: number): never => {
+    throw new Error("must not exit");
+  });
+
+  await expect(closeDaemonSessionBeforeExit(session, exit)).rejects.toThrow("browser close failed");
+  expect(exit).not.toHaveBeenCalled();
 });
 
 describe("exact daemon cancellation", () => {

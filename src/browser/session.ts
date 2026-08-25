@@ -2,7 +2,16 @@
 // (navigator.webdriver, isolated-world detection, etc.). Both runtime
 // and types come from patchright so Locator types stay compatible.
 import { chromium, type BrowserContext, type Page } from "patchright";
-import { existsSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
 import { ProfileLockedError } from "../errors.js";
 import { profileDir, ensureDirs } from "../store/paths.js";
 import { ensureInterceptorInstalled } from "../core/stream.js";
@@ -53,7 +62,14 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
   // We deliberately do NOT add --disable-blink-features=AutomationControlled
   // (patchright handles blink-feature leaks differently and that flag would
   // re-introduce a sec-ch-ua signal Cloudflare checks for).
-  const launchArgs: string[] = ["--password-store=basic", "--lang=en-US,en"];
+  const launchArgs: string[] = [
+    "--password-store=basic",
+    "--lang=en-US,en",
+    // Dedicated cgpro profiles have one automation-owned tab. There is no
+    // user browsing session to restore, so Chrome's crash bubble only blocks
+    // selectors after an abnormal adapter exit.
+    "--hide-crash-restore-bubble",
+  ];
   // Background mode: keep the headed Chromium fingerprint (Cloudflare
   // challenges headless), but park the window off-screen + minimised
   // so it never pops up in front of the user.
@@ -117,11 +133,45 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
     context,
     page,
     async close() {
-      await context.close().catch(() => {
-        /* swallow close-time races */
-      });
+      await context.close();
+      if (!normalizeProfileExitState(dir)) {
+        throw new Error("persistent Chrome profile closed but its clean-exit marker could not be recorded");
+      }
     },
   };
+}
+
+/**
+ * Chrome leaves `profile.exit_type=Crashed` behind for automation-owned
+ * persistent contexts even when Patchright's context.close() resolves. Update
+ * only that dedicated profile marker, only after Chrome has closed, using an
+ * atomic same-directory replacement so Preferences cannot be half-written.
+ */
+export function normalizeProfileExitState(dir: string): boolean {
+  const preferences = join(dir, "Default", "Preferences");
+  if (!existsSync(preferences)) return false;
+  const temporary = `${preferences}.cgpro-${process.pid}-${Date.now()}.tmp`;
+  try {
+    const mode = statSync(preferences).mode & 0o777;
+    const document = JSON.parse(readFileSync(preferences, "utf-8")) as Record<string, unknown>;
+    const profile = document.profile && typeof document.profile === "object"
+      ? document.profile as Record<string, unknown>
+      : {};
+    profile.exit_type = "Normal";
+    profile.exited_cleanly = true;
+    document.profile = profile;
+    writeFileSync(temporary, JSON.stringify(document), { encoding: "utf-8", mode });
+    chmodSync(temporary, mode);
+    renameSync(temporary, preferences);
+    return true;
+  } catch {
+    try {
+      if (existsSync(temporary)) unlinkSync(temporary);
+    } catch {
+      /* The original marker write failure remains authoritative. */
+    }
+    return false;
+  }
 }
 
 export function profileExists(profilePath?: string): boolean {

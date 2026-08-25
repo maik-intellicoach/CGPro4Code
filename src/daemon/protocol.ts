@@ -70,8 +70,12 @@ export function writeDaemonInfo(info: DaemonInfo): void {
   }
 }
 
-export function clearDaemonInfo(): void {
+export function clearDaemonInfo(expectedPid?: number): void {
   if (existsSync(DAEMON_FILE)) {
+    if (expectedPid !== undefined) {
+      const current = readDaemonInfo();
+      if (!current || current.pid !== expectedPid) return;
+    }
     try {
       unlinkSync(DAEMON_FILE);
     } catch {
@@ -96,6 +100,7 @@ export interface AskRequest {
   prompt: string;
   model?: string;
   web?: boolean;
+  deepResearch?: boolean;
   connector?: string;
   images?: string[];
   conversationId?: string;

@@ -3,15 +3,17 @@ import type { Page } from "patchright";
 import { TurnTimeoutError } from "../src/errors.js";
 
 const firstResolved = vi.fn();
+const requireSelector = vi.fn();
 vi.mock("../src/browser/chatgpt.js", () => ({
   firstResolved: (...args: unknown[]) => firstResolved(...args),
-  requireSelector: vi.fn(),
+  requireSelector: (...args: unknown[]) => requireSelector(...args),
 }));
 
 const { openConversation, waitTurnComplete } = await import("../src/browser/conversation.js");
 
 afterEach(() => {
   firstResolved.mockReset();
+  requireSelector.mockReset();
   vi.restoreAllMocks();
 });
 
@@ -119,6 +121,38 @@ describe("waitTurnComplete error classification", () => {
 
       expect(page.goto).toHaveBeenCalledWith("https://chatgpt.com/c/conv-1", expect.any(Object));
       expect(onReload).toHaveBeenCalledWith({ conversationId: "conv-1", working: true, extended: true });
+      expect(requireSelector).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits for the native Deep Research stop control to mount after reload", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      let extended = false;
+      const page = {
+        locator: vi.fn(() => ({ count: vi.fn(async () => 0) })),
+        goto: vi.fn(async () => {}),
+        context: vi.fn(() => ({})),
+        waitForTimeout: vi.fn(async (ms: number) => { await vi.advanceTimersByTimeAsync(ms); }),
+        url: vi.fn(() => "https://chatgpt.com/c/conv-1"),
+      } as unknown as Page;
+      firstResolved
+        .mockResolvedValueOnce(null) // React has not mounted Stop yet
+        .mockResolvedValueOnce({})   // Stop appears on the bounded settle poll
+        .mockResolvedValue(null);
+
+      const pending = waitTurnComplete(page, 10_000, 0, 100, {
+        conversationId: () => "conv-1",
+        onReload: ({ extended: didExtend }) => { extended = didExtend; },
+        cancelled: () => extended,
+      });
+
+      await expect(pending).resolves.toBeUndefined();
+      expect(requireSelector).not.toHaveBeenCalled();
+      expect(page.waitForTimeout).toHaveBeenCalledWith(250);
     } finally {
       vi.useRealTimers();
     }

@@ -38,6 +38,13 @@ export async function daemonStartCmd(opts: DaemonStartOptions): Promise<number> 
   const stale = readDaemonInfo();
   if (stale && !pidIsAlive(stale.pid)) {
     clearDaemonInfo();
+  } else if (stale) {
+    console.error(
+      chalk.red(
+        `Refusing to start a second daemon: registered pid ${stale.pid} is alive but did not pass health. Stop or repair that exact daemon first.`,
+      ),
+    );
+    return 1;
   }
 
   const args = ["daemon-server"];
@@ -98,7 +105,10 @@ export async function daemonStopCmd(): Promise<number> {
     } catch {
       /* ignore */
     }
-    await sleep(500);
+    const deadline = Date.now() + 15_000;
+    while (pidIsAlive(info.pid) && Date.now() < deadline) {
+      await sleep(150);
+    }
     if (pidIsAlive(info.pid)) {
       try {
         process.kill(info.pid, "SIGKILL");
@@ -107,7 +117,7 @@ export async function daemonStopCmd(): Promise<number> {
       }
     }
   }
-  clearDaemonInfo();
+  clearDaemonInfo(info.pid);
   console.log(chalk.green("✓ Daemon stopped (forced)."));
   return 0;
 }

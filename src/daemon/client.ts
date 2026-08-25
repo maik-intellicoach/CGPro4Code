@@ -158,7 +158,10 @@ export async function requestDaemonReload(
 }
 
 export async function shutdownDaemon(info: DaemonInfo): Promise<boolean> {
-  const r = await jsonRequest<{ ok: boolean }>(info, "POST", "/shutdown", {});
+  // Closing a persistent Chrome profile can take longer than the normal
+  // five-second control request. The server acknowledges only after Chrome
+  // has closed, preventing a replacement from racing the old profile.
+  const r = await jsonRequest<{ ok: boolean }>(info, "POST", "/shutdown", {}, 30_000);
   return r?.ok === true;
 }
 
@@ -232,6 +235,7 @@ export function askViaDaemon(
     prompt: opts.prompt,
     model: opts.model,
     web: opts.web,
+    deepResearch: opts.deepResearch,
     connector: opts.connector,
     images: opts.images,
     conversationId: opts.conversationId,

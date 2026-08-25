@@ -24,6 +24,8 @@ export interface AskCliOptions {
    * to true. Documented as policy in the README + skill.
    */
   web?: boolean;
+  /** Select ChatGPT's native Deep Research mode instead of Web Search. */
+  deepResearch?: boolean;
   noWeb?: boolean;
   headed?: boolean;
   headless?: boolean;
@@ -67,7 +69,7 @@ export async function askCommand(promptArg: string, opts: AskCliOptions): Promis
   if (opts.noWeb || opts.web === false) {
     console.error(chalk.dim("(--no-web ignored — web search is policy-on)"));
   }
-  const web = cfg.defaultWeb !== false;
+  const web = opts.deepResearch ? false : cfg.defaultWeb !== false;
   const headless = opts.headed ? false : opts.headless ?? cfg.defaultHeadless;
   // Conversation resolution priority:
   //   1. --new-session wipes any ambient session and starts fresh
@@ -110,6 +112,7 @@ export async function askCommand(promptArg: string, opts: AskCliOptions): Promis
     prompt: projectMemoryPreamble + prompt,
     model: opts.model ?? cfg.defaultModel,
     web,
+    deepResearch: opts.deepResearch === true,
     images: opts.image ?? [],
     conversationId,
     gizmoId,

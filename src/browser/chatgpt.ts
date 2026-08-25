@@ -178,7 +178,7 @@ export async function firstResolved(page: Page, candidates: string[]): Promise<L
     const loc = page.locator(sel).first();
     try {
       const count = await loc.count();
-      if (count > 0) {
+      if (count > 0 && await loc.isVisible()) {
         return loc;
       }
     } catch {

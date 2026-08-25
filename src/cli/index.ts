@@ -94,6 +94,7 @@ program
   .option("-m, --model <slug>", "model slug (default: GPT-5.5 Pro)")
   .option("--web", "live web search (always on; flag kept for compatibility)")
   .option("--no-web", "deprecated — web search is policy-on, this flag is ignored")
+  .option("--deep-research", "use ChatGPT native Deep Research (mutually exclusive with connectors)")
   .option("--headed", "show the browser window")
   .option("--headless", "force headless mode")
   .option("--profile <path>", "override the default profile directory")

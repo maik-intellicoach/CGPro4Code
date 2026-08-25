@@ -8,6 +8,7 @@ import {
   readLatestAssistantText,
   sendPrompt,
   setConnector,
+  setDeepResearch,
   setWebSearch,
   stopCurrentTurn,
   waitTurnComplete,
@@ -28,6 +29,8 @@ export interface AskOptions {
   prompt: string;
   model?: string;
   web?: boolean;
+  /** Select ChatGPT's native Deep Research mode for this turn. */
+  deepResearch?: boolean;
   /** Exact ChatGPT connector/app name to select before sending. */
   connector?: string;
   images?: string[];
@@ -109,6 +112,9 @@ function runAskInner(
     }
     setActiveEmitter(session.context, emitter, opts.connector);
     try {
+      if (opts.deepResearch && opts.connector !== undefined) {
+        throw new Error("native Deep Research and connectors are mutually exclusive");
+      }
       const page = session.page;
       const debug = process.env.CGPRO_DEBUG === "1";
       const log = (m: string): void => {
@@ -141,7 +147,11 @@ function runAskInner(
       });
       log(`openConversation done, url=${page.url()}`);
 
-      if (opts.web !== undefined) {
+      if (opts.deepResearch) {
+        log("setDeepResearch true…");
+        await setDeepResearch(page, true);
+        emitter.push({ type: "tool", name: "deep-research-selected" });
+      } else if (opts.web !== undefined) {
         log(`setWebSearch ${opts.web}…`);
         await setWebSearch(page, opts.web);
       }
@@ -281,9 +291,21 @@ function runAskInner(
               .first()
               .innerText()
               .catch(() => "");
+            const visibleControls = await page
+              .locator("main button:visible, form button:visible")
+              .evaluateAll((buttons) => buttons.slice(-20).map((button) => ({
+                text: (button.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 80),
+                ariaLabel: button.getAttribute("aria-label"),
+                testid: button.getAttribute("data-testid"),
+                className: typeof button.className === "string" ? button.className.slice(0, 160) : null,
+                svgTestid: button.querySelector("svg")?.getAttribute("data-testid") ?? null,
+                hasRect: Boolean(button.querySelector("svg rect")),
+              })))
+              .catch(() => []);
             log(
               `state: url=${url} composer=${composerCount} send=${sendCount} bubbles=${bubbleCount} composerText=${JSON.stringify(composerText.slice(0, 80))}`,
             );
+            log(`visible-controls=${JSON.stringify(visibleControls)}`);
           } catch (diagnosticErr) {
             log(`debug diagnostics unavailable: ${(diagnosticErr as Error).message}`);
           }

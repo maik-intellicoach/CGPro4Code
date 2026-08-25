@@ -63,4 +63,21 @@ describe("daemon protocol", () => {
     expect(readDaemonInfo()).toBeNull();
     clearDaemonInfo();
   });
+
+  it("does not let one daemon clear another daemon's registration", () => {
+    writeDaemonInfo({
+      version: 1,
+      pid: 4242,
+      port: 49100,
+      token: "a".repeat(64),
+      startedAt: "2026-08-26T00:00:00.000Z",
+      background: true,
+    });
+
+    clearDaemonInfo(9999);
+    expect(readDaemonInfo()?.pid).toBe(4242);
+
+    clearDaemonInfo(4242);
+    expect(readDaemonInfo()).toBeNull();
+  });
 });

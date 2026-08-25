@@ -21,6 +21,10 @@ describe("selectors", () => {
     expect(SELECTORS.sendButton[0]).toContain('data-testid="send-button"');
   });
 
+  it("recognizes the square native Deep Research stop control", () => {
+    expect(SELECTORS.stopButton.some((selector) => selector.includes("svg rect"))).toBe(true);
+  });
+
   it("modelSwitcher targets the composer-inline pill first (C-092 Work-area drift)", () => {
     expect(SELECTORS.modelSwitcher[0]).toBe('button.__composer-pill[aria-haspopup="menu"]');
   });
@@ -30,5 +34,13 @@ describe("selectors", () => {
     for (const sel of SELECTORS.chatTabRadio) {
       expect(sel).toContain("Chat");
     }
+  });
+
+  it("exposes a native Deep Research composer selector", () => {
+    expect(SELECTORS.deepResearchToggle.some((selector) => selector.includes("Deep research"))).toBe(true);
+    expect(SELECTORS.deepResearchToggle[0]).toContain('__menu-item[tabindex="0"]');
+    expect(SELECTORS.deepResearchSelected.some((selector) => selector.includes("Deep research"))).toBe(true);
+    expect(SELECTORS.deepResearchEffort.some((selector) => selector.includes("High"))).toBe(true);
+    expect(SELECTORS.deepResearchEffort.some((selector) => selector.includes("Pro"))).toBe(true);
   });
 });

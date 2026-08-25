@@ -20,6 +20,12 @@ export interface SelectorSet {
   chatTabRadio: string[];
   /** Web search composer toggle. */
   webSearchToggle: string[];
+  /** Native ChatGPT Deep Research composer mode. */
+  deepResearchToggle: string[];
+  /** Selected native Deep Research chip in the composer. */
+  deepResearchSelected: string[];
+  /** Deep Research reasoning-depth control after native mode selection. */
+  deepResearchEffort: string[];
   /** Account / profile button — proxy for "logged in" state. */
   accountMenu: string[];
   /** All assistant message bubbles in the current conversation. */
@@ -57,6 +63,9 @@ export const SELECTORS: SelectorSet = {
   ],
   stopButton: [
     'button[data-testid="stop-button"]',
+    'button[data-testid="composer-submit-button"]:has(svg rect)',
+    'form button:has(svg rect)',
+    'main button:has(svg rect)',
     'button[aria-label*="Stop"]',
     'button[aria-label*="Arrêter"]',
     'button:has-text("Stop generating")',
@@ -84,6 +93,34 @@ export const SELECTORS: SelectorSet = {
     'button[aria-label*="Search the web"]',
     'button[aria-label*="Rechercher sur le web"]',
     'button[aria-label*="web search" i]',
+  ],
+  deepResearchToggle: [
+    'div.__menu-item[tabindex="0"]:has(span:text-is("Deep research"))',
+    'div.__menu-item[tabindex="0"]:has(span:text-is("Recherche approfondie"))',
+    '[data-radix-popper-content-wrapper] [role="menuitemradio"]:has-text("Deep research")',
+    '[data-radix-popper-content-wrapper] [role="menuitemradio"]:has-text("Recherche approfondie")',
+    '[data-radix-popper-content-wrapper] button[data-testid="composer-tool-deep-research"]',
+    '[data-radix-popper-content-wrapper] button[aria-label*="Deep research" i]',
+    '[data-radix-popper-content-wrapper] span:text-is("Deep research")',
+  ],
+  deepResearchSelected: [
+    'form [data-testid*="deep-research" i]',
+    'form button:text-is("Deep research")',
+    'form span:text-is("Deep research")',
+    'main [data-testid*="deep-research" i]',
+    'main button:text-is("Deep research")',
+    'main span:text-is("Deep research")',
+  ],
+  deepResearchEffort: [
+    'form button:has-text("High")',
+    'main button[aria-haspopup="menu"]:has-text("High")',
+    'button[aria-label*="High" i][aria-haspopup]',
+    'form button:text-is("Pro")',
+    'main button[aria-haspopup="menu"]:text-is("Pro")',
+    'main button:text-is("Pro")',
+    'main span:text-is("Pro")',
+    'main button:text-is("High")',
+    'main span:text-is("High")',
   ],
   accountMenu: [
     'button[data-testid="profile-button"]',

@@ -28,6 +28,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomBytes } from "node:crypto";
 import { appendFileSync, openSync, writeSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import type { Page } from "patchright";
 import { openSession, type Session } from "../browser/session.js";
 import { fetchAuthSessionInPage, goHome, isLoggedIn } from "../browser/chatgpt.js";
 import {
@@ -36,8 +37,8 @@ import {
   readLatestAssistantText,
   turnIsWorking,
 } from "../browser/conversation.js";
-import { detectPlan, fetchMe } from "../api/me.js";
-import { fetchModels, findProSlug } from "../api/models.js";
+import { detectPlan, fetchMe, type MeResponse } from "../api/me.js";
+import { fetchModels, findProSlug, type ChatgptModel } from "../api/models.js";
 import { runAskOnSession, type AskOptions, type AskRunner } from "../core/orchestrator.js";
 import { NotLoggedInError } from "../errors.js";
 import {
@@ -308,6 +309,43 @@ export interface DaemonServerOptions {
   port?: number;
 }
 
+export async function fetchDaemonAccountCapabilities(
+  page: Page,
+  attempts = 3,
+  fetchers: {
+    me: (page: Page) => Promise<MeResponse | null>;
+    models: (page: Page) => Promise<ChatgptModel[]>;
+  } = { me: fetchMe, models: fetchModels },
+): Promise<{ me: MeResponse | null; models: ChatgptModel[] }> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const [me, models] = await Promise.all([
+        fetchers.me(page),
+        fetchers.models(page),
+      ]);
+      return { me, models };
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) await page.waitForTimeout(1_000);
+    }
+  }
+  throw lastError;
+}
+
+export async function closeDaemonSessionBeforeExit(
+  session: Session,
+  exit: (code: number) => never = process.exit,
+): Promise<never> {
+  await closeDaemonSession(session);
+  return exit(0);
+}
+
+export async function closeDaemonSession(session: Session): Promise<void> {
+  await session.close();
+  clearDaemonInfo(process.pid);
+}
+
 export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<void> {
   log.info(`daemon-server starting (pid=${process.pid})`);
 
@@ -317,28 +355,33 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
     background: opts.background ?? true,
   });
 
-  log.info("session open, going home…");
-  await goHome(session.page);
-  if (!(await isLoggedIn(session.page, 8_000))) {
-    log.error("not logged in — refusing to start daemon");
+  let account: { email?: string; plan: string; proModelAvailable: boolean };
+  try {
+    log.info("session open, going home…");
+    await goHome(session.page);
+    if (!(await isLoggedIn(session.page, 8_000))) {
+      log.error("not logged in — refusing to start daemon");
+      throw new NotLoggedInError();
+    }
+    const auth = await fetchAuthSessionInPage(session.page);
+    const { me, models } = await fetchDaemonAccountCapabilities(session.page);
+    const proModelAvailable = findProSlug(models) !== null;
+    const detectedPlan = detectPlan(me);
+    account = {
+      email: me?.email ?? auth?.user?.email,
+      // ChatGPT currently omits a plan label for this account while returning
+      // the authenticated Pro model catalogue. The entitlement is the stronger
+      // capability fact; never promote a known non-Pro label.
+      plan: detectedPlan === "unknown" && proModelAvailable ? "pro" : detectedPlan,
+      proModelAvailable,
+    };
+  } catch (error) {
+    // A failed pre-listener probe used to terminate Node while Chrome still
+    // owned the persistent profile. Chrome then marked the profile as crashed
+    // and showed "Restore pages?" on the next start.
     await session.close().catch(() => {});
-    throw new NotLoggedInError();
+    throw error;
   }
-  const auth = await fetchAuthSessionInPage(session.page);
-  const [me, models] = await Promise.all([
-    fetchMe(session.page, auth?.accessToken),
-    fetchModels(session.page, auth?.accessToken),
-  ]);
-  const proModelAvailable = findProSlug(models) !== null;
-  const detectedPlan = detectPlan(me);
-  const account = {
-    email: me?.email ?? auth?.user?.email,
-    // ChatGPT currently omits a plan label for this account while returning
-    // the authenticated Pro model catalogue. The entitlement is the stronger
-    // capability fact; never promote a known non-Pro label.
-    plan: detectedPlan === "unknown" && proModelAvailable ? "pro" : detectedPlan,
-    proModelAvailable,
-  };
   log.info("auth verified, starting http listener");
 
   const state: ServerState = {
@@ -390,9 +433,7 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
   const shutdown = async (signal: string): Promise<never> => {
     log.info(`received ${signal} — shutting down`);
     server.close();
-    await session.close().catch(() => {});
-    clearDaemonInfo();
-    process.exit(0);
+    return closeDaemonSessionBeforeExit(session);
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
@@ -438,12 +479,15 @@ export async function handleRequest(
   }
 
   if (method === "POST" && url.pathname === "/shutdown") {
+    log.info("shutdown requested via /shutdown");
+    // Do not acknowledge until the persistent browser has closed. The old
+    // fire-and-exit path let the caller start a replacement against the same
+    // profile while Chrome was still winding down, leaving crash markers and
+    // the recurring "Restore pages?" bubble.
+    await closeDaemonSession(state.session);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
     setTimeout(() => {
-      log.info("shutdown requested via /shutdown");
-      void state.session.close().catch(() => {});
-      clearDaemonInfo();
       process.exit(0);
     }, 50);
     return;
@@ -680,6 +724,7 @@ export async function handleAsk(
       prompt: body.prompt,
       model: body.model,
       web: body.web,
+      deepResearch: body.deepResearch === true,
       connector: typeof body.connector === "string" ? body.connector : undefined,
       images: body.images ?? [],
       conversationId: body.conversationId,
