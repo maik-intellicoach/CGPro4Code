@@ -236,7 +236,9 @@ function runAskInner(
         );
         return state.currentRole === "assistant" &&
           state.currentStatus === "finished_successfully" &&
-          state.currentEndTurn === true;
+          state.currentEndTurn === true &&
+          state.currentContentType === "text" &&
+          !state.currentIsThinkingPreamble;
       };
 
       // Wait for the turn to settle. The SSE interceptor will normally push

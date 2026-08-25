@@ -120,6 +120,8 @@ describe("extractLatestTurnConnectorState", () => {
             author: { role: "assistant" },
             status: "finished_successfully",
             end_turn: true,
+            content: { content_type: "text", parts: ["final"] },
+            metadata: { is_thinking_preamble_message: false },
           },
         },
       },
@@ -129,6 +131,8 @@ describe("extractLatestTurnConnectorState", () => {
       currentRole: "tool",
       currentStatus: "finished_successfully",
       currentEndTurn: false,
+      currentContentType: null,
+      currentIsThinkingPreamble: false,
       calls: [{ name: "search_context" }],
     });
     body.current_node = "assistant";
@@ -136,7 +140,33 @@ describe("extractLatestTurnConnectorState", () => {
       currentRole: "assistant",
       currentStatus: "finished_successfully",
       currentEndTurn: true,
+      currentContentType: "text",
+      currentIsThinkingPreamble: false,
       calls: [{ name: "search_context" }],
+    });
+  });
+
+  it("distinguishes a terminal answer from ChatGPT's end-turn thinking preamble", () => {
+    const body = {
+      current_node: "preamble",
+      mapping: {
+        preamble: {
+          parent: "user",
+          message: {
+            author: { role: "assistant" },
+            status: "finished_successfully",
+            end_turn: true,
+            content: { content_type: "text", parts: ["opening"] },
+            metadata: { is_thinking_preamble_message: true },
+          },
+        },
+      },
+    };
+
+    expect(extractLatestTurnConnectorState(body)).toMatchObject({
+      currentEndTurn: true,
+      currentContentType: "text",
+      currentIsThinkingPreamble: true,
     });
   });
 });

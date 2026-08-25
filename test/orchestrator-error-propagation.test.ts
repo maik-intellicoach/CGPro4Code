@@ -71,6 +71,8 @@ beforeEach(() => {
     currentRole: "assistant",
     currentStatus: "finished_successfully",
     currentEndTurn: true,
+    currentContentType: "text",
+    currentIsThinkingPreamble: false,
   });
 });
 

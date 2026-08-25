@@ -44,6 +44,8 @@ export interface LatestTurnConnectorState {
   currentRole: string | null;
   currentStatus: string | null;
   currentEndTurn: boolean | null;
+  currentContentType: string | null;
+  currentIsThinkingPreamble: boolean;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -104,11 +106,15 @@ export function extractLatestTurnConnectorState(
   const currentNode = currentNodeId && mapping ? asObject(mapping[currentNodeId]) : null;
   const currentMessage = asObject(currentNode?.message);
   const currentAuthor = asObject(currentMessage?.author);
+  const currentContent = asObject(currentMessage?.content);
+  const currentMetadata = asObject(currentMessage?.metadata);
   return {
     calls: extractLatestTurnToolCalls(body, expectedAppName),
     currentRole: typeof currentAuthor?.role === "string" ? currentAuthor.role : null,
     currentStatus: typeof currentMessage?.status === "string" ? currentMessage.status : null,
     currentEndTurn: typeof currentMessage?.end_turn === "boolean" ? currentMessage.end_turn : null,
+    currentContentType: typeof currentContent?.content_type === "string" ? currentContent.content_type : null,
+    currentIsThinkingPreamble: currentMetadata?.is_thinking_preamble_message === true,
   };
 }
 
