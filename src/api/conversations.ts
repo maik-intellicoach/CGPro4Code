@@ -39,6 +39,11 @@ export interface ConnectorToolCall {
   name: string;
 }
 
+export interface LatestTurnConnectorState {
+  calls: ConnectorToolCall[];
+  currentRole: string | null;
+}
+
 type JsonObject = Record<string, unknown>;
 
 function asObject(value: unknown): JsonObject | null {
@@ -87,6 +92,22 @@ export function extractLatestTurnToolCalls(body: unknown, expectedAppName?: stri
   return reverseChronological.reverse();
 }
 
+export function extractLatestTurnConnectorState(
+  body: unknown,
+  expectedAppName?: string,
+): LatestTurnConnectorState {
+  const root = asObject(body);
+  const mapping = asObject(root?.mapping);
+  const currentNodeId = typeof root?.current_node === "string" ? root.current_node : null;
+  const currentNode = currentNodeId && mapping ? asObject(mapping[currentNodeId]) : null;
+  const currentMessage = asObject(currentNode?.message);
+  const currentAuthor = asObject(currentMessage?.author);
+  return {
+    calls: extractLatestTurnToolCalls(body, expectedAppName),
+    currentRole: typeof currentAuthor?.role === "string" ? currentAuthor.role : null,
+  };
+}
+
 export function extractLatestTurnToolNames(body: unknown, expectedAppName?: string): string[] {
   return extractLatestTurnToolCalls(body, expectedAppName).map((call) => call.name);
 }
@@ -102,6 +123,19 @@ export async function fetchLatestTurnToolCalls(
     throw new Error(`conversation tool evidence fetch failed with HTTP ${result.status}`);
   }
   return extractLatestTurnToolCalls(result.body, expectedAppName);
+}
+
+export async function fetchLatestTurnConnectorState(
+  page: Page,
+  conversationId: string,
+  expectedAppName?: string,
+  timeoutMs = 10_000,
+): Promise<LatestTurnConnectorState> {
+  const result = await backendApiFetch(page, `/backend-api/conversation/${conversationId}`, { timeoutMs });
+  if (!result.ok) {
+    throw new Error(`conversation connector state fetch failed with HTTP ${result.status}`);
+  }
+  return extractLatestTurnConnectorState(result.body, expectedAppName);
 }
 
 export async function fetchLatestTurnToolNames(

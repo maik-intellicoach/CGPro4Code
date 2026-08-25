@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { extractLatestTurnToolCalls, extractLatestTurnToolNames } from "../src/api/conversations.js";
+import {
+  extractLatestTurnConnectorState,
+  extractLatestTurnToolCalls,
+  extractLatestTurnToolNames,
+} from "../src/api/conversations.js";
 import { exactConnectorLabelIndex } from "../src/browser/conversation.js";
 
 describe("extractLatestTurnToolNames", () => {
@@ -85,6 +89,40 @@ describe("extractLatestTurnToolNames", () => {
       { id: "message-search-1", name: "search_context" },
       { id: "message-search-2", name: "search_context" },
     ]);
+  });
+});
+
+describe("extractLatestTurnConnectorState", () => {
+  it("requires the current branch to return to an assistant after connector work", () => {
+    const body = {
+      current_node: "tool",
+      mapping: {
+        user: { parent: null, message: { author: { role: "user" } } },
+        tool: {
+          parent: "user",
+          message: {
+            author: { role: "tool" },
+            metadata: {
+              invoked_resource: {
+                resource_uri: "/app/link/search_context",
+                app_name: "p035-low-risk-workstation",
+              },
+            },
+          },
+        },
+        assistant: { parent: "tool", message: { author: { role: "assistant" } } },
+      },
+    };
+
+    expect(extractLatestTurnConnectorState(body, "p035-low-risk-workstation")).toMatchObject({
+      currentRole: "tool",
+      calls: [{ name: "search_context" }],
+    });
+    body.current_node = "assistant";
+    expect(extractLatestTurnConnectorState(body, "p035-low-risk-workstation")).toMatchObject({
+      currentRole: "assistant",
+      calls: [{ name: "search_context" }],
+    });
   });
 });
 

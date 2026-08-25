@@ -19,10 +19,11 @@ import {
 } from "./stream.js";
 import { NotLoggedInError } from "../errors.js";
 import { SELECTORS as SELECTORS_DUMP } from "../browser/selectors.js";
-import { fetchLatestTurnToolCalls } from "../api/conversations.js";
+import { fetchLatestTurnConnectorState, fetchLatestTurnToolCalls } from "../api/conversations.js";
 
 const CONNECTOR_EVIDENCE_POLL_MS = 30_000;
 const CONNECTOR_EVIDENCE_RATE_LIMIT_BACKOFF_MS = 120_000;
+const CONNECTOR_FIRST_TOOL_GRACE_MS = 120_000;
 
 export interface AskOptions {
   prompt: string;
@@ -98,6 +99,7 @@ function runAskInner(
   let lastConnectorEvidencePollAt = 0;
   let connectorEvidenceBackoffUntil = 0;
   let connectorEvidencePollInFlight: Promise<void> | null = null;
+  let connectorStableWithoutToolSince: number | null = null;
 
   const result: Promise<AskResult> = (async () => {
     if (!session) {
@@ -222,6 +224,26 @@ function runAskInner(
           .finally(() => { connectorEvidencePollInFlight = null; });
       };
 
+      const confirmConnectorCompletion = async (): Promise<boolean> => {
+        if (opts.connector === undefined || cancelled) return true;
+        const started = collected.find((event) => event.type === "started");
+        const conversationId = currentConversationId(page) ??
+          (started?.type === "started" ? started.conversationId ?? null : null);
+        if (!conversationId) return false;
+        const state = await fetchLatestTurnConnectorState(
+          page,
+          conversationId,
+          opts.connector,
+          10_000,
+        );
+        if (state.calls.length > 0) {
+          connectorStableWithoutToolSince = null;
+          return state.currentRole === "assistant";
+        }
+        connectorStableWithoutToolSince ??= Date.now();
+        return Date.now() - connectorStableWithoutToolSince >= CONNECTOR_FIRST_TOOL_GRACE_MS;
+      };
+
       // Wait for the turn to settle. The SSE interceptor will normally push
       // a `done` event; if the network missed (cached response, schema we
       // didn't recognize), we fall back to DOM detection.
@@ -243,6 +265,7 @@ function runAskInner(
           },
           cancelled: () => cancelled,
           pollEvidence: () => pollConnectorEvidence(false),
+          confirmComplete: confirmConnectorCompletion,
         });
       } catch (err) {
         if (debug) {

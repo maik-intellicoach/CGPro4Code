@@ -65,6 +65,31 @@ describe("waitTurnComplete error classification", () => {
     expect(page.waitForTimeout).toHaveBeenCalledTimes(1);
   });
 
+  it("does not accept stable text until connector completion is confirmed", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const bubble = {
+        getAttribute: vi.fn(async () => null),
+        innerText: vi.fn(async () => "opening sentence"),
+      };
+      const page = {
+        locator: vi.fn(() => ({ count: vi.fn(async () => 1), nth: vi.fn(() => bubble) })),
+        waitForTimeout: vi.fn(async (ms: number) => { await vi.advanceTimersByTimeAsync(ms); }),
+      } as unknown as Page;
+      firstResolved.mockResolvedValue(null);
+      const confirmComplete = vi.fn()
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(true);
+
+      await waitTurnComplete(page, 10_000, 0, 100, { confirmComplete });
+
+      expect(confirmComplete).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reloads the exact conversation and extends while ChatGPT is still working", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);

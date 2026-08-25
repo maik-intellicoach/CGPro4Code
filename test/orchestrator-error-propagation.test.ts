@@ -15,6 +15,7 @@ const setWebSearch = vi.fn();
 const stopCurrentTurn = vi.fn();
 const waitTurnComplete = vi.fn();
 const fetchLatestTurnToolCalls = vi.fn();
+const fetchLatestTurnConnectorState = vi.fn();
 
 vi.mock("../src/browser/chatgpt.js", () => ({
   goHome: (...args: unknown[]) => goHome(...args),
@@ -33,6 +34,7 @@ vi.mock("../src/browser/conversation.js", () => ({
 }));
 vi.mock("../src/api/conversations.js", () => ({
   fetchLatestTurnToolCalls: (...args: unknown[]) => fetchLatestTurnToolCalls(...args),
+  fetchLatestTurnConnectorState: (...args: unknown[]) => fetchLatestTurnConnectorState(...args),
 }));
 
 const { runAskOnSession } = await import("../src/core/orchestrator.js");
@@ -64,6 +66,7 @@ beforeEach(() => {
   latestAssistantModelSlug.mockResolvedValue(null);
   readLatestAssistantText.mockResolvedValue("");
   fetchLatestTurnToolCalls.mockResolvedValue([]);
+  fetchLatestTurnConnectorState.mockResolvedValue({ calls: [], currentRole: "assistant" });
 });
 
 describe("runAskOnSession connector contract", () => {

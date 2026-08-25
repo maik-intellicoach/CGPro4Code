@@ -652,6 +652,7 @@ export async function waitTurnComplete(
     onReload?: (state: { conversationId: string; working: boolean; extended: boolean }) => void;
     cancelled?: () => boolean;
     pollEvidence?: () => Promise<void>;
+    confirmComplete?: () => Promise<boolean>;
   } = {},
 ): Promise<void> {
   let deadline = Date.now() + timeoutMs;
@@ -738,6 +739,10 @@ export async function waitTurnComplete(
     }
 
     if (text.length > 0 && Date.now() - lastChangedAt >= stableMs) {
+      if (control.confirmComplete && !(await control.confirmComplete())) {
+        lastChangedAt = Date.now();
+        continue;
+      }
       return;
     }
 
