@@ -215,26 +215,28 @@ export function exactConnectorLabelIndex(labels: string[], name: string): number
 }
 
 async function visibleComposerTool(page: Page, name: string): Promise<Locator | null> {
-  const candidates = page
-    .locator('[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"], button');
-  const count = await candidates.count().catch(() => 0);
-  for (let i = 0; i < count; i++) {
-    const candidate = candidates.nth(i);
-    if (!(await candidate.isVisible().catch(() => false))) continue;
-    const label = await candidate.innerText().catch(() => "");
-    if (exactConnectorLabelIndex([label], name) === 0) return candidate;
-  }
+  // Let the browser narrow the DOM before crossing the automation boundary.
+  // Scanning every button and span with serial isVisible/innerText calls made
+  // one nominally bounded picker poll take minutes on large Project pages.
+  const matchingCandidate = async (selector: string): Promise<Locator | null> => {
+    const candidates = page.locator(selector).filter({ hasText: name });
+    const count = await candidates.count().catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      const candidate = candidates.nth(i);
+      if (!(await candidate.isVisible().catch(() => false))) continue;
+      const label = await candidate.innerText().catch(() => "");
+      if (exactConnectorLabelIndex([label], name) === 0) return candidate;
+    }
+    return null;
+  };
+
+  const interactive = await matchingCandidate(
+    '[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"], button',
+  );
+  if (interactive) return interactive;
   // The current @ plugin chooser renders the selectable app label as plain
   // spans inside a keyboard-command row with no ARIA option/menuitem role.
-  const labels = page.locator("span");
-  const labelCount = await labels.count().catch(() => 0);
-  for (let i = 0; i < labelCount; i++) {
-    const label = labels.nth(i);
-    if (!(await label.isVisible().catch(() => false))) continue;
-    const text = await label.innerText().catch(() => "");
-    if (exactConnectorLabelIndex([text], name) === 0) return label;
-  }
-  return null;
+  return matchingCandidate("span");
 }
 
 async function waitForComposerTool(page: Page, name: string, timeoutMs = 8_000): Promise<Locator | null> {

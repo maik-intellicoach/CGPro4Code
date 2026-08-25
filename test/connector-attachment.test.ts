@@ -62,6 +62,7 @@ function makePage() {
   let rows: FakeRow[] = [];
   let devMode = false;
   let devSelect: (() => void) | null = null;
+  const innerTextReads: string[] = [];
 
   const page = {
     keyboard: {
@@ -76,7 +77,10 @@ function makePage() {
   const rowLoc = (row: FakeRow | undefined) => ({
     count: async () => (row ? 1 : 0),
     isVisible: async () => row?.visible ?? false,
-    innerText: async () => row?.label ?? "",
+    innerText: async () => {
+      if (row) innerTextReads.push(row.label);
+      return row?.label ?? "";
+    },
     getAttribute: async (attr: string) => row?.attrs?.[attr] ?? null,
     evaluate: async () => row?.inComposer ?? false,
     // `attachedState` walks the bounded ancestor chain via `locator("..")` —
@@ -98,10 +102,16 @@ function makePage() {
     },
   });
 
-  const makeCandidates = () => ({
-    count: async () => rows.length,
-    nth: (i: number) => rowLoc(rows[i]),
-    filter: () => ({ first: () => devLoc() }),
+  const makeCandidates = (sourceRows = rows) => ({
+    count: async () => sourceRows.length,
+    nth: (i: number) => rowLoc(sourceRows[i]),
+    filter: (options?: { hasText?: string | RegExp }) => {
+      if (typeof options?.hasText === "string") {
+        const expected = options.hasText.toLocaleLowerCase();
+        return makeCandidates(sourceRows.filter((row) => row.label.toLocaleLowerCase().includes(expected)));
+      }
+      return { first: () => devLoc() };
+    },
     getAttribute: async () => null,
     isVisible: async () => false,
     innerText: async () => "",
@@ -118,10 +128,23 @@ function makePage() {
       devMode = on;
       devSelect = onSelect;
     },
+    innerTextReads,
   };
 }
 
 describe("connector selection honest attachment (P-035)", () => {
+  it("prefilters unrelated DOM rows before reading their text", async () => {
+    const scenario = makePage();
+    scenario.setRows([
+      ...Array.from({ length: 1_000 }, (_, i) => ({ label: `Unrelated row ${i}`, visible: true })),
+      { label: "p035-low-risk-workstation", visible: true, attrs: { "aria-checked": "true" } },
+    ]);
+
+    await expect(setConnector(scenario.page, "p035-low-risk-workstation")).resolves.toBeUndefined();
+
+    expect(scenario.innerTextReads).toEqual(["p035-low-risk-workstation"]);
+  });
+
   it("rejects when an exact-label click lands but no connector becomes attached", async () => {
     const scenario = makePage();
     // The @ picker row is visible and accepts the click, but after the click
