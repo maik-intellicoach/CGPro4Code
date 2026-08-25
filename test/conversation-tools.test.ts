@@ -50,6 +50,8 @@ describe("extractLatestTurnToolNames", () => {
           parent: "user",
           message: {
             author: { role: "tool" },
+            status: "finished_successfully",
+            end_turn: false,
             metadata: { invoked_resource: { resource_uri: "/app/link/search_context", app_name } },
           },
         },
@@ -102,6 +104,8 @@ describe("extractLatestTurnConnectorState", () => {
           parent: "user",
           message: {
             author: { role: "tool" },
+            status: "finished_successfully",
+            end_turn: false,
             metadata: {
               invoked_resource: {
                 resource_uri: "/app/link/search_context",
@@ -110,17 +114,28 @@ describe("extractLatestTurnConnectorState", () => {
             },
           },
         },
-        assistant: { parent: "tool", message: { author: { role: "assistant" } } },
+        assistant: {
+          parent: "tool",
+          message: {
+            author: { role: "assistant" },
+            status: "finished_successfully",
+            end_turn: true,
+          },
+        },
       },
     };
 
     expect(extractLatestTurnConnectorState(body, "p035-low-risk-workstation")).toMatchObject({
       currentRole: "tool",
+      currentStatus: "finished_successfully",
+      currentEndTurn: false,
       calls: [{ name: "search_context" }],
     });
     body.current_node = "assistant";
     expect(extractLatestTurnConnectorState(body, "p035-low-risk-workstation")).toMatchObject({
       currentRole: "assistant",
+      currentStatus: "finished_successfully",
+      currentEndTurn: true,
       calls: [{ name: "search_context" }],
     });
   });

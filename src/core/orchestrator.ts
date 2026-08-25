@@ -23,7 +23,6 @@ import { fetchLatestTurnConnectorState, fetchLatestTurnToolCalls } from "../api/
 
 const CONNECTOR_EVIDENCE_POLL_MS = 30_000;
 const CONNECTOR_EVIDENCE_RATE_LIMIT_BACKOFF_MS = 120_000;
-const CONNECTOR_FIRST_TOOL_GRACE_MS = 120_000;
 
 export interface AskOptions {
   prompt: string;
@@ -99,7 +98,6 @@ function runAskInner(
   let lastConnectorEvidencePollAt = 0;
   let connectorEvidenceBackoffUntil = 0;
   let connectorEvidencePollInFlight: Promise<void> | null = null;
-  let connectorStableWithoutToolSince: number | null = null;
 
   const result: Promise<AskResult> = (async () => {
     if (!session) {
@@ -236,12 +234,9 @@ function runAskInner(
           opts.connector,
           10_000,
         );
-        if (state.calls.length > 0) {
-          connectorStableWithoutToolSince = null;
-          return state.currentRole === "assistant";
-        }
-        connectorStableWithoutToolSince ??= Date.now();
-        return Date.now() - connectorStableWithoutToolSince >= CONNECTOR_FIRST_TOOL_GRACE_MS;
+        return state.currentRole === "assistant" &&
+          state.currentStatus === "finished_successfully" &&
+          state.currentEndTurn === true;
       };
 
       // Wait for the turn to settle. The SSE interceptor will normally push

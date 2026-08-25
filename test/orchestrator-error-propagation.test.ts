@@ -66,7 +66,12 @@ beforeEach(() => {
   latestAssistantModelSlug.mockResolvedValue(null);
   readLatestAssistantText.mockResolvedValue("");
   fetchLatestTurnToolCalls.mockResolvedValue([]);
-  fetchLatestTurnConnectorState.mockResolvedValue({ calls: [], currentRole: "assistant" });
+  fetchLatestTurnConnectorState.mockResolvedValue({
+    calls: [],
+    currentRole: "assistant",
+    currentStatus: "finished_successfully",
+    currentEndTurn: true,
+  });
 });
 
 describe("runAskOnSession connector contract", () => {

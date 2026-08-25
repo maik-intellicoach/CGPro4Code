@@ -42,6 +42,8 @@ export interface ConnectorToolCall {
 export interface LatestTurnConnectorState {
   calls: ConnectorToolCall[];
   currentRole: string | null;
+  currentStatus: string | null;
+  currentEndTurn: boolean | null;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -105,6 +107,8 @@ export function extractLatestTurnConnectorState(
   return {
     calls: extractLatestTurnToolCalls(body, expectedAppName),
     currentRole: typeof currentAuthor?.role === "string" ? currentAuthor.role : null,
+    currentStatus: typeof currentMessage?.status === "string" ? currentMessage.status : null,
+    currentEndTurn: typeof currentMessage?.end_turn === "boolean" ? currentMessage.end_turn : null,
   };
 }
 
