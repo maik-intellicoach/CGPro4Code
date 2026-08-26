@@ -88,6 +88,10 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
       headless,
       channel: useSystemChrome ? "chrome" : undefined,
       args: launchArgs,
+      // Patchright disables Chromium's process sandbox unless this is
+      // explicitly true. Dedicated local profiles do not require that
+      // concession, and Chrome surfaces it as an unsupported/security banner.
+      chromiumSandbox: true,
       // Strip Playwright's automation default flags so navigator.webdriver
       // is undefined and the UA doesn't include "HeadlessChrome" markers.
       ignoreDefaultArgs: ["--enable-automation"],
