@@ -1,7 +1,7 @@
 // patchright is a drop-in Playwright fork that patches CDP leaks
 // (navigator.webdriver, isolated-world detection, etc.). Both runtime
 // and types come from patchright so Locator types stay compatible.
-import { chromium, type BrowserContext, type Page } from "patchright";
+import { chromium, type BrowserContext, type FileChooser, type Page } from "patchright";
 import {
   chmodSync,
   existsSync,
@@ -133,6 +133,8 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
     page = await context.newPage();
   }
 
+  installFileChooserGuard(context, page);
+
   return {
     context,
     page,
@@ -143,6 +145,50 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
       }
     },
   };
+}
+
+/**
+ * Never let a native OS file-open dialog reach the user's screen.
+ *
+ * We drive a REAL Chrome via patchright. Nothing here registered a
+ * `filechooser` listener, and without one Chrome raises the genuine macOS
+ * picker whenever the composer's hidden `input[type=file]` is activated. On
+ * 2026-08-27 a planning run did exactly that mid-prompt and Maik had to cancel
+ * a Finder window repeatedly while the run stalled (invocation a9f3717e:
+ * 4m46s between connector_selected and prompt_submitted).
+ *
+ * Registering the listener is what makes patchright intercept the dialog, so
+ * this handler both suppresses the modal AND turns a silent UI hijack into a
+ * loud stderr diagnostic. Intended uploads are unaffected: `attachImages`
+ * calls `setInputFiles` directly on the input element, which never emits a
+ * `filechooser` event.
+ */
+export function installFileChooserGuard(context: BrowserContext, page?: Page): void {
+  const guard = (chooser: FileChooser): void => {
+    const element = chooser.element();
+    void element
+      .evaluate((node: Element) => ({
+        name: node.getAttribute("name"),
+        testid: node.getAttribute("data-testid"),
+        accept: node.getAttribute("accept"),
+      }))
+      .catch(() => null)
+      .then((detail) => {
+        console.error(
+          "[cgpro:filechooser] BLOCKED an unrequested native file dialog " +
+            `(multiple=${chooser.isMultiple()} detail=${JSON.stringify(detail)}). ` +
+            "cgpro never uploads through the OS picker; attachments go through setInputFiles. " +
+            "If this fires during a turn, the composer was hijacked - check the prompt path.",
+        );
+      });
+    // Empty file list dismisses the chooser without uploading anything.
+    void chooser.setFiles([]).catch(() => undefined);
+  };
+  // `filechooser` is a Page event, so cover the current tab and any tab the
+  // app opens later (cgpro is single-tab today, but a stray popup must not
+  // become an unguarded surface).
+  page?.on("filechooser", guard);
+  context.on("page", (opened: Page) => opened.on("filechooser", guard));
 }
 
 /**

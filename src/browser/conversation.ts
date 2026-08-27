@@ -286,9 +286,15 @@ export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
 }
 
 async function openComposerToolsPopover(page: Page): Promise<boolean> {
+  // Every fallback must be a POPOVER TRIGGER. The old middle entry was a bare
+  // `button[aria-label*="Add files" i]`, which also matches an upload-only
+  // control — clicking that fires the hidden file input and raises a native
+  // macOS picker instead of opening the tools menu. Requiring the menu ARIA
+  // contract keeps an upload button from ever being clicked here.
   const plus = await firstResolved(page, [
     'button[data-testid="composer-plus-btn"]',
-    'button[aria-label*="Add files" i]',
+    'button[aria-label*="Add files" i][aria-haspopup]',
+    'button[aria-label*="Add files" i][aria-expanded]',
     'button[aria-label*="Add" i][aria-haspopup]',
   ]);
   if (!plus) return false;
@@ -675,12 +681,25 @@ export async function sendPrompt(
     await page.keyboard.press("Meta+A");
     await page.keyboard.press("Backspace");
   }
-  // Composer is a contenteditable div on modern chatgpt.com — use the
-  // keyboard so React's state listeners actually fire.
-  const lines = prompt.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    if (i > 0) await page.keyboard.press("Shift+Enter");
-    await page.keyboard.type(lines[i], { delay: 4 });
+  // Composer is a contenteditable div on modern chatgpt.com. Insert the whole
+  // prompt in one CDP `Input.insertText` instead of typing it character by
+  // character: at 4ms/char a planning prompt spent MINUTES streaming synthetic
+  // keystrokes into a live React composer (invocation a9f3717e on 2026-08-27
+  // sat 4m46s between connector_selected and prompt_submitted). Every one of
+  // those keystrokes is a chance for an inline `@`/`/` menu to swallow the
+  // input and activate something — including the composer's file upload, which
+  // is how a native Finder dialog ended up on Maik's screen mid-run.
+  // insertText fires the same beforeinput/input events React listens for, but
+  // atomically and without triggering keyboard-driven menus.
+  // Escape hatch: CGPRO_TYPE_KEYSTROKES=1 restores the old per-character path.
+  if (process.env.CGPRO_TYPE_KEYSTROKES === "1") {
+    const lines = prompt.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) await page.keyboard.press("Shift+Enter");
+      await page.keyboard.type(lines[i], { delay: 4 });
+    }
+  } else {
+    await insertComposerText(page, composer, prompt);
   }
   const priorAssistantCount = await assistantCount();
   if (cancelled?.()) return priorAssistantCount;
@@ -691,6 +710,40 @@ export async function sendPrompt(
     await page.keyboard.press("Enter");
   }
   return priorAssistantCount;
+}
+
+/**
+ * Put `text` into the focused composer without emitting key events.
+ *
+ * `keyboard.insertText` dispatches only the `input` event — no keydown — so
+ * chatgpt.com's inline `@` mention and `/` command menus cannot open, and no
+ * menu entry (notably "Add photos & files") can be activated by the prompt's
+ * own characters. Newlines still go through Shift+Enter because the composer
+ * treats a bare "\n" as submit-adjacent; that is a handful of keypresses
+ * instead of one per character.
+ *
+ * Falls back to per-character typing if insertion leaves the composer empty,
+ * so a build that rejects inserted text degrades to the old behaviour rather
+ * than submitting an empty prompt to a paid run.
+ */
+async function insertComposerText(page: Page, composer: Locator, text: string): Promise<void> {
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (i > 0) await page.keyboard.press("Shift+Enter");
+    if (lines[i].length > 0) await page.keyboard.insertText(lines[i]);
+  }
+  if (text.trim().length === 0) return;
+  // Fail OPEN on the read: only fall back when we positively observe an empty
+  // composer. An unreadable composer must not trigger a duplicate write.
+  const landed = await composer.innerText().catch(() => null);
+  if (landed === null || landed.trim().length > 0) return;
+  console.error(
+    "[cgpro:composer] insertText left the composer empty; falling back to keystroke typing",
+  );
+  for (let i = 0; i < lines.length; i++) {
+    if (i > 0) await page.keyboard.press("Shift+Enter");
+    await page.keyboard.type(lines[i], { delay: 4 });
+  }
 }
 
 const SEND_CLICK_MAX_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_SEND_CLICK_ATTEMPTS ?? 3));

@@ -18,11 +18,14 @@ import { openSession } from "../src/browser/session.js";
 
 describe("dedicated Chrome launch policy", () => {
   it("keeps Chromium's process sandbox enabled and hides only the crash bubble", async () => {
-    const page = {};
+    // `on` is part of the fake because openSession installs the file-chooser
+    // guard (no native OS picker may ever reach the screen).
+    const page = { on: vi.fn() };
     const context = {
       pages: () => [page],
       newPage: vi.fn(),
       close: vi.fn(),
+      on: vi.fn(),
     };
     launchPersistentContext.mockResolvedValue(context);
 
