@@ -197,6 +197,7 @@ describe("runAskOnSession connector contract", () => {
       "11111111-1111-1111-1111-111111111111",
       "p035-low-risk-workstation",
       10_000,
+      true,
     );
     expect(events).toContainEqual({
       type: "tool", name: "search_context",

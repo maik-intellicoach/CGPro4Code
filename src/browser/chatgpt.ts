@@ -110,9 +110,9 @@ export async function backendApiFetch(
   page: Page,
   pathOrUrl: string,
   init: { method?: string; body?: unknown; headers?: Record<string, string>; timeoutMs?: number } = {},
-): Promise<{ ok: boolean; status: number; body: unknown }> {
+): Promise<{ ok: boolean; status: number; body: unknown; retryAfter: string | null }> {
   const token = await getAccessToken(page, init.timeoutMs);
-  if (!token) return { ok: false, status: 401, body: null };
+  if (!token) return { ok: false, status: 401, body: null, retryAfter: null };
   return await page.evaluate(
     async ({ url, method, body, headers, accessToken, timeoutMs }) => {
       const controller = typeof timeoutMs === "number" ? new AbortController() : null;
@@ -137,7 +137,7 @@ export async function backendApiFetch(
         } catch {
           parsed = null;
         }
-        return { ok: r.ok, status: r.status, body: parsed };
+        return { ok: r.ok, status: r.status, body: parsed, retryAfter: r.headers.get("retry-after") };
       } finally {
         if (timer) clearTimeout(timer);
       }

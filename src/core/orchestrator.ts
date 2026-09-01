@@ -194,6 +194,10 @@ function runAskInner(
             conversationId,
             opts.connector,
             force ? 10_000 : 1_000,
+            // Only the forced terminal read retries a 429: a failure there
+            // discards the finished turn. The mid-turn poll is best-effort
+            // and already has its own CONNECTOR_EVIDENCE_RATE_LIMIT_BACKOFF_MS.
+            force,
           );
         } catch (err) {
           if (force) throw err;

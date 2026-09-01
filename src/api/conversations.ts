@@ -122,13 +122,66 @@ export function extractLatestTurnToolNames(body: unknown, expectedAppName?: stri
   return extractLatestTurnToolCalls(body, expectedAppName).map((call) => call.name);
 }
 
+/**
+ * Corroboration read retry (P-035 audit 2026-09-02, P1-1).
+ *
+ * chatgpt.com answers these conversation GETs with HTTP 429 under load.
+ * Throwing on the first non-200 discards an already-finished 14-60 minute
+ * turn, so the read is retried with bounded jittered backoff. This is safe
+ * ONLY because the endpoint is an idempotent GET — never route a
+ * prompt-submitting POST through it.
+ */
+const CORROBORATION_MAX_ATTEMPTS = 4;
+const CORROBORATION_BASE_DELAY_MS = 1_000;
+const CORROBORATION_MAX_DELAY_MS = 8_000;
+const CORROBORATION_JITTER_MS = 250;
+
+function parseRetryAfterMs(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const seconds = Number(value.trim());
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1_000);
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? null : Math.max(0, at - Date.now());
+}
+
+function corroborationRetryDelayMs(attempt: number, retryAfter: string | null | undefined): number {
+  const advertised = parseRetryAfterMs(retryAfter);
+  if (advertised !== null) return Math.min(advertised, CORROBORATION_MAX_DELAY_MS);
+  const backoff = Math.min(CORROBORATION_BASE_DELAY_MS * 2 ** (attempt - 1), CORROBORATION_MAX_DELAY_MS);
+  return backoff + Math.random() * CORROBORATION_JITTER_MS;
+}
+
+/**
+ * Single place both corroboration fetches route through. Retries HTTP 429
+ * and 5xx up to `CORROBORATION_MAX_ATTEMPTS`; every other status (including
+ * the 401 that means "no access token") is returned on the first response.
+ */
+async function fetchConversationForCorroboration(
+  page: Page,
+  conversationId: string,
+  timeoutMs: number,
+  retryTransient: boolean,
+): Promise<{ ok: boolean; status: number; body: unknown }> {
+  const url = `/backend-api/conversation/${conversationId}`;
+  let result = await backendApiFetch(page, url, { timeoutMs });
+  const attempts = retryTransient ? CORROBORATION_MAX_ATTEMPTS : 1;
+  for (let attempt = 1; attempt < attempts; attempt++) {
+    if (result.ok || (result.status !== 429 && result.status < 500)) break;
+    const delayMs = corroborationRetryDelayMs(attempt, result.retryAfter);
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    result = await backendApiFetch(page, url, { timeoutMs });
+  }
+  return result;
+}
+
 export async function fetchLatestTurnToolCalls(
   page: Page,
   conversationId: string,
   expectedAppName?: string,
   timeoutMs = 10_000,
+  retryTransient = true,
 ): Promise<ConnectorToolCall[]> {
-  const result = await backendApiFetch(page, `/backend-api/conversation/${conversationId}`, { timeoutMs });
+  const result = await fetchConversationForCorroboration(page, conversationId, timeoutMs, retryTransient);
   if (!result.ok) {
     throw new Error(`conversation tool evidence fetch failed with HTTP ${result.status}`);
   }
@@ -140,8 +193,9 @@ export async function fetchLatestTurnConnectorState(
   conversationId: string,
   expectedAppName?: string,
   timeoutMs = 10_000,
+  retryTransient = true,
 ): Promise<LatestTurnConnectorState> {
-  const result = await backendApiFetch(page, `/backend-api/conversation/${conversationId}`, { timeoutMs });
+  const result = await fetchConversationForCorroboration(page, conversationId, timeoutMs, retryTransient);
   if (!result.ok) {
     throw new Error(`conversation connector state fetch failed with HTTP ${result.status}`);
   }
