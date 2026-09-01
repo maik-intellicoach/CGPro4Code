@@ -53,6 +53,9 @@ export const SELECTORS: SelectorSet = {
     'textarea[placeholder*="Message"]',
     'textarea[placeholder*="Envoyer"]',
     'div[contenteditable="true"][data-virtualkeyboard="true"]',
+    // Current ChatGPT composer no longer exposes the older stable attributes
+    // on every account surface. Keep this deliberately broad fallback last.
+    'div[contenteditable="true"]',
   ],
   sendButton: [
     'button[data-testid="send-button"]',

@@ -18,6 +18,7 @@ describe("selectors", () => {
 
   it("composer and sendButton are listed first in the most stable form", () => {
     expect(SELECTORS.composer[0]).toBe("#prompt-textarea");
+    expect(SELECTORS.composer.at(-1)).toBe('div[contenteditable="true"]');
     expect(SELECTORS.sendButton[0]).toContain('data-testid="send-button"');
   });
 
