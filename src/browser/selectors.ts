@@ -119,12 +119,9 @@ export const SELECTORS: SelectorSet = {
     '[data-radix-popper-content-wrapper] span:text-is("Deep research")',
   ],
   deepResearchSelected: [
+    '#prompt-textarea [data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"]',
     'form [data-testid*="deep-research" i]',
     'form button:text-is("Deep research")',
-    'form span:text-is("Deep research")',
-    'main [data-testid*="deep-research" i]',
-    'main button:text-is("Deep research")',
-    'main span:text-is("Deep research")',
   ],
   accountMenu: [
     'button[data-testid="profile-button"]',

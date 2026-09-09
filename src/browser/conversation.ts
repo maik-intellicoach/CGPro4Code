@@ -266,11 +266,16 @@ export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
     return true;
   }
 
+  await page.waitForTimeout(5_000);
   if (!(await openComposerToolsPopover(page))) {
     throw new Error("ChatGPT native Deep Research picker is unavailable");
   }
 
-  let toggle = await firstResolved(page, SELECTORS.deepResearchToggle);
+  // Project composers hydrate their tool menu asynchronously. A snapshot
+  // taken immediately after opening the menu can falsely report no mode.
+  await page.waitForTimeout(5_000);
+  const toggle = await requireSelector(page, SELECTORS.deepResearchToggle, "native Deep Research", 8_000)
+    .catch(() => null);
   if (!toggle) {
     const visible = await recordConnectorDiagnostics(page);
     await page.keyboard.press("Escape").catch(() => undefined);
@@ -316,9 +321,11 @@ export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
 
   // The picker normally closes after selection. Verify the fresh composer
   // chip instead of trusting a successful click or a stale picker locator.
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(5_000);
   await page.keyboard.press("Escape").catch(() => undefined);
-  const verified = await firstResolved(page, SELECTORS.deepResearchSelected);
+  const verified = on
+    ? await requireSelector(page, SELECTORS.deepResearchSelected, "selected native Deep Research", 8_000).catch(() => null)
+    : await firstResolved(page, SELECTORS.deepResearchSelected);
   if ((verified !== null) !== on) {
     throw new Error("ChatGPT native Deep Research selection did not become active");
   }
@@ -695,6 +702,14 @@ export async function setConnector(page: Page, name: string): Promise<void> {
   await assertConnectorAttached(page, connectorName);
 }
 
+export async function clearComposer(page: Page): Promise<void> {
+  const composer = await requireSelector(page, SELECTORS.composer, "composer");
+  await composer.click();
+  await page.keyboard.press("Meta+A");
+  await page.keyboard.press("Backspace");
+  await page.waitForTimeout(5_000);
+}
+
 /**
  * Type the prompt into the composer and submit it. Returns the assistant-
  * bubble count from BEFORE the send so the caller can detect "the new one".
@@ -708,6 +723,7 @@ export async function sendPrompt(
   prompt: string,
   preserveExisting = false,
   cancelled?: () => boolean,
+  verifySubmission?: () => Promise<void>,
 ): Promise<number> {
   const assistantCount = async (): Promise<number> => page
     .locator(SELECTORS.assistantMessages.join(", "))
@@ -721,8 +737,9 @@ export async function sendPrompt(
   // on some ChatGPT builds. Always replace the composer contents so a failed
   // or stale picker query cannot contaminate the actual prompt.
   if (!preserveExisting) {
-    await page.keyboard.press("Meta+A");
-    await page.keyboard.press("Backspace");
+    await clearComposer(page);
+  } else {
+    await page.keyboard.press("Meta+End");
   }
   // Composer is a contenteditable div on modern chatgpt.com. Insert the whole
   // prompt in one CDP `Input.insertText` instead of typing it character by
@@ -747,10 +764,18 @@ export async function sendPrompt(
   const priorAssistantCount = await assistantCount();
   if (cancelled?.()) return priorAssistantCount;
 
+  // Typing may change inline modes. Verify the composed request, not just
+  // the empty composer, and let failures stop both click and Enter submission.
+  await verifySubmission?.();
+  if (cancelled?.()) return priorAssistantCount;
+
   const clicked = await clickSendButtonWithRetries(page, cancelled);
   if (!clicked && !cancelled?.()) {
-    // Fall back to pressing Enter while the composer has focus.
-    await page.keyboard.press("Enter");
+    // The final model check moves focus into a menu. Re-resolve the composer
+    // before the keyboard fallback instead of pressing Enter on that menu.
+    const currentComposer = await requireSelector(page, SELECTORS.composer, "composer");
+    await currentComposer.click();
+    if (!cancelled?.()) await page.keyboard.press("Enter");
   }
   return priorAssistantCount;
 }

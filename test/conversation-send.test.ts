@@ -130,4 +130,37 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     expect(page.keyboard.insertText).not.toHaveBeenCalled();
     expect(page.keyboard.press).not.toHaveBeenCalledWith("Enter");
   });
+
+  it("verifies the composed request after insertion and before sending", async () => {
+    const order: string[] = [];
+    firstResolved.mockResolvedValue(fakeLocator({ click: async () => { order.push("send"); } }));
+    const page = fakePage();
+    vi.mocked(page.keyboard.insertText).mockImplementation(async () => { order.push("insert"); });
+    await sendPrompt(page, "research this", true, undefined, async () => { order.push("verify"); });
+    expect(order).toEqual(["insert", "verify", "send"]);
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Backspace");
+  });
+
+  it("never clicks Send or presses Enter when the final mode check fails", async () => {
+    const click = vi.fn(async () => {});
+    firstResolved.mockResolvedValue(fakeLocator({ click }));
+    const page = fakePage();
+    await expect(sendPrompt(page, "research this", true, undefined, async () => {
+      throw new Error("native mode missing");
+    })).rejects.toThrow("native mode missing");
+    expect(click).not.toHaveBeenCalled();
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+  });
+
+  it("restores composer focus for Enter after verification moved focus into a menu", async () => {
+    let focus = "none";
+    requireSelector.mockResolvedValue(fakeLocator({ click: async () => { focus = "composer"; } }));
+    firstResolved.mockResolvedValue(fakeLocator({ click: async () => { throw new Error("detached"); } }));
+    const page = fakePage();
+    vi.mocked(page.keyboard.press).mockImplementation(async (key) => {
+      if (key === "Enter") expect(focus).toBe("composer");
+    });
+    await sendPrompt(page, "hello", true, undefined, async () => { focus = "menu"; });
+    expect(page.keyboard.press).toHaveBeenCalledWith("Enter");
+  });
 });

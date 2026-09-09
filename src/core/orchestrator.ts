@@ -1,7 +1,8 @@
 import type { Page } from "patchright";
 import { openSession, type Session } from "../browser/session.js";
-import { goHome, isLoggedIn } from "../browser/chatgpt.js";
+import { goHome, isLoggedIn, requireSelector } from "../browser/chatgpt.js";
 import {
+  clearComposer,
   currentConversationId,
   latestAssistantModelSlug,
   openConversation,
@@ -149,6 +150,7 @@ function runAskInner(
       log(`openConversation done, url=${page.url()}`);
 
       if (opts.deepResearch) {
+        await clearComposer(page);
         log("setDeepResearch true…");
         await setDeepResearch(page, true);
         emitter.push({ type: "tool", name: "deep-research-selected" });
@@ -165,13 +167,19 @@ function runAskInner(
 
       await attachImages(page, opts.images ?? []);
 
-      if (modelSlug === "gpt-6-pro") {
-        const selection = await ensureProSixMaximum(page);
-        emitter.push({ type: "tool", name: "model-thinking-verified", meta: selection });
-      }
-
       log("sendPrompt…");
-      const priorBubbles = await sendPrompt(page, opts.prompt, opts.connector !== undefined, () => cancelled);
+      const priorBubbles = await sendPrompt(
+        page, opts.prompt, opts.connector !== undefined || opts.deepResearch === true, () => cancelled,
+        async () => {
+          if (opts.deepResearch) {
+            await requireSelector(page, SELECTORS_DUMP.deepResearchSelected, "native Deep Research before submission", 8_000);
+          }
+          if (modelSlug === "gpt-6-pro" || opts.deepResearch) {
+            const selection = await ensureProSixMaximum(page);
+            emitter.push({ type: "tool", name: "model-thinking-verified", meta: selection });
+          }
+        },
+      );
       if (opts.connector !== undefined && !cancelled) {
         emitter.push({ type: "tool", name: "prompt-submitted", meta: { connector: opts.connector } });
       }

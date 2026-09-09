@@ -57,6 +57,14 @@ function scenario(options: {
   } as unknown as Page;
   let power = "2";
   requireSelector.mockImplementation(async (_page: Page, _selectors: string[], name: string) => {
+    if (name === "native Deep Research") {
+      if (popoverOpen && exposed) return toggle;
+      throw new Error("native mode unavailable");
+    }
+    if (name === "selected native Deep Research") {
+      if (selected && options.chipExposed !== false) return toggle;
+      throw new Error("native mode not selected");
+    }
     if (!effortExposed) throw new Error("thinking control unavailable");
     if (name === "thinking control") return { click: vi.fn(async () => {}) };
     if (name === "selected thinking model") return effort;

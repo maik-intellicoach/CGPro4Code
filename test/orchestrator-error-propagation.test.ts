@@ -8,6 +8,7 @@ const isLoggedIn = vi.fn();
 const currentConversationId = vi.fn();
 const latestAssistantModelSlug = vi.fn();
 const openConversation = vi.fn();
+const clearComposer = vi.fn();
 const readLatestAssistantText = vi.fn();
 const sendPrompt = vi.fn();
 const setConnector = vi.fn();
@@ -23,6 +24,7 @@ vi.mock("../src/browser/chatgpt.js", () => ({
   isLoggedIn: (...args: unknown[]) => isLoggedIn(...args),
 }));
 vi.mock("../src/browser/conversation.js", () => ({
+  clearComposer: (...args: unknown[]) => clearComposer(...args),
   currentConversationId: (...args: unknown[]) => currentConversationId(...args),
   latestAssistantModelSlug: (...args: unknown[]) => latestAssistantModelSlug(...args),
   openConversation: (...args: unknown[]) => openConversation(...args),
@@ -101,6 +103,8 @@ describe("runAskOnSession native Deep Research contract", () => {
     expect(setWebSearch).not.toHaveBeenCalled();
     expect(setConnector).not.toHaveBeenCalled();
     expect(setDeepResearch.mock.invocationCallOrder[0]).toBeLessThan(sendPrompt.mock.invocationCallOrder[0]);
+    expect(clearComposer.mock.invocationCallOrder[0]).toBeLessThan(setDeepResearch.mock.invocationCallOrder[0]);
+    expect(sendPrompt.mock.calls[0][2]).toBe(true);
     expect(events).toContainEqual({ type: "tool", name: "deep-research-selected" });
   });
 
