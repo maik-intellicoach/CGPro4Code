@@ -2,10 +2,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "patchright";
 
 const firstResolved = vi.fn();
+const requireSelector = vi.fn();
 
 vi.mock("../src/browser/chatgpt.js", () => ({
   firstResolved: (...args: unknown[]) => firstResolved(...args),
-  requireSelector: vi.fn(),
+  requireSelector: (...args: unknown[]) => requireSelector(...args),
 }));
 
 const { setDeepResearch } = await import("../src/browser/conversation.js");
@@ -15,7 +16,8 @@ function scenario(options: {
   clickSticks?: boolean;
   effortExposed?: boolean;
   initiallySelected?: boolean;
-  effortLabel?: "High" | "Pro";
+  chipExposed?: boolean;
+  effortLabel?: "High" | "6Pro";
   normalClickThrows?: boolean;
 } = {}) {
   let popoverOpen = false;
@@ -46,24 +48,32 @@ function scenario(options: {
     }),
   };
   const effort = {
-    textContent: vi.fn(async () => options.effortLabel ?? "High"),
+    textContent: vi.fn(async () => options.effortLabel ?? "6Pro"),
     getAttribute: vi.fn(async () => null),
   };
   const page = {
     keyboard: { press: vi.fn(async () => { popoverOpen = false; }) },
     waitForTimeout: vi.fn(async () => {}),
   } as unknown as Page;
+  let power = "2";
+  requireSelector.mockImplementation(async (_page: Page, _selectors: string[], name: string) => {
+    if (!effortExposed) throw new Error("thinking control unavailable");
+    if (name === "thinking control") return { click: vi.fn(async () => {}) };
+    if (name === "selected thinking model") return effort;
+    if (name === "thinking power") return {
+      getAttribute: async (attr: string) => attr === "aria-valuemin" ? "0" : attr === "aria-valuemax" ? "4" : power,
+      press: async () => { power = "4"; },
+    };
+    throw new Error(`Unexpected selector: ${name}`);
+  });
 
   firstResolved.mockImplementation(async (_page: Page, selectors?: string[]) => {
     if (selectors?.some((selector) => selector.includes("composer-plus-btn"))) return plus;
     if (selectors?.some((selector) => selector.includes("form") && selector.includes("Deep research"))) {
-      return selected && !popoverOpen ? toggle : null;
+      return selected && options.chipExposed !== false && !popoverOpen ? toggle : null;
     }
     if (!selectors || selectors.some((selector) => selector.includes("Deep research"))) {
       return popoverOpen && exposed ? toggle : null;
-    }
-    if (selectors.some((selector) => selector.includes("High"))) {
-      return selected && !popoverOpen && effortExposed ? effort : null;
     }
     return null;
   });
@@ -71,7 +81,7 @@ function scenario(options: {
   return { page, plus, toggle, effort };
 }
 
-beforeEach(() => firstResolved.mockReset());
+beforeEach(() => { firstResolved.mockReset(); requireSelector.mockReset(); });
 
 describe("native Deep Research selection", () => {
   it("verifies selection from the composer chip after clicking the picker row", async () => {
@@ -85,7 +95,7 @@ describe("native Deep Research selection", () => {
   });
 
   it("recognizes an already-selected native mode without reopening the picker", async () => {
-    const test = scenario({ initiallySelected: true, effortLabel: "Pro" });
+    const test = scenario({ initiallySelected: true, effortLabel: "6Pro" });
 
     await expect(setDeepResearch(test.page, true)).resolves.toBe(true);
 
@@ -123,7 +133,18 @@ describe("native Deep Research selection", () => {
     const test = scenario({ effortExposed: false });
 
     await expect(setDeepResearch(test.page, true)).rejects.toThrow(
-      "maximum-capability control is unavailable",
+      "thinking control unavailable",
     );
+  });
+
+  it("rejects High even when the native chip is selected and the slider reports maximum", async () => {
+    const test = scenario({ initiallySelected: true, effortLabel: "High" });
+    await expect(setDeepResearch(test.page, true)).rejects.toThrow("6 Pro is not selected");
+  });
+
+  it("also verifies 6 Pro when only the picker reports native mode already selected", async () => {
+    const test = scenario({ initiallySelected: true, chipExposed: false, effortLabel: "High" });
+    await expect(setDeepResearch(test.page, true)).rejects.toThrow("6 Pro is not selected");
+    expect(test.toggle.click).not.toHaveBeenCalled();
   });
 });

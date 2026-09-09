@@ -41,7 +41,6 @@ describe("selectors", () => {
     expect(SELECTORS.deepResearchToggle.some((selector) => selector.includes("Deep research"))).toBe(true);
     expect(SELECTORS.deepResearchToggle[0]).toContain('__menu-item[tabindex="0"]');
     expect(SELECTORS.deepResearchSelected.some((selector) => selector.includes("Deep research"))).toBe(true);
-    expect(SELECTORS.deepResearchEffort.some((selector) => selector.includes("High"))).toBe(true);
-    expect(SELECTORS.deepResearchEffort.some((selector) => selector.includes("Pro"))).toBe(true);
+    expect(SELECTORS.thinkingPowerSlider.some((selector) => selector.includes("aria-valuemax"))).toBe(true);
   });
 });

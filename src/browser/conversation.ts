@@ -1,6 +1,7 @@
 import type { Page, Locator } from "patchright";
-import { SELECTORS } from "./selectors.js";
-import { firstResolved, requireSelector } from "./chatgpt.js";
+import { SELECTORS, joinSelectors } from "./selectors.js";
+import { firstResolved, requireSelector, goHome } from "./chatgpt.js";
+import { listProjects } from "../api/projects.js";
 import { TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation } from "../core/stream.js";
 
@@ -27,13 +28,32 @@ export async function openConversation(
       timeout: 60_000,
     });
   } else if (opts.gizmoId || opts.gizmoShortUrl) {
-    // Land on the project page; the next sendPrompt creates a conv
-    // inside it (the React app reads the gizmo from the URL and
-    // includes the right conversation_mode in the POST body).
     const slug = opts.gizmoShortUrl ?? opts.gizmoId!;
-    const url = new URL(`https://chatgpt.com/g/${encodeURIComponent(slug)}/project`);
-    if (opts.model) url.searchParams.set("model", opts.model);
-    await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await goHome(page, { model: opts.model });
+    await requireSelector(page, SELECTORS.composer, "home composer", 20_000);
+    await page.waitForTimeout(5_000);
+    const projects = await listProjects(page);
+    const project = projects.find((p) =>
+      (!opts.gizmoId || p.id === opts.gizmoId) &&
+      (p.id === slug || p.shortUrl === slug));
+    if (!project || projects.filter((p) => p.name === project.name).length !== 1) {
+      throw new Error("Requested ChatGPT Project could not be uniquely identified");
+    }
+    // The directory row prepares Project metadata before client navigation.
+    // A cold deep link can instead hit the unavailable locked-chats endpoint.
+    const directory = await requireSelector(page, SELECTORS.projectsNavigation, "Projects navigation");
+    await page.waitForTimeout(5_000);
+    await directory.click({ timeout: 5_000 });
+    const row = page.locator(joinSelectors(SELECTORS.projectRows)).filter({
+      has: page.getByRole("button", { name: `Open project options for ${project.name}`, exact: true }),
+    });
+    await row.waitFor({ state: "visible", timeout: 20_000 });
+    await page.waitForTimeout(5_000);
+    await row.getByText(project.name, { exact: true }).click({ timeout: 5_000 });
+    await page.waitForURL((url) => url.origin === "https://chatgpt.com" &&
+      (url.pathname === `/g/${project.id}/project` ||
+       (project.shortUrl !== undefined && url.pathname === `/g/${project.shortUrl}/project`)),
+    { timeout: 20_000 });
   } else {
     const url = new URL("https://chatgpt.com/");
     if (opts.model) url.searchParams.set("model", opts.model);
@@ -65,6 +85,39 @@ async function ensureChatTab(page: Page): Promise<void> {
     console.error(
       "[cgpro:model] WARNING: found the Chat/Work surface toggle but failed to switch to Chat. The conversation may run on the wrong ChatGPT surface (no Pro tier). Run `cgpro doctor` to audit selectors.",
     );
+  }
+}
+
+/** Verify the current 6 Pro power control before any prompt is submitted. */
+export async function ensureProSixMaximum(page: Page): Promise<{ model: string; power: number }> {
+  const button = await requireSelector(page, SELECTORS.thinkingPowerButton, "thinking control");
+  await page.waitForTimeout(5_000);
+  await button.click({ timeout: 5_000 });
+  try {
+    await page.waitForTimeout(5_000);
+    const slider = await requireSelector(page, SELECTORS.thinkingPowerSlider, "thinking power");
+    const maximum = await slider.getAttribute("aria-valuemax");
+    const minimum = await slider.getAttribute("aria-valuemin");
+    const max = maximum === null ? NaN : Number(maximum);
+    const min = minimum === null ? NaN : Number(minimum);
+    if (!Number.isFinite(max) || !Number.isFinite(min) || max <= min) {
+      throw new Error("6 Pro thinking power range could not be verified");
+    }
+    await slider.press("End", { timeout: 5_000 });
+    await page.waitForTimeout(5_000);
+    const current = await slider.getAttribute("aria-valuenow");
+    if (current === null || Number(current) !== max) {
+      throw new Error("6 Pro thinking power did not reach its maximum");
+    }
+    // On the current UI, moving the power slider upgrades High to 6 Pro.
+    // Verify the resulting model, rather than rejecting the lower initial level.
+    const model = await requireSelector(page, SELECTORS.selectedPowerModel, "selected thinking model");
+    if (!/^6\s*Pro$/i.test((await model.textContent() ?? "").trim())) {
+      throw new Error("6 Pro is not selected in the thinking menu");
+    }
+    return { model: "gpt-6-pro", power: max };
+  } finally {
+    await page.keyboard.press("Escape");
   }
 }
 
@@ -201,18 +254,7 @@ export async function setWebSearch(page: Page, on: boolean): Promise<boolean> {
  */
 export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
   const verifyMaximum = async (): Promise<void> => {
-    const effort = await firstResolved(page, SELECTORS.deepResearchEffort);
-    if (!effort) {
-      throw new Error("ChatGPT native Deep Research maximum-capability control is unavailable");
-    }
-    const label = ((await effort.textContent().catch(() => "")) ?? "").trim();
-    const aria = ((await effort.getAttribute("aria-label").catch(() => "")) ?? "").trim();
-    // The current composer labels its maximum native route either "High"
-    // (reasoning depth) or "Pro" (the highest-capability Deep Research model),
-    // depending on the account/UI rollout.
-    if (!/\b(?:high|pro)\b/i.test(`${label} ${aria}`)) {
-      throw new Error("ChatGPT native Deep Research is not set to the maximum High/Pro route");
-    }
+    await ensureProSixMaximum(page);
   };
 
   // The selected mode is rendered as a blue composer chip. This is the
@@ -245,6 +287,7 @@ export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
 
   if ((await selected(toggle)) === on) {
     await page.keyboard.press("Escape").catch(() => undefined);
+    if (on) await verifyMaximum();
     return on;
   }
 

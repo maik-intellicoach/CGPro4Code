@@ -5,6 +5,7 @@ import {
   currentConversationId,
   latestAssistantModelSlug,
   openConversation,
+  ensureProSixMaximum,
   readLatestAssistantText,
   sendPrompt,
   setConnector,
@@ -163,6 +164,11 @@ function runAskInner(
       }
 
       await attachImages(page, opts.images ?? []);
+
+      if (modelSlug === "gpt-6-pro") {
+        const selection = await ensureProSixMaximum(page);
+        emitter.push({ type: "tool", name: "model-thinking-verified", meta: selection });
+      }
 
       log("sendPrompt…");
       const priorBubbles = await sendPrompt(page, opts.prompt, opts.connector !== undefined, () => cancelled);

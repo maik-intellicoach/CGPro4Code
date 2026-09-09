@@ -16,6 +16,11 @@ export interface SelectorSet {
   stopButton: string[];
   /** Model picker / dropdown trigger (composer-inline pill since the C-092 Work-area rollout). */
   modelSwitcher: string[];
+  thinkingPowerButton: string[];
+  selectedPowerModel: string[];
+  thinkingPowerSlider: string[];
+  projectsNavigation: string[];
+  projectRows: string[];
   /** "Chat" surface radio in the Chat/Work toggle (Work-area rollout, C-092). */
   chatTabRadio: string[];
   /** Web search composer toggle. */
@@ -24,8 +29,6 @@ export interface SelectorSet {
   deepResearchToggle: string[];
   /** Selected native Deep Research chip in the composer. */
   deepResearchSelected: string[];
-  /** Deep Research reasoning-depth control after native mode selection. */
-  deepResearchEffort: string[];
   /** Account / profile button — proxy for "logged in" state. */
   accountMenu: string[];
   /** All assistant message bubbles in the current conversation. */
@@ -80,6 +83,15 @@ export const SELECTORS: SelectorSet = {
     'header button[aria-label*="Sélecteur"]',
     'button[aria-haspopup="menu"]:has(svg)',
   ],
+  thinkingPowerButton: [
+    'button:has-text("Thinking effort")',
+    'button:text-matches("^(?:6\\\\s*Pro|High|Instant)$", "i")',
+    'button:has(:text-matches("^(?:6\\\\s*Pro|High|Instant)$", "i"))',
+  ],
+  selectedPowerModel: ['[role="menuitem"][aria-label="Select model"]'],
+  thinkingPowerSlider: ['[role="slider"][aria-valuemax]'],
+  projectsNavigation: ['a[href="/projects"]'],
+  projectRows: ['[role="row"]'],
   chatTabRadio: [
     'button[role="radio"]:has-text("Chat")',
     'div[role="radiogroup"] button:has-text("Chat")',
@@ -113,17 +125,6 @@ export const SELECTORS: SelectorSet = {
     'main [data-testid*="deep-research" i]',
     'main button:text-is("Deep research")',
     'main span:text-is("Deep research")',
-  ],
-  deepResearchEffort: [
-    'form button:has-text("High")',
-    'main button[aria-haspopup="menu"]:has-text("High")',
-    'button[aria-label*="High" i][aria-haspopup]',
-    'form button:text-is("Pro")',
-    'main button[aria-haspopup="menu"]:text-is("Pro")',
-    'main button:text-is("Pro")',
-    'main span:text-is("Pro")',
-    'main button:text-is("High")',
-    'main span:text-is("High")',
   ],
   accountMenu: [
     'button[data-testid="profile-button"]',
