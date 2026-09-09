@@ -18,6 +18,8 @@ const stopCurrentTurn = vi.fn();
 const waitTurnComplete = vi.fn();
 const fetchLatestTurnToolCalls = vi.fn();
 const fetchLatestTurnConnectorState = vi.fn();
+const fetchLatestNativeResearchReport = vi.fn();
+const fetchNativeResearchUserNodes = vi.fn();
 
 vi.mock("../src/browser/chatgpt.js", () => ({
   goHome: (...args: unknown[]) => goHome(...args),
@@ -37,6 +39,8 @@ vi.mock("../src/browser/conversation.js", () => ({
   waitTurnComplete: (...args: unknown[]) => waitTurnComplete(...args),
 }));
 vi.mock("../src/api/conversations.js", () => ({
+  fetchNativeResearchUserNodes: (...args: unknown[]) => fetchNativeResearchUserNodes(...args),
+  fetchLatestNativeResearchReport: (...args: unknown[]) => fetchLatestNativeResearchReport(...args),
   fetchLatestTurnToolCalls: (...args: unknown[]) => fetchLatestTurnToolCalls(...args),
   fetchLatestTurnConnectorState: (...args: unknown[]) => fetchLatestTurnConnectorState(...args),
 }));
@@ -59,6 +63,8 @@ function session(): Session {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  fetchNativeResearchUserNodes.mockResolvedValue(new Set());
+  fetchLatestNativeResearchReport.mockResolvedValue(null);
   goHome.mockResolvedValue(undefined);
   isLoggedIn.mockResolvedValue(true);
   openConversation.mockResolvedValue(undefined);
@@ -82,6 +88,34 @@ beforeEach(() => {
 });
 
 describe("runAskOnSession native Deep Research contract", () => {
+  it("recovers an app report while preserving the non-Pro engine mismatch guard", async () => {
+    currentConversationId.mockReturnValue("native-conversation");
+    fetchLatestNativeResearchReport.mockResolvedValue({ text: "Native sourced report", model: "gpt-5-thinking", userNodeId: "new-user" });
+    waitTurnComplete.mockImplementationOnce(async (_page, _timeout, _count, _stable, control) => {
+      await control.pollEvidence();
+      expect(control.externalComplete()).toBe(true);
+    });
+    const runner = runAskOnSession({ prompt: "research", deepResearch: true, model: "gpt-6-pro", timeoutSec: 1200, headless: false }, session());
+    const events = await collect(runner.events);
+    await expect(runner.result).resolves.toMatchObject({ finalText: "Native sourced report" });
+    expect(readLatestAssistantText).not.toHaveBeenCalled();
+    expect(events).toContainEqual({ type: "tool", name: "model-mismatch", meta: { wanted: "gpt-6-pro", got: "gpt-5-thinking" } });
+  });
+  it("rejects the old report while the new submitted turn has not persisted", async () => {
+    currentConversationId.mockReturnValue("resumed-conversation");
+    fetchNativeResearchUserNodes.mockResolvedValue(new Set(["old-user"]));
+    fetchLatestNativeResearchReport.mockResolvedValue({ text: "Old report", model: "gpt-5-thinking", userNodeId: "old-user" });
+    waitTurnComplete.mockImplementationOnce(async (_page, _timeout, _count, _stable, control) => {
+      await control.pollEvidence();
+      expect(control.externalComplete()).toBe(false);
+      expect(await control.confirmComplete()).toBe(false);
+      throw new Error("new turn not yet persisted");
+    });
+    const runner = runAskOnSession({ prompt: "research again", deepResearch: true, timeoutSec: 1200, headless: false }, session());
+    await collect(runner.events);
+    await expect(runner.result).rejects.toThrow("new turn not yet persisted");
+    expect(fetchNativeResearchUserNodes.mock.invocationCallOrder[0]).toBeLessThan(sendPrompt.mock.invocationCallOrder[0]);
+  });
   it("selects native Deep Research before submission and never enables Web Search", async () => {
     waitTurnComplete.mockResolvedValueOnce(undefined);
     readLatestAssistantText.mockResolvedValueOnce("researched");

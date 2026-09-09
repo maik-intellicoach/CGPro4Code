@@ -122,6 +122,78 @@ export function extractLatestTurnToolNames(body: unknown, expectedAppName?: stri
   return extractLatestTurnToolCalls(body, expectedAppName).map((call) => call.name);
 }
 
+export interface NativeResearchReport {
+  text: string;
+  model: string | null;
+  userNodeId: string;
+}
+
+/** Native research reports live in the app widget, not an assistant bubble. */
+export function extractLatestNativeResearchReport(body: unknown): NativeResearchReport | null {
+  const root = asObject(body);
+  const mapping = asObject(root?.mapping);
+  let nodeId = typeof root?.current_node === "string" ? root.current_node : null;
+  const seen = new Set<string>();
+  let recovered: Omit<NativeResearchReport, "userNodeId"> | null = null;
+  while (mapping && nodeId && !seen.has(nodeId)) {
+    seen.add(nodeId);
+    const node = asObject(mapping[nodeId]);
+    if (!node) break;
+    const message = asObject(node.message);
+    const role = asObject(message?.author)?.role;
+    if (role === "user") return recovered ? { ...recovered, userNodeId: nodeId } : null;
+    const metadata = asObject(message?.metadata);
+    const resource = asObject(metadata?.invoked_resource);
+    if (!recovered && role === "tool" && resource?.resource_uri === "/connector_openai_deep_research/start") {
+      const raw = asObject(metadata?.chatgpt_sdk)?.widget_state;
+      let state: JsonObject | null;
+      try { state = asObject(typeof raw === "string" ? JSON.parse(raw) : raw); }
+      catch { return null; }
+      const report = asObject(state?.report_message);
+      const content = asObject(report?.content);
+      // An earlier report must not satisfy a newer/incomplete app invocation.
+      if (state?.status !== "completed" || asObject(report?.author)?.role !== "assistant" ||
+          report?.status !== "finished_successfully" || report?.end_turn !== true ||
+          content?.content_type !== "text" || !Array.isArray(content.parts)) return null;
+      let text = content.parts.filter((part): part is string => typeof part === "string").join("\n").trim();
+      if (!text) return null;
+      const reportMetadata = asObject(report.metadata);
+      const references = reportMetadata?.content_references;
+      if (Array.isArray(references)) {
+        for (const value of references) {
+          const ref = asObject(value);
+          // sources_footnote can use a single space as its placeholder.
+          // Replacing that globally would concatenate every word in a report.
+          if (typeof ref?.matched_text === "string" && ref.matched_text.startsWith("\uE200") && typeof ref.alt === "string") {
+            text = text.split(ref.matched_text).join(ref.alt);
+          }
+        }
+      }
+      recovered = { text, model: typeof reportMetadata?.resolved_model_slug === "string" ? reportMetadata.resolved_model_slug : null };
+    }
+    nodeId = typeof node.parent === "string" ? node.parent : null;
+  }
+  return null;
+}
+
+/** Snapshot all existing turns before Send, including abandoned branches. */
+export async function fetchNativeResearchUserNodes(page: Page, conversationId: string): Promise<Set<string>> {
+  const result = await fetchConversationForCorroboration(page, conversationId, 12_000, true);
+  const mapping = asObject(asObject(result.body)?.mapping);
+  if (!result.ok || !mapping || Object.keys(mapping).length === 0) {
+    throw new Error(`Cannot establish native research turn boundary (HTTP ${result.status})`);
+  }
+  return new Set(Object.entries(mapping)
+    .filter(([, node]) => asObject(asObject(asObject(node)?.message)?.author)?.role === "user")
+    .map(([id]) => id));
+}
+
+export async function fetchLatestNativeResearchReport(page: Page, conversationId: string): Promise<NativeResearchReport | null> {
+  const result = await fetchConversationForCorroboration(page, conversationId, 12_000, true);
+  if (!result.ok) throw new Error(`Native research report read failed with HTTP ${result.status}`);
+  return extractLatestNativeResearchReport(result.body);
+}
+
 /**
  * Corroboration read retry (P-035 audit 2026-09-02, P1-1).
  *

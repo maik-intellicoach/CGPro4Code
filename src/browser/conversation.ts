@@ -893,7 +893,8 @@ export async function waitTurnComplete(
     conversationId?: () => string | null;
     onReload?: (state: { conversationId: string; working: boolean; extended: boolean }) => void;
     cancelled?: () => boolean;
-    pollEvidence?: () => Promise<void>;
+    pollEvidence?: (force?: boolean) => Promise<void>;
+    externalComplete?: () => boolean;
     confirmComplete?: () => Promise<boolean>;
   } = {},
 ): Promise<void> {
@@ -903,8 +904,9 @@ export async function waitTurnComplete(
 
   for (;;) {
     if (control.cancelled?.()) return;
-    await control.pollEvidence?.();
+    await control.pollEvidence?.(Date.now() >= deadline);
     if (control.cancelled?.()) return;
+    if (control.externalComplete?.()) return;
     const requestedConversation = control.consumeReload?.() ?? null;
     const expired = Date.now() >= deadline;
     if (requestedConversation || expired) {
@@ -935,6 +937,13 @@ export async function waitTurnComplete(
             await page.waitForTimeout(250);
           } while (!control.cancelled?.());
           if (control.cancelled?.()) return;
+          if (control.externalComplete) {
+            await control.pollEvidence?.(true);
+            if (control.cancelled?.() || control.externalComplete()) return;
+            // App plans/clarifications may have stable text but no report.
+            // They must release the lane instead of reloading indefinitely.
+            if (expired && !working) throw new TurnTimeoutError(Math.ceil(timeoutMs / 1_000));
+          }
           if (!working) {
             await requireSelector(page, SELECTORS.composer, "composer", 20_000);
           }
@@ -960,6 +969,10 @@ export async function waitTurnComplete(
       }
     }
 
+    if (control.externalComplete) {
+      await page.waitForTimeout(400);
+      continue;
+    }
     const count = await page.locator(SELECTORS.assistantMessages.join(", ")).count();
     if (count <= priorAssistantCount) {
       await page.waitForTimeout(250);

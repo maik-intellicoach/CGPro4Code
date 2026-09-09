@@ -18,6 +18,42 @@ afterEach(() => {
 });
 
 describe("waitTurnComplete error classification", () => {
+  it("accepts independent native completion without requiring an assistant DOM bubble", async () => {
+    let complete = false;
+    const page = { locator: vi.fn(() => { throw new Error("no ordinary bubble exists"); }) } as unknown as Page;
+    await expect(waitTurnComplete(page, 1_200_000, 0, undefined, {
+      pollEvidence: async () => { complete = true; },
+      externalComplete: () => complete,
+    })).resolves.toBeUndefined();
+    expect(page.locator).not.toHaveBeenCalled();
+  });
+  it("forces a final native read when completion occurs inside the polling cooldown", async () => {
+    let now = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    let complete = false;
+    const poll = vi.fn(async (force = false) => { if (force && now >= 5000) complete = true; });
+    const page = { waitForTimeout: async (ms: number) => { now += ms; },
+      locator: vi.fn(() => { throw new Error("native report has no DOM bubble"); }) } as unknown as Page;
+    await expect(waitTurnComplete(page, 10000, 0, 100, {
+      pollEvidence: poll, externalComplete: () => complete,
+    })).resolves.toBeUndefined();
+    expect(poll).toHaveBeenLastCalledWith(true);
+    expect(now).toBe(10000);
+  });
+  it("terminates a native plan with no report after one deadline reload", async () => {
+    let now = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const bubble = { getAttribute: async () => null, innerText: async () => "Please approve the plan" };
+    const goto = vi.fn(async () => {});
+    const page = { context: () => ({}), goto,
+      url: () => "https://chatgpt.com/c/native", locator: () => ({ count: async () => 1, nth: () => bubble }),
+      waitForTimeout: async (ms: number) => { now += ms; } } as unknown as Page;
+    firstResolved.mockResolvedValue(null);
+    await expect(waitTurnComplete(page, 10000, 0, 100, {
+      conversationId: () => "native", externalComplete: () => false, pollEvidence: async () => {},
+    })).rejects.toBeInstanceOf(TurnTimeoutError);
+    expect(goto).toHaveBeenCalledTimes(1);
+  });
   it("propagates a phase-1 closed-page error unchanged", async () => {
     const closed = new Error("Target page, context or browser has been closed");
     const page = {

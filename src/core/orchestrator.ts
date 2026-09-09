@@ -22,7 +22,7 @@ import {
 } from "./stream.js";
 import { NotLoggedInError } from "../errors.js";
 import { SELECTORS as SELECTORS_DUMP } from "../browser/selectors.js";
-import { fetchLatestTurnConnectorState, fetchLatestTurnToolCalls } from "../api/conversations.js";
+import { fetchLatestTurnConnectorState, fetchLatestTurnToolCalls, fetchLatestNativeResearchReport, fetchNativeResearchUserNodes, type NativeResearchReport } from "../api/conversations.js";
 
 const CONNECTOR_EVIDENCE_POLL_MS = 30_000;
 const CONNECTOR_EVIDENCE_RATE_LIMIT_BACKOFF_MS = 120_000;
@@ -103,6 +103,8 @@ function runAskInner(
   let lastConnectorEvidencePollAt = 0;
   let connectorEvidenceBackoffUntil = 0;
   let connectorEvidencePollInFlight: Promise<void> | null = null;
+  const nativeState: { report: NativeResearchReport | null } = { report: null };
+  let nextNativeReportPollAt = 0;
 
   const result: Promise<AskResult> = (async () => {
     if (!session) {
@@ -166,6 +168,12 @@ function runAskInner(
       }
 
       await attachImages(page, opts.images ?? []);
+
+      // A stale GET after Send must never satisfy this run with an old report.
+      const existingNativeConversation = opts.deepResearch
+        ? currentConversationId(page) ?? opts.conversationId : null;
+      const priorNativeUsers = existingNativeConversation
+        ? await fetchNativeResearchUserNodes(page, existingNativeConversation) : new Set<string>();
 
       log("sendPrompt…");
       const priorBubbles = await sendPrompt(
@@ -273,6 +281,21 @@ function runAskInner(
       // a `done` event; if the network missed (cached response, schema we
       // didn't recognize), we fall back to DOM detection.
       log(`waitTurnComplete (timeout ${opts.timeoutSec}s)…`);
+      const pollNativeReport = async (force = false): Promise<void> => {
+        if (!opts.deepResearch || nativeState.report || (!force && Date.now() < nextNativeReportPollAt)) return;
+        const started = collected.find((event) => event.type === "started");
+        const id = currentConversationId(page) ??
+          (started?.type === "started" ? started.conversationId ?? null : null);
+        if (!id) return;
+        try {
+          const report = await fetchLatestNativeResearchReport(page, id);
+          if (report && !priorNativeUsers.has(report.userNodeId)) nativeState.report = report;
+        } catch (error) {
+          console.error(`[cgpro:native] ${String(error)}; report read deferred`);
+        } finally {
+          nextNativeReportPollAt = Date.now() + 30_000;
+        }
+      };
       try {
         await waitTurnComplete(page, opts.timeoutSec * 1_000, priorBubbles, undefined, {
           consumeReload: opts.consumeReload,
@@ -289,8 +312,12 @@ function runAskInner(
             });
           },
           cancelled: () => cancelled,
-          pollEvidence: () => pollConnectorEvidence(false),
-          confirmComplete: confirmConnectorCompletion,
+          pollEvidence: async (force = false) => {
+            await pollConnectorEvidence(false);
+            await pollNativeReport(force);
+          },
+          externalComplete: opts.deepResearch ? () => nativeState.report !== null : undefined,
+          confirmComplete: opts.deepResearch ? async () => nativeState.report !== null : confirmConnectorCompletion,
         });
       } catch (err) {
         if (debug) {
@@ -357,7 +384,7 @@ function runAskInner(
           conversationId = startedEv.conversationId;
         }
       }
-      const actualModel = await latestAssistantModelSlug(page);
+      const actualModel = nativeState.report ? nativeState.report.model : await latestAssistantModelSlug(page);
       log(`actualModel=${actualModel ?? "(unknown)"} conv=${conversationId ?? "(none)"}`);
 
       if (opts.connector !== undefined && conversationId) {
@@ -372,7 +399,9 @@ function runAskInner(
       const wantedPro = (modelSlug ?? "").toLowerCase().includes("pro");
       const gotPro = (actualModel ?? "").toLowerCase().includes("pro");
       if (wantedPro && !gotPro) {
-        const msg =
+        const msg = opts.deepResearch
+          ? `Native research reports engine "${actualModel ?? "unknown"}" while the requested UI model was "${modelSlug}"; their identity mapping is unverified.`
+          :
           `cgpro asked for "${modelSlug}" but the response came from "${actualModel ?? "unknown"}" — ` +
           `the model picker did not switch. Common causes: project default model overrides, ` +
           `or a stale conversation that resumed with its previous model.`;
@@ -382,7 +411,10 @@ function runAskInner(
 
       // Always pull the DOM text — the SSE interceptor may have missed
       // the URL pattern and the DOM is the authoritative final state.
-      const domText = await readLatestAssistantText(page);
+      const domText = nativeState.report?.text ?? await readLatestAssistantText(page);
+      if (nativeState.report) {
+        emitter.push({ type: "tool", name: "native-research-report", meta: { model: nativeState.report.model, source: "widget_state" } });
+      }
 
       if (!emitter.isFinished()) {
         emitter.push({ type: "done", finalText: domText });
@@ -392,9 +424,9 @@ function runAskInner(
         .slice()
         .reverse()
         .find((e) => e.type === "done") as { finalText?: string } | undefined;
-      const finalText = (finalEvent?.finalText && finalEvent.finalText.length > 0)
+      const finalText = nativeState.report?.text ?? ((finalEvent?.finalText && finalEvent.finalText.length > 0)
         ? finalEvent.finalText
-        : domText;
+        : domText);
 
       return { conversationId, finalText, events: collected };
     } catch (err) {

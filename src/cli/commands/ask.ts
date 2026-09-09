@@ -156,6 +156,7 @@ async function runHumanMode(askOpts: AskOptions, opts: AskCliOptions): Promise<n
       if (ev.type === "started") {
         spinner.text = "Streaming…";
       } else if (ev.type === "delta") {
+        if (askOpts.deepResearch) continue;
         if (firstDelta) {
           spinner.stop();
           firstDelta = false;
@@ -171,6 +172,7 @@ async function runHumanMode(askOpts: AskOptions, opts: AskCliOptions): Promise<n
         spinner.fail(ev.message);
         return 1;
       } else if (ev.type === "done") {
+        if (askOpts.deepResearch) continue;
         spinner.stop();
         const text = ev.finalText ?? buffer;
         // Emit the final answer when:
@@ -191,6 +193,12 @@ async function runHumanMode(askOpts: AskOptions, opts: AskCliOptions): Promise<n
     }
 
     const summary = await runner.result;
+    if (askOpts.deepResearch) {
+      spinner.stop();
+      // Native app preambles are not the report; use the recovered final result.
+      const text = opts.render || opts.noStream ? renderMarkdown(summary.finalText) : summary.finalText;
+      if (text) process.stdout.write(text + "\n");
+    }
     if (summary.conversationId) {
       // Auto-thread so the next ask in this Claude Code session continues here.
       saveActiveConversationId(summary.conversationId);
