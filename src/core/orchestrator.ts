@@ -105,6 +105,7 @@ function runAskInner(
   let connectorEvidencePollInFlight: Promise<void> | null = null;
   const nativeState: { report: NativeResearchReport | null } = { report: null };
   let nextNativeReportPollAt = 0;
+  let nativeMaximumVerified = false;
 
   const result: Promise<AskResult> = (async () => {
     if (!session) {
@@ -184,10 +185,14 @@ function runAskInner(
           }
           if (modelSlug === "gpt-6-pro" || opts.deepResearch) {
             const selection = await ensureProSixMaximum(page);
+            if (opts.deepResearch) nativeMaximumVerified = true;
             emitter.push({ type: "tool", name: "model-thinking-verified", meta: selection });
           }
         },
       );
+      if (opts.deepResearch && !cancelled && !nativeMaximumVerified) {
+        throw new Error("Native research maximum UI setting was not verified before submission");
+      }
       if (opts.connector !== undefined && !cancelled) {
         emitter.push({ type: "tool", name: "prompt-submitted", meta: { connector: opts.connector } });
       }
@@ -391,14 +396,12 @@ function runAskInner(
         await pollConnectorEvidence(true);
       }
 
-      // GPT-5.5 Pro is policy. If the bubble's model slug doesn't include
-      // "pro", warn loudly to stderr — the user almost certainly wanted
-      // Pro and got the regular Thinking model. Common cause: the model
-      // picker silently kept the chat's previous default, or the project
-      // we navigated into pinned a non-Pro model.
+      // Native research uses a separate app engine. Maik approved the verified
+      // maximum UI setting as its acceptance basis (2026-09-09); retain the
+      // engine identity as provenance without claiming it is the UI model.
       const wantedPro = (modelSlug ?? "").toLowerCase().includes("pro");
       const gotPro = (actualModel ?? "").toLowerCase().includes("pro");
-      if (wantedPro && !gotPro) {
+      if (wantedPro && !gotPro && !(nativeState.report && nativeMaximumVerified)) {
         const msg = opts.deepResearch
           ? `Native research reports engine "${actualModel ?? "unknown"}" while the requested UI model was "${modelSlug}"; their identity mapping is unverified.`
           :
@@ -413,7 +416,7 @@ function runAskInner(
       // the URL pattern and the DOM is the authoritative final state.
       const domText = nativeState.report?.text ?? await readLatestAssistantText(page);
       if (nativeState.report) {
-        emitter.push({ type: "tool", name: "native-research-report", meta: { model: nativeState.report.model, source: "widget_state" } });
+        emitter.push({ type: "tool", name: "native-research-report", meta: { model: nativeState.report.model, source: "widget_state", selectionBasis: "verified-ui-maximum", uiModel: "gpt-6-pro" } });
       }
 
       if (!emitter.isFinished()) {

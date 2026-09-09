@@ -12,6 +12,7 @@ const clearComposer = vi.fn();
 const readLatestAssistantText = vi.fn();
 const sendPrompt = vi.fn();
 const setConnector = vi.fn();
+const ensureProSixMaximum = vi.fn();
 const setDeepResearch = vi.fn();
 const setWebSearch = vi.fn();
 const stopCurrentTurn = vi.fn();
@@ -22,10 +23,12 @@ const fetchLatestNativeResearchReport = vi.fn();
 const fetchNativeResearchUserNodes = vi.fn();
 
 vi.mock("../src/browser/chatgpt.js", () => ({
+  requireSelector: vi.fn(async () => ({})),
   goHome: (...args: unknown[]) => goHome(...args),
   isLoggedIn: (...args: unknown[]) => isLoggedIn(...args),
 }));
 vi.mock("../src/browser/conversation.js", () => ({
+  ensureProSixMaximum: (...args: unknown[]) => ensureProSixMaximum(...args),
   clearComposer: (...args: unknown[]) => clearComposer(...args),
   currentConversationId: (...args: unknown[]) => currentConversationId(...args),
   latestAssistantModelSlug: (...args: unknown[]) => latestAssistantModelSlug(...args),
@@ -68,7 +71,8 @@ beforeEach(() => {
   goHome.mockResolvedValue(undefined);
   isLoggedIn.mockResolvedValue(true);
   openConversation.mockResolvedValue(undefined);
-  sendPrompt.mockResolvedValue(0);
+  ensureProSixMaximum.mockResolvedValue({ model: "gpt-6-pro", power: 4 });
+  sendPrompt.mockImplementation(async (_page, _prompt, _preserve, _cancelled, guard) => { await guard?.(); return 0; });
   setWebSearch.mockResolvedValue(true);
   setConnector.mockResolvedValue(undefined);
   setDeepResearch.mockResolvedValue(true);
@@ -88,7 +92,7 @@ beforeEach(() => {
 });
 
 describe("runAskOnSession native Deep Research contract", () => {
-  it("recovers an app report while preserving the non-Pro engine mismatch guard", async () => {
+  it("accepts verified maximum UI selection while retaining the distinct native engine", async () => {
     currentConversationId.mockReturnValue("native-conversation");
     fetchLatestNativeResearchReport.mockResolvedValue({ text: "Native sourced report", model: "gpt-5-thinking", userNodeId: "new-user" });
     waitTurnComplete.mockImplementationOnce(async (_page, _timeout, _count, _stable, control) => {
@@ -99,6 +103,21 @@ describe("runAskOnSession native Deep Research contract", () => {
     const events = await collect(runner.events);
     await expect(runner.result).resolves.toMatchObject({ finalText: "Native sourced report" });
     expect(readLatestAssistantText).not.toHaveBeenCalled();
+    expect(events.some(e => e.type === "tool" && e.name === "model-mismatch")).toBe(false);
+    expect(events).toContainEqual({ type: "tool", name: "model-thinking-verified", meta: { model: "gpt-6-pro", power: 4 } });
+    expect(events).toContainEqual({ type: "tool", name: "native-research-report", meta: { model: "gpt-5-thinking", source: "widget_state", selectionBasis: "verified-ui-maximum", uiModel: "gpt-6-pro" } });
+  });
+  it("fails closed when the maximum UI verification fails", async () => {
+    ensureProSixMaximum.mockRejectedValueOnce(new Error("6 Pro thinking power did not reach its maximum"));
+    const runner = runAskOnSession({ prompt: "research", deepResearch: true, model: "gpt-6-pro", timeoutSec: 1200, headless: false }, session());
+    await collect(runner.events);
+    await expect(runner.result).rejects.toThrow("did not reach its maximum");
+    expect(waitTurnComplete).not.toHaveBeenCalled();
+  });
+  it("retains the ordinary planning non-Pro model guard", async () => {
+    latestAssistantModelSlug.mockResolvedValue("gpt-5-thinking");
+    const runner = runAskOnSession({ prompt: "plan", model: "gpt-6-pro", timeoutSec: 1200, headless: false }, session());
+    const events = await collect(runner.events); await runner.result;
     expect(events).toContainEqual({ type: "tool", name: "model-mismatch", meta: { wanted: "gpt-6-pro", got: "gpt-5-thinking" } });
   });
   it("rejects the old report while the new submitted turn has not persisted", async () => {
