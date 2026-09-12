@@ -3,6 +3,12 @@ import type { Page } from "patchright";
 import type { Session } from "../src/browser/session.js";
 import type { StreamEvent } from "../src/core/stream.js";
 
+const requireAccount = vi.fn();
+const verifyFiling = vi.fn();
+vi.mock("../src/api/conversation-filing.js", () => ({
+  requireAccount: (...args: unknown[]) => requireAccount(...args),
+  verifyFiling: (...args: unknown[]) => verifyFiling(...args),
+}));
 const goHome = vi.fn();
 const isLoggedIn = vi.fn();
 const currentConversationId = vi.fn();
@@ -66,6 +72,8 @@ function session(): Session {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  requireAccount.mockReset().mockResolvedValue(undefined);
+  verifyFiling.mockReset().mockResolvedValue({ status: "unavailable", conversationId: "id", projectId: null, accountVerified: false });
   fetchNativeResearchUserNodes.mockResolvedValue(new Set());
   fetchLatestNativeResearchReport.mockResolvedValue(null);
   goHome.mockResolvedValue(undefined);
@@ -497,5 +505,34 @@ describe("runAskOnSession wait failure propagation", () => {
     await expect(runner.result).resolves.toMatchObject({ finalText: "" });
     expect(stopCurrentTurn).toHaveBeenCalledTimes(1);
     expect(await collect(runner.events)).toEqual([{ type: "done", finalText: "" }]);
+  });
+});
+
+
+describe("account and Project filing contract", () => {
+  const opts = { prompt: "plan", model: "gpt-6-pro", timeoutSec: 1200, headless: false, gizmoId: "g-p-fixture", expectedAccountEmail: "fixture@example.com" };
+  it("refuses account mismatch before any prompt submission", async () => {
+    requireAccount.mockRejectedValueOnce(new Error("account mismatch"));
+    const runner = runAskOnSession(opts, session());
+    await collect(runner.events);
+    await expect(runner.result).rejects.toThrow("account mismatch");
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+  it("refuses a resumed chat outside the expected Project before sending", async () => {
+    verifyFiling.mockResolvedValue({ status: "mismatch" });
+    const runner = runAskOnSession({ ...opts, conversationId: "existing" }, session());
+    await collect(runner.events);
+    await expect(runner.result).rejects.toThrow("Project membership not verified before submission");
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+  it("retains completed output when post-submit filing cannot be verified", async () => {
+    currentConversationId.mockReturnValue("id");
+    readLatestAssistantText.mockResolvedValue("completed answer");
+    const runner = runAskOnSession(opts, session());
+    await collect(runner.events);
+    const result = await runner.result;
+    expect(result.finalText).toBe("completed answer");
+    expect(result.filing).toMatchObject({ status: "unavailable", preSubmitVerified: true });
+    expect(sendPrompt).toHaveBeenCalledTimes(1);
   });
 });

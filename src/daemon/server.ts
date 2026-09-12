@@ -38,6 +38,7 @@ import {
   turnIsWorking,
 } from "../browser/conversation.js";
 import { detectPlan, fetchMe, type MeResponse } from "../api/me.js";
+import { archiveSavedConversation } from "../api/conversation-filing.js";
 import { fetchModels, findProSlug, type ChatgptModel } from "../api/models.js";
 import { runAskOnSession, type AskOptions, type AskRunner } from "../core/orchestrator.js";
 import { NotLoggedInError } from "../errors.js";
@@ -536,6 +537,39 @@ export async function handleRequest(
     return;
   }
 
+  if (method === "POST" && url.pathname === "/archive-saved") {
+    let body: { conversationId: string; projectId: string; expectedEmail: string; fingerprint: string } | null;
+    try {
+      state.readerBudget.acquire();
+    } catch {
+      res.writeHead(429); res.end(JSON.stringify({ error: "reader_budget_exceeded" })); return;
+    }
+    try {
+      body = await readJsonBody(req);
+    } catch {
+      res.writeHead(400); res.end(JSON.stringify({ error: "invalid_request" })); return;
+    } finally { state.readerBudget.release(); }
+    if (!body || typeof body.conversationId !== "string" || !/^[0-9a-f-]{36}$/i.test(body.conversationId) ||
+        typeof body.projectId !== "string" ||
+        !/^g-p-[A-Za-z0-9_-]+$/.test(body.projectId ?? "") ||
+        typeof body.expectedEmail !== "string" || body.expectedEmail.length > 320 || !body.expectedEmail.includes("@") ||
+        typeof body.fingerprint !== "string" ||
+        !/^[a-f0-9]{64}$/.test(body.fingerprint ?? "")) {
+      res.writeHead(400); res.end(JSON.stringify({ error: "invalid_archive_identity" })); return;
+    }
+    if (!state.queue.tryAcquire()) {
+      res.writeHead(409); res.end(JSON.stringify({ error: "lane_busy" })); return;
+    }
+    try {
+      const filing = await archiveSavedConversation(state.session.page, body);
+      res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(filing));
+    } catch (error) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: (error as Error).message }));
+    } finally { state.queue.release(); }
+    return;
+  }
+
   if (method === "POST" && url.pathname === "/reload") {
     let body: { conversationId?: string } | null;
     try {
@@ -667,7 +701,8 @@ export async function handleAsk(
     )) ||
     (body.gizmoShortUrl !== undefined && (
       typeof body.gizmoShortUrl !== "string" || !/^[A-Za-z0-9_-]+$/.test(body.gizmoShortUrl)
-    ))
+    )) || (body.expectedAccountEmail !== undefined &&
+      (typeof body.expectedAccountEmail !== "string" || body.expectedAccountEmail.length > 320 || !body.expectedAccountEmail.includes("@")))
   ) {
     res.writeHead(400, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "invalid_project_identity" }));
@@ -729,6 +764,7 @@ export async function handleAsk(
       images: body.images ?? [],
       conversationId: body.conversationId,
       gizmoId: body.gizmoId,
+      expectedAccountEmail: body.expectedAccountEmail,
       gizmoShortUrl: body.gizmoShortUrl,
       timeoutSec,
       invocationId: typeof body.invocationId === "string" ? body.invocationId : undefined,
@@ -774,6 +810,7 @@ export async function handleAsk(
         writeEvent("summary", {
           conversationId: summary.conversationId,
           finalText: summary.finalText,
+          filing: summary.filing,
         });
         res.end();
       }

@@ -1,3 +1,4 @@
+import type { FilingProof } from "../api/conversation-filing.js";
 /**
  * Daemon wire format. Kept tiny and string-only so the client and server
  * can stay decoupled — the daemon process and the CLI are separate Node
@@ -110,11 +111,13 @@ export interface AskRequest {
   gizmoShortUrl?: string;
   /** Stable facade invocation ID used for exact cancellation. */
   invocationId?: string;
+  expectedAccountEmail?: string;
   /** Per-turn cap. Daemon clamps to 14,400 seconds. */
   timeoutSec: number;
 }
 
 export interface AskSummary {
+  filing?: FilingProof;
   conversationId: string | null;
   finalText: string;
 }

@@ -21,6 +21,7 @@ import {
   type StreamEvent,
 } from "./stream.js";
 import { NotLoggedInError } from "../errors.js";
+import { requireAccount, verifyFiling, type FilingProof } from "../api/conversation-filing.js";
 import { SELECTORS as SELECTORS_DUMP } from "../browser/selectors.js";
 import { fetchLatestTurnConnectorState, fetchLatestTurnToolCalls, fetchLatestNativeResearchReport, fetchNativeResearchUserNodes, type NativeResearchReport } from "../api/conversations.js";
 
@@ -55,12 +56,14 @@ export interface AskOptions {
   consumeReload?: () => string | null;
   /** Stable facade invocation ID used for exact cancellation attribution. */
   invocationId?: string;
+  expectedAccountEmail?: string;
 }
 
 export interface AskResult {
   conversationId: string | null;
   finalText: string;
   events: StreamEvent[];
+  filing?: FilingProof;
 }
 
 export interface AskRunner {
@@ -132,6 +135,7 @@ function runAskInner(
         throw new NotLoggedInError();
       }
       log("isLoggedIn ✓");
+      if (opts.expectedAccountEmail) await requireAccount(page, opts.expectedAccountEmail);
 
       // Model resolution:
       // - If caller passed --model, use it verbatim (chatgpt.com falls
@@ -151,6 +155,17 @@ function runAskInner(
         gizmoShortUrl: opts.gizmoShortUrl,
       });
       log(`openConversation done, url=${page.url()}`);
+      if (opts.gizmoId && opts.expectedAccountEmail) {
+        // New Project navigation is checked by openConversation. A resumed chat
+        // must also prove actual membership before it receives another prompt.
+        await requireAccount(page, opts.expectedAccountEmail);
+        if (opts.conversationId) {
+          const prior = await verifyFiling(page, opts.conversationId, opts.gizmoId, opts.expectedAccountEmail);
+          if (prior.status !== "verified") throw new Error("ChatGPT Project membership not verified before submission");
+        }
+        emitter.push({ type: "tool", name: "filing-context-verified", meta: { projectId: opts.gizmoId, accountVerified: true } });
+      }
+
 
       if (opts.deepResearch) {
         await clearComposer(page);
@@ -431,7 +446,11 @@ function runAskInner(
         ? finalEvent.finalText
         : domText);
 
-      return { conversationId, finalText, events: collected };
+      const filing = conversationId && opts.gizmoId && opts.expectedAccountEmail
+        ? await verifyFiling(page, conversationId, opts.gizmoId, opts.expectedAccountEmail)
+        : undefined;
+      if (filing) filing.preSubmitVerified = true;
+      return { conversationId, finalText, events: collected, filing };
     } catch (err) {
       const message = (err as Error).message ?? String(err);
       emitter.push({ type: "error", message });
