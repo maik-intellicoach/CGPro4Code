@@ -40,6 +40,7 @@ describe("extractLatestTurnToolNames", () => {
 
     expect(extractLatestTurnToolNames(body, "p035-low-risk-workstation")).toEqual(["search_context"]);
     expect(extractLatestTurnToolNames(body, "wrong-connector")).toEqual([]);
+    expect(extractLatestTurnConnectorState(body).currentUserNodeId).toBe("new-user");
   });
 
   it("rejects a correct tool tail from the wrong or missing connector app", () => {

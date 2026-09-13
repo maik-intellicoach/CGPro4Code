@@ -23,7 +23,7 @@ import {
 import { NotLoggedInError } from "../errors.js";
 import { requireAccount, verifyFiling, type FilingProof } from "../api/conversation-filing.js";
 import { SELECTORS as SELECTORS_DUMP } from "../browser/selectors.js";
-import { fetchLatestTurnConnectorState, fetchLatestTurnToolCalls, fetchLatestNativeResearchReport, fetchNativeResearchUserNodes, type NativeResearchReport } from "../api/conversations.js";
+import { fetchLatestTurnConnectorState, type LatestTurnConnectorState, fetchLatestNativeResearchReport, fetchNativeResearchUserNodes, type NativeResearchReport } from "../api/conversations.js";
 
 const CONNECTOR_EVIDENCE_POLL_MS = 30_000;
 const CONNECTOR_EVIDENCE_RATE_LIMIT_BACKOFF_MS = 120_000;
@@ -103,7 +103,9 @@ function runAskInner(
   let session: Session | null = providedSession;
   let cancelled = false;
   const observedConnectorCallIds = new Set<string>();
-  let lastConnectorEvidencePollAt = 0;
+  let lastConnectorEvidencePollAt = -Infinity;
+  let connectorSnapshot: LatestTurnConnectorState | null = null;
+  let connectorCompletionConfirmed = false;
   let connectorEvidenceBackoffUntil = 0;
   let connectorEvidencePollInFlight: Promise<void> | null = null;
   const nativeState: { report: NativeResearchReport | null } = { report: null };
@@ -186,7 +188,7 @@ function runAskInner(
       await attachImages(page, opts.images ?? []);
 
       // A stale GET after Send must never satisfy this run with an old report.
-      const existingNativeConversation = opts.deepResearch
+      const existingNativeConversation = opts.deepResearch || opts.connector !== undefined
         ? currentConversationId(page) ?? opts.conversationId : null;
       const priorNativeUsers = existingNativeConversation
         ? await fetchNativeResearchUserNodes(page, existingNativeConversation) : new Set<string>();
@@ -228,10 +230,11 @@ function runAskInner(
         const conversationId = currentConversationId(page) ??
           (started?.type === "started" ? started.conversationId ?? null : null);
         if (!conversationId) return;
-        if (!force) lastConnectorEvidencePollAt = now;
-        let calls;
+        lastConnectorEvidencePollAt = now;
+        connectorSnapshot = null;
+        let state;
         try {
-          calls = await fetchLatestTurnToolCalls(
+          state = await fetchLatestTurnConnectorState(
             page,
             conversationId,
             opts.connector,
@@ -244,11 +247,18 @@ function runAskInner(
         } catch (err) {
           if (force) throw err;
           if (err instanceof Error && err.message.includes("HTTP 429")) {
-            connectorEvidenceBackoffUntil = Date.now() + CONNECTOR_EVIDENCE_RATE_LIMIT_BACKOFF_MS;
+            const retryAfterMs = (err as Error & { retryAfterMs?: number }).retryAfterMs;
+            connectorEvidenceBackoffUntil = Date.now() + Math.max(
+              CONNECTOR_EVIDENCE_RATE_LIMIT_BACKOFF_MS,
+              typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) ? retryAfterMs : 0,
+            );
           }
           return;
         }
-        for (const call of calls) {
+        // A resumed conversation GET can lag Send and still expose an old turn.
+        if (!state.currentUserNodeId || priorNativeUsers.has(state.currentUserNodeId)) return;
+        connectorSnapshot = state;
+        for (const call of state.calls) {
           if (observedConnectorCallIds.has(call.id)) continue;
           observedConnectorCallIds.add(call.id);
           emitter.push({
@@ -260,41 +270,29 @@ function runAskInner(
       };
 
       const pollConnectorEvidence = async (force = false): Promise<void> => {
-        if (force) {
-          if (connectorEvidencePollInFlight) {
-            await new Promise<void>((resolve) => {
-              const timer = setTimeout(resolve, 2_500);
-              connectorEvidencePollInFlight?.catch(() => undefined).finally(() => {
-                clearTimeout(timer);
-                resolve();
-              });
-            });
-          }
-          await runConnectorEvidencePoll(true);
-          return;
+        if (connectorEvidencePollInFlight) await connectorEvidencePollInFlight;
+        if (force && connectorCompletionConfirmed) return;
+        if (force && Date.now() < connectorEvidenceBackoffUntil) {
+          throw new Error("conversation connector state fetch deferred after HTTP 429");
         }
-        if (connectorEvidencePollInFlight) return;
-        connectorEvidencePollInFlight = runConnectorEvidencePoll(false)
+        if (connectorEvidencePollInFlight) return connectorEvidencePollInFlight;
+        connectorEvidencePollInFlight = runConnectorEvidencePoll(force)
           .finally(() => { connectorEvidencePollInFlight = null; });
+        await connectorEvidencePollInFlight;
       };
 
       const confirmConnectorCompletion = async (): Promise<boolean> => {
         if (opts.connector === undefined || cancelled) return true;
-        const started = collected.find((event) => event.type === "started");
-        const conversationId = currentConversationId(page) ??
-          (started?.type === "started" ? started.conversationId ?? null : null);
-        if (!conversationId) return false;
-        const state = await fetchLatestTurnConnectorState(
-          page,
-          conversationId,
-          opts.connector,
-          10_000,
-        );
-        return state.currentRole === "assistant" &&
+        // Tools and DOM-completion candidates share one bounded GET and backoff.
+        await pollConnectorEvidence();
+        const state = connectorSnapshot;
+        connectorCompletionConfirmed = state !== null &&
+          state.currentRole === "assistant" &&
           state.currentStatus === "finished_successfully" &&
           state.currentEndTurn === true &&
           state.currentContentType === "text" &&
           !state.currentIsThinkingPreamble;
+        return connectorCompletionConfirmed;
       };
 
       // Wait for the turn to settle. The SSE interceptor will normally push
@@ -375,7 +373,16 @@ function runAskInner(
             log(`debug diagnostics unavailable: ${(diagnosticErr as Error).message}`);
           }
         }
-        if (!cancelled) throw err;
+        if (!cancelled) {
+          if (!collected.some(e => e.type === "delta" || e.type === "done")) {
+            const count = await page.locator(SELECTORS_DUMP.assistantMessages.join(", ")).count().catch(() => 0);
+            if (count > priorBubbles) {
+              const partial = await readLatestAssistantText(page).catch(() => "");
+              if (partial) emitter.push({ type: "delta", text: partial });
+            }
+          }
+          throw err;
+        }
       }
       log(`waitTurnComplete done, url=${page.url()}`);
 
@@ -408,7 +415,14 @@ function runAskInner(
       log(`actualModel=${actualModel ?? "(unknown)"} conv=${conversationId ?? "(none)"}`);
 
       if (opts.connector !== undefined && conversationId) {
-        await pollConnectorEvidence(true);
+        try { await pollConnectorEvidence(true); }
+        catch (error) {
+          if (!collected.some(e => e.type === "delta" || e.type === "done")) {
+            const partial = await readLatestAssistantText(page).catch(() => "");
+            if (partial) emitter.push({ type: "delta", text: partial });
+          }
+          throw error;
+        }
       }
 
       // Native research uses a separate app engine. Maik approved the verified

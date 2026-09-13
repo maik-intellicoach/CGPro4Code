@@ -41,6 +41,7 @@ export interface ConnectorToolCall {
 
 export interface LatestTurnConnectorState {
   calls: ConnectorToolCall[];
+  currentUserNodeId: string | null;
   currentRole: string | null;
   currentStatus: string | null;
   currentEndTurn: boolean | null;
@@ -108,7 +109,17 @@ export function extractLatestTurnConnectorState(
   const currentAuthor = asObject(currentMessage?.author);
   const currentContent = asObject(currentMessage?.content);
   const currentMetadata = asObject(currentMessage?.metadata);
+  let userNodeId = currentNodeId;
+  const seen = new Set<string>();
+  while (mapping && userNodeId && !seen.has(userNodeId)) {
+    seen.add(userNodeId);
+    const node = asObject(mapping[userNodeId]);
+    if (asObject(asObject(node?.message)?.author)?.role === "user") break;
+    userNodeId = typeof node?.parent === "string" ? node.parent : null;
+  }
+  if (!mapping || (userNodeId && asObject(asObject(asObject(mapping[userNodeId])?.message)?.author)?.role !== "user")) userNodeId = null;
   return {
+    currentUserNodeId: userNodeId,
     calls: extractLatestTurnToolCalls(body, expectedAppName),
     currentRole: typeof currentAuthor?.role === "string" ? currentAuthor.role : null,
     currentStatus: typeof currentMessage?.status === "string" ? currentMessage.status : null,
@@ -218,7 +229,7 @@ function parseRetryAfterMs(value: string | null | undefined): number | null {
 
 function corroborationRetryDelayMs(attempt: number, retryAfter: string | null | undefined): number {
   const advertised = parseRetryAfterMs(retryAfter);
-  if (advertised !== null) return Math.min(advertised, CORROBORATION_MAX_DELAY_MS);
+  if (advertised !== null) return advertised;
   const backoff = Math.min(CORROBORATION_BASE_DELAY_MS * 2 ** (attempt - 1), CORROBORATION_MAX_DELAY_MS);
   return backoff + Math.random() * CORROBORATION_JITTER_MS;
 }
@@ -233,13 +244,15 @@ async function fetchConversationForCorroboration(
   conversationId: string,
   timeoutMs: number,
   retryTransient: boolean,
-): Promise<{ ok: boolean; status: number; body: unknown }> {
+): Promise<{ ok: boolean; status: number; body: unknown; retryAfter?: string | null }> {
   const url = `/backend-api/conversation/${conversationId}`;
   let result = await backendApiFetch(page, url, { timeoutMs });
   const attempts = retryTransient ? CORROBORATION_MAX_ATTEMPTS : 1;
   for (let attempt = 1; attempt < attempts; attempt++) {
     if (result.ok || (result.status !== 429 && result.status < 500)) break;
     const delayMs = corroborationRetryDelayMs(attempt, result.retryAfter);
+    // A bounded read may give up, but must never retry before Retry-After.
+    if (delayMs > CORROBORATION_MAX_DELAY_MS + CORROBORATION_JITTER_MS) break;
     await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
     result = await backendApiFetch(page, url, { timeoutMs });
   }
@@ -269,7 +282,7 @@ export async function fetchLatestTurnConnectorState(
 ): Promise<LatestTurnConnectorState> {
   const result = await fetchConversationForCorroboration(page, conversationId, timeoutMs, retryTransient);
   if (!result.ok) {
-    throw new Error(`conversation connector state fetch failed with HTTP ${result.status}`);
+    throw Object.assign(new Error(`conversation connector state fetch failed with HTTP ${result.status}`), { retryAfterMs: parseRetryAfterMs(result.retryAfter) });
   }
   return extractLatestTurnConnectorState(result.body, expectedAppName);
 }

@@ -598,6 +598,21 @@ async function assertConnectorAttached(page: Page, connectorName: string): Promi
  * Actual tool use remains a separate postcondition for the caller because
  * a successful attachment does not prove that the model invoked the tool.
  */
+async function clickConnector(page: Page, row: Locator, name: string): Promise<void> {
+  try {
+    await row.click({ timeout: 5_000 });
+  } catch (error) {
+    // ChatGPT can replace the @ results between observation and click. Resolve
+    // one fresh exact row; never force-click through a popover or toggle off an
+    // attachment that mounted while the first click was timing out.
+    if (!(error instanceof Error) || !error.message.includes("Timeout")) throw error;
+    const refreshed = await waitForComposerTool(page, name);
+    if (!refreshed) throw error;
+    if (await attachedState(refreshed)) return;
+    await refreshed.click({ timeout: 5_000 });
+  }
+}
+
 export async function setConnector(page: Page, name: string): Promise<void> {
   const connectorName = name.trim();
   if (!connectorName) throw new Error("connector name must not be empty");
@@ -616,7 +631,7 @@ export async function setConnector(page: Page, name: string): Promise<void> {
       await page.keyboard.press("Escape").catch(() => undefined);
       return;
     }
-    await connector.click({ timeout: 5_000 });
+    await clickConnector(page, connector, connectorName);
     await page.waitForTimeout(300);
     await assertConnectorAttached(page, connectorName);
     return;
@@ -692,11 +707,12 @@ export async function setConnector(page: Page, name: string): Promise<void> {
   }
 
   try {
-    await connector.click({ timeout: 5_000 });
-  } catch {
+    await clickConnector(page, connector, connectorName);
+  } catch (error) {
     await recordConnectorDiagnostics(page);
     await page.keyboard.press("Escape").catch(() => undefined);
-    throw new Error(`ChatGPT connector "${connectorName}" was visible but could not be selected.`);
+    const reason = error instanceof Error ? error.message.split("\n")[0].slice(0, 200) : "unknown click error";
+    throw new Error(`ChatGPT connector "${connectorName}" was visible but could not be selected: ${reason}`, { cause: error });
   }
   await page.waitForTimeout(300);
   await assertConnectorAttached(page, connectorName);

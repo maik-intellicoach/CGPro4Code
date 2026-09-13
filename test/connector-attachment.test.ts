@@ -371,3 +371,25 @@ describe("connector selection honest attachment (P-035)", () => {
     expect(plus.click).toHaveBeenCalledTimes(1); // popover reopened once
   });
 });
+
+it("re-resolves a replaced picker row without replaying the stale locator", async () => {
+  const { page, setRows } = makePage();
+  const attached: FakeRow = { label: "connector", visible: true, attrs: { "aria-checked": "true" } };
+  const replacement: FakeRow = { label: "connector", visible: true, onSelected: () => setRows([attached]) };
+  setRows([{ label: "connector", visible: true, onSelected: () => {
+    setRows([replacement]);
+    throw new Error("locator.click: Timeout 5000ms exceeded.");
+  } }]);
+  await expect(setConnector(page, "connector")).resolves.toBeUndefined();
+  expect(page.clickedLabels).toEqual(["connector", "connector"]);
+});
+
+it("does not toggle off an attachment that mounted during a timed-out click", async () => {
+  const { page, setRows } = makePage();
+  setRows([{ label: "connector", visible: true, onSelected: () => {
+    setRows([{ label: "connector", visible: true, attrs: { "aria-checked": "true" } }]);
+    throw new Error("locator.click: Timeout 5000ms exceeded.");
+  } }]);
+  await expect(setConnector(page, "connector")).resolves.toBeUndefined();
+  expect(page.clickedLabels).toEqual(["connector"]);
+});

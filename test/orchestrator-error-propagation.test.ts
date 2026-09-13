@@ -23,7 +23,6 @@ const setDeepResearch = vi.fn();
 const setWebSearch = vi.fn();
 const stopCurrentTurn = vi.fn();
 const waitTurnComplete = vi.fn();
-const fetchLatestTurnToolCalls = vi.fn();
 const fetchLatestTurnConnectorState = vi.fn();
 const fetchLatestNativeResearchReport = vi.fn();
 const fetchNativeResearchUserNodes = vi.fn();
@@ -50,7 +49,6 @@ vi.mock("../src/browser/conversation.js", () => ({
 vi.mock("../src/api/conversations.js", () => ({
   fetchNativeResearchUserNodes: (...args: unknown[]) => fetchNativeResearchUserNodes(...args),
   fetchLatestNativeResearchReport: (...args: unknown[]) => fetchLatestNativeResearchReport(...args),
-  fetchLatestTurnToolCalls: (...args: unknown[]) => fetchLatestTurnToolCalls(...args),
   fetchLatestTurnConnectorState: (...args: unknown[]) => fetchLatestTurnConnectorState(...args),
 }));
 
@@ -65,7 +63,7 @@ async function collect(events: AsyncIterable<StreamEvent>): Promise<StreamEvent[
 function session(): Session {
   return {
     context: {},
-    page: { url: () => "https://chatgpt.com/" } as unknown as Page,
+    page: { url: () => "https://chatgpt.com/", locator: () => ({ count: async () => 1 }) } as unknown as Page,
     close: vi.fn(async () => {}),
   } as unknown as Session;
 }
@@ -88,8 +86,8 @@ beforeEach(() => {
   currentConversationId.mockReturnValue(null);
   latestAssistantModelSlug.mockResolvedValue(null);
   readLatestAssistantText.mockResolvedValue("");
-  fetchLatestTurnToolCalls.mockResolvedValue([]);
-  fetchLatestTurnConnectorState.mockResolvedValue({
+  fetchLatestTurnConnectorState.mockReset().mockResolvedValue({
+    currentUserNodeId: "new-user",
     calls: [],
     currentRole: "assistant",
     currentStatus: "finished_successfully",
@@ -238,11 +236,11 @@ describe("runAskOnSession connector contract", () => {
     waitTurnComplete.mockResolvedValueOnce(undefined);
     currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
     readLatestAssistantText.mockResolvedValueOnce("grounded");
-    fetchLatestTurnToolCalls.mockResolvedValueOnce([
+    fetchLatestTurnConnectorState.mockResolvedValueOnce({ currentUserNodeId: "new-user", calls: [
       { id: "call-1", name: "search_context" },
       { id: "call-2", name: "search_context" },
       { id: "call-3", name: "fetch_excerpt" },
-    ]);
+    ] });
     const activeSession = session();
     const runner = runAskOnSession(
       {
@@ -257,7 +255,7 @@ describe("runAskOnSession connector contract", () => {
     const result = runner.result;
     const events = await collect(runner.events);
     await expect(result).resolves.toMatchObject({ finalText: "grounded" });
-    expect(fetchLatestTurnToolCalls).toHaveBeenCalledWith(
+    expect(fetchLatestTurnConnectorState).toHaveBeenCalledWith(
       activeSession.page,
       "11111111-1111-1111-1111-111111111111",
       "p035-low-risk-workstation",
@@ -277,21 +275,21 @@ describe("runAskOnSession connector contract", () => {
 
   it("rate-limits active branch evidence and performs one final fetch", async () => {
     currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
-    fetchLatestTurnToolCalls.mockResolvedValue([
+    fetchLatestTurnConnectorState.mockResolvedValue({ currentUserNodeId: "new-user", calls: [
       { id: "active-call-1", name: "search_context" },
-    ]);
+    ] });
     const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
     waitTurnComplete.mockImplementationOnce(
       async (_page, _timeout, _prior, _stable, control: { pollEvidence?: () => Promise<void> }) => {
         await control.pollEvidence?.();
-        await vi.waitFor(() => expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(1));
+        await vi.waitFor(() => expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(1));
         await Promise.resolve();
         clock.mockReturnValue(1_029_999);
         await control.pollEvidence?.();
-        expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(1);
+        expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(1);
         clock.mockReturnValue(1_030_000);
         await control.pollEvidence?.();
-        await vi.waitFor(() => expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(2));
+        await vi.waitFor(() => expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(2));
         await Promise.resolve();
       },
     );
@@ -309,27 +307,27 @@ describe("runAskOnSession connector contract", () => {
     const events = await collect(runner.events);
     await expect(runner.result).resolves.toMatchObject({ finalText: "grounded" });
     expect(events.filter((event) => event.type === "tool" && event.name === "search_context")).toHaveLength(1);
-    expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(3);
+    expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(3);
     clock.mockRestore();
   });
 
   it("backs active evidence polling off for two minutes after HTTP 429", async () => {
     currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
-    fetchLatestTurnToolCalls
-      .mockRejectedValueOnce(new Error("conversation tool evidence fetch failed with HTTP 429"))
-      .mockResolvedValue([]);
+    fetchLatestTurnConnectorState
+      .mockRejectedValueOnce(new Error("conversation connector state fetch failed with HTTP 429"))
+      .mockResolvedValue({ currentUserNodeId: "new-user", calls: [] });
     const clock = vi.spyOn(Date, "now").mockReturnValue(2_000_000);
     waitTurnComplete.mockImplementationOnce(
       async (_page, _timeout, _prior, _stable, control: { pollEvidence?: () => Promise<void> }) => {
         await control.pollEvidence?.();
-        await vi.waitFor(() => expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(1));
+        await vi.waitFor(() => expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(1));
         await Promise.resolve();
         clock.mockReturnValue(2_060_000);
         await control.pollEvidence?.();
-        expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(1);
+        expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(1);
         clock.mockReturnValue(2_120_000);
         await control.pollEvidence?.();
-        await vi.waitFor(() => expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(2));
+        await vi.waitFor(() => expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(2));
         await Promise.resolve();
       },
     );
@@ -340,15 +338,16 @@ describe("runAskOnSession connector contract", () => {
 
     await expect(runner.result).resolves.toMatchObject({ finalText: "" });
     expect(await collect(runner.events)).toContainEqual(expect.objectContaining({ type: "done" }));
-    expect(fetchLatestTurnToolCalls).toHaveBeenCalledTimes(3);
+    expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(3);
     clock.mockRestore();
   });
 
-  it("propagates a terminal conversation-evidence rate limit instead of reporting no connector use", async () => {
+  it("retains the finished answer as partial while failing terminal evidence verification", async () => {
+    readLatestAssistantText.mockResolvedValue("finished answer");
     currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
     waitTurnComplete.mockResolvedValueOnce(undefined);
-    fetchLatestTurnToolCalls.mockRejectedValueOnce(
-      new Error("conversation tool evidence fetch failed with HTTP 429"),
+    fetchLatestTurnConnectorState.mockRejectedValueOnce(
+      new Error("conversation connector state fetch failed with HTTP 429"),
     );
     const runner = runAskOnSession(
       {
@@ -360,11 +359,44 @@ describe("runAskOnSession connector contract", () => {
       session(),
     );
 
-    await expect(runner.result).rejects.toThrow("conversation tool evidence fetch failed with HTTP 429");
-    expect(await collect(runner.events)).toContainEqual({
-      type: "error",
-      message: "conversation tool evidence fetch failed with HTTP 429",
+    await expect(runner.result).rejects.toThrow("conversation connector state fetch failed with HTTP 429");
+    const events = await collect(runner.events);
+    expect(events).toContainEqual({ type: "delta", text: "finished answer" });
+    expect(events).toContainEqual({ type: "error", message: "conversation connector state fetch failed with HTTP 429" });
+    expect(events.some(e => e.type === "done")).toBe(false);
+  });
+
+  it("coalesces completion with polling and skips a redundant terminal GET", async () => {
+    currentConversationId.mockReturnValue("conversation");
+    waitTurnComplete.mockImplementationOnce(async (_p, _t, _n, _s, control) => {
+      await Promise.all([control.pollEvidence(), control.confirmComplete()]);
+      expect(await control.confirmComplete()).toBe(true);
+      expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(1);
     });
+    const runner = runAskOnSession({ prompt: "test", connector: "connector", timeoutSec: 1200, headless: false }, session());
+    await runner.result;
+    expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(1);
+  });
+
+  it("completion cannot bypass Retry-After or accept a stale resumed turn", async () => {
+    currentConversationId.mockReturnValue("conversation");
+    fetchNativeResearchUserNodes.mockResolvedValueOnce(new Set(["new-user"]));
+    fetchLatestTurnConnectorState.mockRejectedValueOnce(Object.assign(new Error("HTTP 429"), { retryAfterMs: 600_000 }));
+    const clock = vi.spyOn(Date, "now").mockReturnValue(3_000_000);
+    waitTurnComplete.mockImplementationOnce(async (_p, _t, _n, _s, control) => {
+      expect(await control.confirmComplete()).toBe(false);
+      clock.mockReturnValue(3_120_000);
+      await control.pollEvidence();
+      expect(await control.confirmComplete()).toBe(false);
+      expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(1);
+      clock.mockReturnValue(3_600_000);
+      expect(await control.confirmComplete()).toBe(false);
+      expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(2);
+      throw new Error("still awaiting current turn");
+    });
+    const runner = runAskOnSession({ prompt: "test", connector: "connector", timeoutSec: 1200, headless: false }, session());
+    await expect(runner.result).rejects.toThrow("still awaiting current turn");
+    clock.mockRestore();
   });
 
   it("fails before sending when the required connector cannot be selected", async () => {

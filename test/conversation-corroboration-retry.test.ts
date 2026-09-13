@@ -153,16 +153,12 @@ describe("conversation corroboration retry", () => {
     await expect(calls).resolves.toEqual([{ id: "call-1", name: "search_context" }]);
   });
 
-  it("caps an absurd Retry-After at the maximum delay", async () => {
-    backendApiFetch
-      .mockResolvedValueOnce(response(429, "600"))
-      .mockResolvedValueOnce(response(200));
-
-    const calls = fetchLatestTurnToolCalls(page, CONVERSATION_ID, "connector");
-
-    await vi.advanceTimersByTimeAsync(8_000);
-    expect(backendApiFetch).toHaveBeenCalledTimes(2);
-    await expect(calls).resolves.toHaveLength(1);
+  it("gives up a bounded read rather than retrying before a long Retry-After", async () => {
+    backendApiFetch.mockResolvedValueOnce(response(429, "600"));
+    const assertion = expect(fetchLatestTurnToolCalls(page, CONVERSATION_ID, "connector")).rejects.toThrow("HTTP 429");
+    await vi.runAllTimersAsync();
+    await assertion;
+    expect(backendApiFetch).toHaveBeenCalledTimes(1);
   });
 
   it("does not retry when the caller opts out", async () => {
