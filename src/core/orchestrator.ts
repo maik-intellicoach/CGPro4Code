@@ -246,7 +246,9 @@ function runAskInner(
             force,
           );
         } catch (err) {
-          if (force) throw err;
+          // Unlike rate limits, a denied/missing conversation cannot recover
+          // through progress polling; surface it and preserve partial output.
+          if (force || (err instanceof Error && /\bHTTP 4(?!29)\d{2}\b/.test(err.message))) throw err;
           if (err instanceof Error && err.message.includes("HTTP 429")) {
             const retryAfterMs = (err as Error & { retryAfterMs?: number }).retryAfterMs;
             connectorEvidenceBackoffUntil = Date.now() + Math.max(

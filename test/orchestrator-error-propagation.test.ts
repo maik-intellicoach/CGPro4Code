@@ -400,6 +400,22 @@ describe("runAskOnSession connector contract", () => {
     clock.mockRestore();
   });
 
+  it("fails permanent completion verification while retaining only the new answer", async () => {
+    currentConversationId.mockReturnValue("conversation");
+    readLatestAssistantText.mockResolvedValue("new answer");
+    fetchLatestTurnConnectorState.mockRejectedValueOnce(new Error("conversation connector state fetch failed with HTTP 403"));
+    waitTurnComplete.mockImplementationOnce(async (_p, _t, _n, _s, control) => {
+      await control.confirmComplete();
+      throw new Error("permanent error was swallowed");
+    });
+    const runner = runAskOnSession({ prompt: "test", connector: "connector", timeoutSec: 1200, headless: false }, session());
+    await expect(runner.result).rejects.toThrow("HTTP 403");
+    const events = await collect(runner.events);
+    expect(events).toContainEqual({ type: "delta", text: "new answer" });
+    expect(events.some(e => e.type === "done")).toBe(false);
+    expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(1);
+  });
+
   it("fails before sending when the required connector cannot be selected", async () => {
     setConnector.mockRejectedValueOnce(new Error("connector unavailable"));
     const runner = runAskOnSession(

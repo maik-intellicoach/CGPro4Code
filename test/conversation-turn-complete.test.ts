@@ -54,6 +54,22 @@ describe("waitTurnComplete error classification", () => {
     })).rejects.toBeInstanceOf(TurnTimeoutError);
     expect(goto).toHaveBeenCalledTimes(1);
   });
+  it.each([false, true])("settles an expired non-working answer with verification=%s after one reload", async (confirmed) => {
+    let now = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const bubble = { getAttribute: async () => null, innerText: async () => "Finished answer" };
+    const goto = vi.fn(async () => {});
+    const page = { context: () => ({}), goto,
+      url: () => "https://chatgpt.com/c/conversation", locator: () => ({ count: async () => 1, nth: () => bubble }),
+      waitForTimeout: async (ms: number) => { now += ms; } } as unknown as Page;
+    firstResolved.mockResolvedValue(null);
+    const run = waitTurnComplete(page, 1000, 0, 4000, {
+      conversationId: () => "conversation", confirmComplete: async () => confirmed,
+    });
+    if (confirmed) await expect(run).resolves.toBeUndefined();
+    else await expect(run).rejects.toBeInstanceOf(TurnTimeoutError);
+    expect(goto).toHaveBeenCalledTimes(1);
+  });
   it("propagates a phase-1 closed-page error unchanged", async () => {
     const closed = new Error("Target page, context or browser has been closed");
     const page = {

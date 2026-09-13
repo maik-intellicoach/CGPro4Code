@@ -608,7 +608,7 @@ async function clickConnector(page: Page, row: Locator, name: string): Promise<v
     if (!(error instanceof Error) || !error.message.includes("Timeout")) throw error;
     const refreshed = await waitForComposerTool(page, name);
     if (!refreshed) throw error;
-    if (await attachedState(refreshed)) return;
+    if (await isComposerMountedTool(refreshed) || await attachedState(refreshed)) return;
     await refreshed.click({ timeout: 5_000 });
   }
 }
@@ -978,7 +978,10 @@ export async function waitTurnComplete(
           const count = await page.locator(SELECTORS.assistantMessages.join(", ")).count();
           const bubble = count > priorAssistantCount ? await latestAssistantBubble(page) : null;
           const text = bubble ? ((await bubble.innerText().catch(() => "")) ?? "") : "";
-          if (!text) throw new TurnTimeoutError(Math.ceil(timeoutMs / 1_000));
+          if (!text || (control.confirmComplete && !(await control.confirmComplete()))) {
+            throw new TurnTimeoutError(Math.ceil(timeoutMs / 1_000));
+          }
+          return;
         }
         lastText = "";
         lastChangedAt = Date.now();

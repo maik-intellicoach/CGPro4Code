@@ -393,3 +393,14 @@ it("does not toggle off an attachment that mounted during a timed-out click", as
   await expect(setConnector(page, "connector")).resolves.toBeUndefined();
   expect(page.clickedLabels).toEqual(["connector"]);
 });
+
+it("recognizes an unmarked composer pill after a timed-out click", async () => {
+  const { page, setRows } = makePage();
+  setRows([{ label: "connector", visible: true, onSelected: () => {
+    setRows([{ label: "connector", visible: true, inComposer: true,
+      onSelected: () => { throw new Error("mounted pill must not be clicked"); } }]);
+    throw new Error("locator.click: Timeout 5000ms exceeded.");
+  } }]);
+  await expect(setConnector(page, "connector")).resolves.toBeUndefined();
+  expect(page.clickedLabels).toEqual(["connector"]);
+});
