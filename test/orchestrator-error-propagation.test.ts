@@ -372,6 +372,7 @@ describe("runAskOnSession connector contract", () => {
       await Promise.all([control.pollEvidence(), control.confirmComplete()]);
       expect(await control.confirmComplete()).toBe(true);
       expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(1);
+      expect(fetchLatestTurnConnectorState.mock.calls[0].slice(-2)).toEqual([10_000, false]);
     });
     const runner = runAskOnSession({ prompt: "test", connector: "connector", timeoutSec: 1200, headless: false }, session());
     await runner.result;

@@ -238,7 +238,8 @@ function runAskInner(
             page,
             conversationId,
             opts.connector,
-            force ? 10_000 : 1_000,
+            // Completion shares this read, so retain its original 10s budget.
+            10_000,
             // Only the forced terminal read retries a 429: a failure there
             // discards the finished turn. The mid-turn poll is best-effort
             // and already has its own CONNECTOR_EVIDENCE_RATE_LIMIT_BACKOFF_MS.
