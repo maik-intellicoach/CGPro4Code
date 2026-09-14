@@ -20,7 +20,7 @@ import {
   StreamEmitter,
   type StreamEvent,
 } from "./stream.js";
-import { NotLoggedInError } from "../errors.js";
+import { NotLoggedInError, PreSubmitInteractionError } from "../errors.js";
 import { requireAccount, verifyFiling, type FilingProof } from "../api/conversation-filing.js";
 import { SELECTORS as SELECTORS_DUMP } from "../browser/selectors.js";
 import { fetchLatestTurnConnectorState, type LatestTurnConnectorState, fetchLatestNativeResearchReport, fetchNativeResearchUserNodes, type NativeResearchReport } from "../api/conversations.js";
@@ -70,6 +70,57 @@ export interface AskRunner {
   events: AsyncIterable<StreamEvent>;
   result: Promise<AskResult>;
   cancel: () => Promise<void>;
+}
+
+export interface InteractionPreflightOptions {
+  model: "gpt-6-pro";
+  connector: string;
+  gizmoId: string;
+  gizmoShortUrl?: string;
+  expectedAccountEmail: string;
+}
+
+export interface InteractionPreflightResult {
+  accountVerified: true;
+  projectVerified: true;
+  connectorVerified: true;
+  model: "gpt-6-pro";
+  power: number;
+}
+
+/** Verify current controls on an idle daemon lane without submitting a prompt. */
+export async function runInteractionPreflight(
+  opts: InteractionPreflightOptions,
+  session: Session,
+): Promise<InteractionPreflightResult> {
+  const page = session.page;
+  try {
+    await goHome(page);
+    if (!(await isLoggedIn(page, 10_000))) throw new NotLoggedInError();
+    await requireAccount(page, opts.expectedAccountEmail);
+    await openConversation(page, {
+      model: opts.model,
+      gizmoId: opts.gizmoId,
+      gizmoShortUrl: opts.gizmoShortUrl,
+    });
+    await requireAccount(page, opts.expectedAccountEmail);
+    await clearComposer(page);
+    await setConnector(page, opts.connector);
+    const selection = await ensureProSixMaximum(page);
+    return {
+      accountVerified: true,
+      projectVerified: true,
+      connectorVerified: true,
+      model: "gpt-6-pro",
+      power: selection.power,
+    };
+  } finally {
+    await page.keyboard.press("Escape").catch(() => undefined);
+    // A fresh home composer prevents connector state from leaking into a
+    // later connector-off route on this persistent browser session.
+    await goHome(page, { model: opts.model }).catch(() => undefined);
+    await clearComposer(page).catch(() => undefined);
+  }
 }
 
 /**
@@ -470,7 +521,15 @@ function runAskInner(
       return { conversationId, finalText, events: collected, filing };
     } catch (err) {
       const message = (err as Error).message ?? String(err);
-      emitter.push({ type: "error", message });
+      emitter.push(err instanceof PreSubmitInteractionError
+        ? {
+            type: "error",
+            message,
+            code: err.code,
+            phase: err.phase,
+            promptSubmitted: err.promptSubmitted,
+          }
+        : { type: "error", message });
       throw err;
     } finally {
       // Reset the active emitter so a stale binding doesn't leak into

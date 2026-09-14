@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "patchright";
 import type { Session } from "../src/browser/session.js";
 import type { StreamEvent } from "../src/core/stream.js";
+import { PreSubmitInteractionError } from "../src/errors.js";
 
 const requireAccount = vi.fn();
 const verifyFiling = vi.fn();
@@ -119,6 +120,24 @@ describe("runAskOnSession native Deep Research contract", () => {
     await collect(runner.events);
     await expect(runner.result).rejects.toThrow("did not reach its maximum");
     expect(waitTurnComplete).not.toHaveBeenCalled();
+  });
+
+  it("emits structured pre-submit metadata for a typed control failure", async () => {
+    ensureProSixMaximum.mockRejectedValueOnce(new PreSubmitInteractionError(
+      "model_control_activation_timeout",
+      "model_verification",
+      "control did not activate",
+    ));
+    const runner = runAskOnSession({ prompt: "research", model: "gpt-6-pro", timeoutSec: 1200, headless: false }, session());
+    const events = await collect(runner.events);
+    await expect(runner.result).rejects.toThrow("control did not activate");
+    expect(events).toContainEqual({
+      type: "error",
+      message: "control did not activate",
+      code: "model_control_activation_timeout",
+      phase: "model_verification",
+      promptSubmitted: false,
+    });
   });
   it("retains the ordinary planning non-Pro model guard", async () => {
     latestAssistantModelSlug.mockResolvedValue("gpt-5-thinking");

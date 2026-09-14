@@ -404,3 +404,26 @@ it("recognizes an unmarked composer pill after a timed-out click", async () => {
   await expect(setConnector(page, "connector")).resolves.toBeUndefined();
   expect(page.clickedLabels).toEqual(["connector"]);
 });
+
+it("emits a typed pre-submit failure after two timed-out clicks with no attachment", async () => {
+  const { page, setRows } = makePage();
+  const replacement: FakeRow = {
+    label: "connector",
+    visible: true,
+    onSelected: () => { throw new Error("locator.click: Timeout 5000ms exceeded."); },
+  };
+  setRows([{
+    label: "connector",
+    visible: true,
+    onSelected: () => {
+      setRows([replacement]);
+      throw new Error("locator.click: Timeout 5000ms exceeded.");
+    },
+  }]);
+  await expect(setConnector(page, "connector")).rejects.toMatchObject({
+    code: "connector_control_activation_timeout",
+    phase: "connector_selection",
+    promptSubmitted: false,
+  });
+  expect(page.clickedLabels).toEqual(["connector", "connector"]);
+});

@@ -2,7 +2,7 @@ import type { Page, Locator } from "patchright";
 import { SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, goHome } from "./chatgpt.js";
 import { listProjects } from "../api/projects.js";
-import { TurnTimeoutError } from "../errors.js";
+import { PreSubmitInteractionError, TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation } from "../core/stream.js";
 
 /**
@@ -92,7 +92,24 @@ async function ensureChatTab(page: Page): Promise<void> {
 export async function ensureProSixMaximum(page: Page): Promise<{ model: string; power: number }> {
   const button = await requireSelector(page, SELECTORS.thinkingPowerButton, "thinking control");
   await page.waitForTimeout(5_000);
-  await button.click({ timeout: 5_000 });
+  try {
+    await button.click({ timeout: 5_000 });
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes("Timeout")) throw error;
+    // Playwright can time out while React has already opened the Radix menu.
+    // Inspect the honest UI postcondition before treating the click as failed.
+    const slider = await firstResolved(page, SELECTORS.thinkingPowerSlider);
+    const expanded = (await button.getAttribute("aria-expanded").catch(() => null)) === "true";
+    const open = (await button.getAttribute("data-state").catch(() => null)) === "open";
+    if (!slider && !expanded && !open) {
+      throw new PreSubmitInteractionError(
+        "model_control_activation_timeout",
+        "model_verification",
+        "ChatGPT 6 Pro control did not open before submission",
+        { cause: error },
+      );
+    }
+  }
   try {
     await page.waitForTimeout(5_000);
     const slider = await requireSelector(page, SELECTORS.thinkingPowerSlider, "thinking power");
@@ -607,9 +624,28 @@ async function clickConnector(page: Page, row: Locator, name: string): Promise<v
     // attachment that mounted while the first click was timing out.
     if (!(error instanceof Error) || !error.message.includes("Timeout")) throw error;
     const refreshed = await waitForComposerTool(page, name);
-    if (!refreshed) throw error;
+    if (!refreshed) {
+      throw new PreSubmitInteractionError(
+        "connector_control_activation_timeout",
+        "connector_selection",
+        `ChatGPT connector "${name}" did not activate before submission`,
+        { cause: error },
+      );
+    }
     if (await isComposerMountedTool(refreshed) || await attachedState(refreshed)) return;
-    await refreshed.click({ timeout: 5_000 });
+    try {
+      await refreshed.click({ timeout: 5_000 });
+    } catch (retryError) {
+      if (!(retryError instanceof Error) || !retryError.message.includes("Timeout")) throw retryError;
+      const finalRow = await waitForComposerTool(page, name);
+      if (finalRow && (await isComposerMountedTool(finalRow) || await attachedState(finalRow))) return;
+      throw new PreSubmitInteractionError(
+        "connector_control_activation_timeout",
+        "connector_selection",
+        `ChatGPT connector "${name}" did not activate before submission`,
+        { cause: retryError },
+      );
+    }
   }
 }
 
@@ -711,6 +747,7 @@ export async function setConnector(page: Page, name: string): Promise<void> {
   } catch (error) {
     await recordConnectorDiagnostics(page);
     await page.keyboard.press("Escape").catch(() => undefined);
+    if (error instanceof PreSubmitInteractionError) throw error;
     const reason = error instanceof Error ? error.message.split("\n")[0].slice(0, 200) : "unknown click error";
     throw new Error(`ChatGPT connector "${connectorName}" was visible but could not be selected: ${reason}`, { cause: error });
   }

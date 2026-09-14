@@ -6,7 +6,13 @@ export type StreamEvent =
   | { type: "thinking"; text: string }
   | { type: "tool"; name: string; meta?: unknown }
   | { type: "sources"; items: Array<{ title?: string; url?: string }> }
-  | { type: "error"; message: string }
+  | {
+      type: "error";
+      message: string;
+      code?: string;
+      phase?: string;
+      promptSubmitted?: boolean;
+    }
   | { type: "done"; finalText?: string };
 
 function toolFromMessage(

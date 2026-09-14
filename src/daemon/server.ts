@@ -40,14 +40,21 @@ import {
 import { detectPlan, fetchMe, type MeResponse } from "../api/me.js";
 import { archiveSavedConversation } from "../api/conversation-filing.js";
 import { fetchModels, findProSlug, type ChatgptModel } from "../api/models.js";
-import { runAskOnSession, type AskOptions, type AskRunner } from "../core/orchestrator.js";
-import { NotLoggedInError } from "../errors.js";
+import {
+  runAskOnSession,
+  runInteractionPreflight,
+  type AskOptions,
+  type AskRunner,
+} from "../core/orchestrator.js";
+import { NotLoggedInError, PreSubmitInteractionError } from "../errors.js";
 import {
   clearDaemonInfo,
   DAEMON_LOG,
   writeDaemonInfo,
   type DaemonInfo,
   type AskRequest,
+  type InteractionStatus,
+  type PreflightRequest,
   type StatusResponse,
 } from "./protocol.js";
 
@@ -253,6 +260,7 @@ export interface ServerState {
   currentConversation: string | null;
   lastConversation: string | null;
   reloadConversation: string | null;
+  interaction: InteractionStatus;
   account?: {
     email?: string;
     plan: string;
@@ -399,6 +407,7 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
     currentConversation: null,
     lastConversation: null,
     reloadConversation: null,
+    interaction: { state: "unknown" },
     account,
   };
 
@@ -473,6 +482,7 @@ export async function handleRequest(
       account: state.account,
       currentConversation: state.currentConversation,
       lastConversation: state.lastConversation,
+      interaction: state.interaction,
     };
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(status));
@@ -534,6 +544,65 @@ export async function handleRequest(
 
   if (method === "POST" && url.pathname === "/ask") {
     await handleAsk(req, res, state);
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/preflight") {
+    let body: PreflightRequest | null;
+    try {
+      state.readerBudget.acquire();
+    } catch {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "reader_budget_exceeded" }));
+      return;
+    }
+    try {
+      try {
+        body = await readJsonBody<PreflightRequest>(req);
+      } catch (error) {
+        const status = error instanceof BodyTooLargeError ? 413
+          : error instanceof BodyTimeoutError ? 408
+            : 400;
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_preflight_request" }));
+        return;
+      }
+    } finally {
+      state.readerBudget.release();
+    }
+    if (!body || body.model !== "gpt-6-pro" || typeof body.connector !== "string" || !body.connector.trim() ||
+        typeof body.gizmoId !== "string" || !/^g-p-[A-Za-z0-9_-]+$/.test(body.gizmoId) ||
+        (body.gizmoShortUrl !== undefined && !/^[A-Za-z0-9_-]+$/.test(body.gizmoShortUrl)) ||
+        typeof body.expectedAccountEmail !== "string" || body.expectedAccountEmail.length > 320 ||
+        !body.expectedAccountEmail.includes("@")) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_preflight_identity" }));
+      return;
+    }
+    if (!state.queue.tryAcquire()) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "lane_busy" }));
+      return;
+    }
+    try {
+      const result = await runInteractionPreflight(body, state.session);
+      state.interaction = { state: "ready", checkedAt: new Date().toISOString() };
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, ...result }));
+    } catch (error) {
+      state.interaction = {
+        state: "degraded",
+        checkedAt: new Date().toISOString(),
+        ...(error instanceof PreSubmitInteractionError ? { failureCode: error.code } : {}),
+      };
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "interaction_preflight_failed",
+        ...(error instanceof PreSubmitInteractionError ? { code: error.code, phase: error.phase } : {}),
+      }));
+    } finally {
+      state.queue.release();
+    }
     return;
   }
 
@@ -793,6 +862,7 @@ export async function handleAsk(
     };
 
     let clientGone = false;
+    let connectorVerified = body.connector === undefined;
     res.on("close", () => {
       clientGone = true;
     });
@@ -803,6 +873,17 @@ export async function handleAsk(
           state.currentConversation = ev.conversationId;
         }
         if (!clientGone) writeEvent(ev.type, ev);
+        if (ev.type === "tool" && ev.name === "connector-selected") connectorVerified = true;
+        if (ev.type === "tool" && ev.name === "model-thinking-verified" && connectorVerified) {
+          state.interaction = { state: "ready", checkedAt: new Date().toISOString() };
+        }
+        if (ev.type === "error" && ev.promptSubmitted === false && ev.code) {
+          state.interaction = {
+            state: "degraded",
+            checkedAt: new Date().toISOString(),
+            failureCode: ev.code,
+          };
+        }
       }
       const summary = await runner.result;
       state.lastConversation = summary.conversationId ?? state.currentConversation;
@@ -818,7 +899,14 @@ export async function handleAsk(
       state.lastConversation = state.currentConversation ?? state.lastConversation;
       log.error(`ask turn failed: ${(err as Error).message}`);
       if (!clientGone) {
-        writeEvent("error", { message: (err as Error).message });
+        writeEvent("error", err instanceof PreSubmitInteractionError
+          ? {
+              message: err.message,
+              code: err.code,
+              phase: err.phase,
+              promptSubmitted: err.promptSubmitted,
+            }
+          : { message: (err as Error).message });
         res.end();
       }
     } finally {

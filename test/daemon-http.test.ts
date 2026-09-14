@@ -6,8 +6,10 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 // wiring (queue admission, status codes, header/body ordering) can be
 // exercised without a browser (C-092 P-026 r2 test-gap concession).
 const runAskOnSession = vi.fn();
+const runInteractionPreflight = vi.fn();
 vi.mock("../src/core/orchestrator.js", () => ({
   runAskOnSession: (...args: unknown[]) => runAskOnSession(...args),
+  runInteractionPreflight: (...args: unknown[]) => runInteractionPreflight(...args),
 }));
 
 const browserConversation = vi.hoisted(() => ({
@@ -25,7 +27,7 @@ vi.mock("../src/browser/conversation.js", async () => {
 // Small bounds so the body-timeout/body-too-large tests don't need to wait
 // out (or allocate) the real production defaults (C-092 P-026 xfam r1 H1).
 process.env.CGPRO_DAEMON_BODY_TIMEOUT_MS = "200";
-process.env.CGPRO_DAEMON_BODY_MAX_BYTES = "64";
+process.env.CGPRO_DAEMON_BODY_MAX_BYTES = "256";
 
 const {
   AskQueue,
@@ -38,6 +40,7 @@ const {
 import type { ServerState } from "../src/daemon/server.js";
 import type { Session } from "../src/browser/session.js";
 import { StreamEmitter } from "../src/core/stream.js";
+import { PreSubmitInteractionError } from "../src/errors.js";
 
 function fakeState(overrides: Partial<ServerState> = {}): ServerState {
   return {
@@ -53,6 +56,7 @@ function fakeState(overrides: Partial<ServerState> = {}): ServerState {
     currentConversation: null,
     lastConversation: null,
     reloadConversation: null,
+    interaction: { state: "unknown" },
     ...overrides,
   };
 }
@@ -96,6 +100,7 @@ const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve)
 
 beforeEach(() => {
   runAskOnSession.mockReset();
+  runInteractionPreflight.mockReset();
   browserConversation.openConversation.mockReset();
   browserConversation.readLatestAssistantText.mockReset();
   browserConversation.turnIsWorking.mockReset();
@@ -211,6 +216,86 @@ it("returns authenticated account facts from daemon status", async () => {
   expect((res as unknown as FakeRes).statusCode).toBe(200);
   expect(parseJsonBody(res as unknown as FakeRes)).toMatchObject({
     account: { email: "account@example.test", plan: "pro", proModelAvailable: true },
+    interaction: { state: "unknown" },
+  });
+});
+
+it("marks an idle lane interaction-ready after a no-submit preflight", async () => {
+  runInteractionPreflight.mockResolvedValue({
+    accountVerified: true,
+    projectVerified: true,
+    connectorVerified: true,
+    model: "gpt-6-pro",
+    power: 4,
+  });
+  const state = fakeState();
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST", url: "/preflight", headers: { authorization: "Bearer test-token" } });
+  const pending = handleRequest(req, res, state);
+  sendBody(req, {
+    model: "gpt-6-pro",
+    connector: "connector",
+    gizmoId: "g-p-project",
+    expectedAccountEmail: "account@example.test",
+  });
+  await pending;
+
+  expect((res as unknown as FakeRes).statusCode).toBe(200);
+  expect(state.interaction).toMatchObject({ state: "ready" });
+  expect(runInteractionPreflight).toHaveBeenCalledOnce();
+});
+
+it("refuses a preflight while the lane is busy", async () => {
+  const queue = new AskQueue(1, 60_000);
+  expect(queue.tryAcquire()).toBe(true);
+  const state = fakeState({ queue });
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST", url: "/preflight", headers: { authorization: "Bearer test-token" } });
+  const pending = handleRequest(req, res, state);
+  sendBody(req, {
+    model: "gpt-6-pro",
+    connector: "connector",
+    gizmoId: "g-p-project",
+    expectedAccountEmail: "account@example.test",
+  });
+  await pending;
+
+  expect((res as unknown as FakeRes).statusCode).toBe(409);
+  expect(parseJsonBody(res as unknown as FakeRes)).toEqual({ error: "lane_busy" });
+  expect(runInteractionPreflight).not.toHaveBeenCalled();
+  queue.release();
+});
+
+it("marks a typed pre-submit preflight failure degraded", async () => {
+  runInteractionPreflight.mockRejectedValue(new PreSubmitInteractionError(
+    "connector_control_activation_timeout",
+    "connector_selection",
+    "control did not activate",
+  ));
+  const state = fakeState();
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST", url: "/preflight", headers: { authorization: "Bearer test-token" } });
+  const pending = handleRequest(req, res, state);
+  sendBody(req, {
+    model: "gpt-6-pro",
+    connector: "connector",
+    gizmoId: "g-p-project",
+    expectedAccountEmail: "account@example.test",
+  });
+  await pending;
+
+  expect((res as unknown as FakeRes).statusCode).toBe(409);
+  expect(parseJsonBody(res as unknown as FakeRes)).toMatchObject({
+    error: "interaction_preflight_failed",
+    code: "connector_control_activation_timeout",
+    phase: "connector_selection",
+  });
+  expect(state.interaction).toMatchObject({
+    state: "degraded",
+    failureCode: "connector_control_activation_timeout",
   });
 });
 
@@ -561,7 +646,7 @@ describe("handleAsk HTTP-level wiring", () => {
     const pending = handleAsk(req, res as unknown as ServerResponse, state);
 
     const reqEmitter = req as unknown as FakeReq;
-    reqEmitter.emit("data", JSON.stringify({ prompt: "x".repeat(100) })); // > CGPRO_DAEMON_BODY_MAX_BYTES=64
+    reqEmitter.emit("data", JSON.stringify({ prompt: "x".repeat(500) })); // > CGPRO_DAEMON_BODY_MAX_BYTES=256
     await pending;
 
     const fakeRes = res as unknown as FakeRes;

@@ -139,6 +139,21 @@ export interface StatusResponse {
   currentConversation?: string | null;
   /** UUID of the last completed turn, if any. */
   lastConversation?: string | null;
+  interaction?: InteractionStatus;
+}
+
+export interface InteractionStatus {
+  state: "unknown" | "ready" | "degraded";
+  checkedAt?: string;
+  failureCode?: string;
+}
+
+export interface PreflightRequest {
+  model: "gpt-6-pro";
+  connector: string;
+  gizmoId: string;
+  gizmoShortUrl?: string;
+  expectedAccountEmail: string;
 }
 
 export interface ReloadResponse {

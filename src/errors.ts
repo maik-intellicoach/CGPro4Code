@@ -70,3 +70,26 @@ export class BotChallengeError extends CgproError {
     this.name = "BotChallengeError";
   }
 }
+
+export type PreSubmitInteractionCode =
+  | "model_control_activation_timeout"
+  | "connector_control_activation_timeout";
+
+export type PreSubmitInteractionPhase =
+  | "model_verification"
+  | "connector_selection";
+
+/** A browser-control failure that is proven to occur before Send. */
+export class PreSubmitInteractionError extends Error {
+  readonly promptSubmitted = false;
+
+  constructor(
+    readonly code: PreSubmitInteractionCode,
+    readonly phase: PreSubmitInteractionPhase,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "PreSubmitInteractionError";
+  }
+}
