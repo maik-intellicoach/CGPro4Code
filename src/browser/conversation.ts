@@ -99,9 +99,15 @@ export async function ensureProSixMaximum(page: Page): Promise<{ model: string; 
     // Playwright can time out while React has already opened the Radix menu.
     // Inspect the honest UI postcondition before treating the click as failed.
     const slider = await firstResolved(page, SELECTORS.thinkingPowerSlider);
-    const expanded = (await button.getAttribute("aria-expanded").catch(() => null)) === "true";
-    const open = (await button.getAttribute("data-state").catch(() => null)) === "open";
-    if (!slider && !expanded && !open) {
+    let opened = slider !== null;
+    if (!opened) {
+      const [expanded, state] = await Promise.all([
+        button.getAttribute("aria-expanded", { timeout: 1_000 }).catch(() => null),
+        button.getAttribute("data-state", { timeout: 1_000 }).catch(() => null),
+      ]);
+      opened = expanded === "true" || state === "open";
+    }
+    if (!opened) {
       throw new PreSubmitInteractionError(
         "model_control_activation_timeout",
         "model_verification",

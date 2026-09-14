@@ -53,7 +53,7 @@ vi.mock("../src/api/conversations.js", () => ({
   fetchLatestTurnConnectorState: (...args: unknown[]) => fetchLatestTurnConnectorState(...args),
 }));
 
-const { runAskOnSession } = await import("../src/core/orchestrator.js");
+const { runAskOnSession, runInteractionPreflight } = await import("../src/core/orchestrator.js");
 
 async function collect(events: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> {
   const out: StreamEvent[] = [];
@@ -95,6 +95,39 @@ beforeEach(() => {
     currentEndTurn: true,
     currentContentType: "text",
     currentIsThinkingPreamble: false,
+  });
+});
+
+describe("runInteractionPreflight cleanup", () => {
+  function preflightSession(): Session {
+    return {
+      ...session(),
+      page: { keyboard: { press: vi.fn(async () => {}) } } as unknown as Page,
+    } as Session;
+  }
+
+  const options = {
+    model: "gpt-6-pro" as const,
+    connector: "fixture-connector",
+    gizmoId: "g-p-fixture",
+    expectedAccountEmail: "fixture@example.com",
+  };
+
+  it("fails readiness when final cleanup cannot restore a clean composer", async () => {
+    clearComposer
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("cleanup composer unavailable"));
+    await expect(runInteractionPreflight(options, preflightSession())).rejects.toThrow(
+      "interaction preflight cleanup failed",
+    );
+  });
+
+  it("preserves the verification failure when cleanup also fails", async () => {
+    setConnector.mockRejectedValueOnce(new Error("connector verification failed"));
+    goHome.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("cleanup navigation failed"));
+    await expect(runInteractionPreflight(options, preflightSession())).rejects.toThrow(
+      "connector verification failed",
+    );
   });
 });
 

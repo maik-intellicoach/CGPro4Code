@@ -89,6 +89,7 @@ describe("6 Pro maximum thinking admission", () => {
   it("accepts a timed-out activation when the live menu postcondition is already open", async () => {
     const s = setup({ clickTimesOut: true, menuOpened: true });
     await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 4 });
+    expect(s.model.getAttribute).not.toHaveBeenCalled();
   });
 
   it("emits a typed pre-submit failure when activation times out with no open menu", async () => {
@@ -98,5 +99,7 @@ describe("6 Pro maximum thinking admission", () => {
       phase: "model_verification",
       promptSubmitted: false,
     });
+    expect(s.model.getAttribute).toHaveBeenCalledWith("aria-expanded", { timeout: 1_000 });
+    expect(s.model.getAttribute).toHaveBeenCalledWith("data-state", { timeout: 1_000 });
   });
 });

@@ -94,6 +94,7 @@ export async function runInteractionPreflight(
   session: Session,
 ): Promise<InteractionPreflightResult> {
   const page = session.page;
+  let verificationError: unknown;
   try {
     await goHome(page);
     if (!(await isLoggedIn(page, 10_000))) throw new NotLoggedInError();
@@ -114,12 +115,27 @@ export async function runInteractionPreflight(
       model: "gpt-6-pro",
       power: selection.power,
     };
+  } catch (error) {
+    verificationError = error;
+    throw error;
   } finally {
     await page.keyboard.press("Escape").catch(() => undefined);
     // A fresh home composer prevents connector state from leaking into a
     // later connector-off route on this persistent browser session.
-    await goHome(page, { model: opts.model }).catch(() => undefined);
-    await clearComposer(page).catch(() => undefined);
+    let cleanupError: unknown;
+    try {
+      await goHome(page, { model: opts.model });
+    } catch (error) {
+      cleanupError = error;
+    }
+    try {
+      await clearComposer(page);
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    if (verificationError === undefined && cleanupError !== undefined) {
+      throw new Error("interaction preflight cleanup failed", { cause: cleanupError });
+    }
   }
 }
 
