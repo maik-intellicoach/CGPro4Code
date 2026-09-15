@@ -132,7 +132,8 @@ describe("CGPRO_DAEMON_SLOTS", () => {
     expect(daemonSlotCount("abc")).toBe(1);
     expect(daemonSlotCount("0")).toBe(1);
     expect(daemonSlotCount("2.9")).toBe(2);
-    expect(daemonSlotCount("9")).toBe(3);
+    expect(daemonSlotCount("4")).toBe(4);
+    expect(daemonSlotCount("9")).toBe(4);
   });
 
   it("gives AskQueue a matching capacity; capacity 1 keeps today's single-lane semantics", async () => {

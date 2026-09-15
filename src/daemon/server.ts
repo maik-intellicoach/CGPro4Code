@@ -288,7 +288,7 @@ export interface ServerState {
     plan: string;
     proModelAvailable: boolean;
   };
-  /** CGPRO_DAEMON_SLOTS clamped to 1..3; absent means 1. */
+  /** CGPRO_DAEMON_SLOTS clamped to 1..4; absent means 1. */
   maxSlots?: number;
   slots?: SlotState[];
   /** Slot whose turn finished most recently (status lastConversation, bare /reload). */
@@ -296,7 +296,7 @@ export interface ServerState {
 }
 
 export function daemonSlotCount(raw = process.env.CGPRO_DAEMON_SLOTS): number {
-  return Math.min(3, Math.max(1, Math.trunc(Number(raw)) || 1));
+  return Math.min(4, Math.max(1, Math.trunc(Number(raw)) || 1));
 }
 
 export function createServerState(
