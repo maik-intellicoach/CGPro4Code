@@ -123,7 +123,7 @@ export async function chatCommand(opts: ChatCliOptions): Promise<number> {
 
       // Fresh emitter for this turn — the binding routes its events here.
       const emitter = new StreamEmitter();
-      setActiveEmitter(session.context, emitter);
+      setActiveEmitter(session.page, emitter);
 
       const spinner = ora({ text: "Thinking…", color: "cyan" }).start();
       let firstDelta = true;

@@ -975,7 +975,7 @@ export async function waitTurnComplete(
         if (expired) throw new TurnTimeoutError(Math.ceil(timeoutMs / 1_000));
       } else {
         let working = false;
-        setExpectedReloadNavigation(page.context(), true);
+        setExpectedReloadNavigation(page, true);
         try {
           await page.goto(`https://chatgpt.com/c/${conversationId}`, {
             waitUntil: "domcontentloaded",
@@ -1007,7 +1007,7 @@ export async function waitTurnComplete(
             await requireSelector(page, SELECTORS.composer, "composer", 20_000);
           }
         } finally {
-          setExpectedReloadNavigation(page.context(), false);
+          setExpectedReloadNavigation(page, false);
         }
 
         if (working) {

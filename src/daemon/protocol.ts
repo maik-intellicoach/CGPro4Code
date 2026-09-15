@@ -140,6 +140,19 @@ export interface StatusResponse {
   /** UUID of the last completed turn, if any. */
   lastConversation?: string | null;
   interaction?: InteractionStatus;
+  /** Per-tab occupancy (CGPRO_DAEMON_SLOTS; total stays 1 unless configured). */
+  slots?: {
+    total: number;
+    busy: number;
+    free: number;
+    items: Array<{
+      slot: number;
+      busy: boolean;
+      invocationId: string | null;
+      conversationId: string | null;
+      interaction: InteractionStatus;
+    }>;
+  };
 }
 
 export interface InteractionStatus {

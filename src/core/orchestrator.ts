@@ -187,7 +187,7 @@ function runAskInner(
         background: opts.background,
       });
     }
-    setActiveEmitter(session.context, emitter, opts.connector);
+    setActiveEmitter(session.page, emitter, opts.connector);
     try {
       if (opts.deepResearch && opts.connector !== undefined) {
         throw new Error("native Deep Research and connectors are mutually exclusive");
@@ -549,8 +549,8 @@ function runAskInner(
       throw err;
     } finally {
       // Reset the active emitter so a stale binding doesn't leak into
-      // the next turn on the same context (daemon mode).
-      if (session) setActiveEmitter(session.context, null);
+      // the next turn on the same page (daemon mode).
+      if (session) setActiveEmitter(session.page, null);
       if (closeOnFinish) {
         await session?.close().catch(() => {});
       }

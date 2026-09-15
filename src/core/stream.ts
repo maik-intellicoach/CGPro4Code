@@ -128,11 +128,12 @@ export class StreamEmitter implements AsyncIterable<StreamEvent> {
 }
 
 /**
- * Per-context interceptor state. The binding is registered ONCE per
- * BrowserContext (not per turn) — per-turn we swap which emitter+parser
- * the binding routes to.
+ * Per-page interceptor state. The bindings are registered ONCE per
+ * BrowserContext (not per turn); each binding call resolves the page it
+ * came from, so pages never share a parser, emitter or observer set and
+ * per-turn we swap which emitter+parser a page's bindings route to.
  */
-class InterceptorState {
+class PageStreamState {
   parser: SseParser = new SseParser();
   emitter: StreamEmitter | null = null;
   expectedReloadNavigation = false;
@@ -140,7 +141,23 @@ class InterceptorState {
   observers = new Map<string, number>();
 }
 
-const STATE = new WeakMap<BrowserContext, InterceptorState>();
+/**
+ * State is keyed by Page. The context itself is the fallback key for a
+ * binding source that carries no page (the fake contexts in test/sse.test.ts).
+ */
+export type StreamScope = Page | BrowserContext;
+
+const INSTALLED = new WeakSet<BrowserContext>();
+const STATES = new WeakMap<StreamScope, PageStreamState>();
+
+function stateFor(scope: StreamScope): PageStreamState {
+  let state = STATES.get(scope);
+  if (!state) {
+    state = new PageStreamState();
+    STATES.set(scope, state);
+  }
+  return state;
+}
 
 /**
  * One-time setup: registers `__cgproChunk` / `__cgproDone` bindings on the
@@ -148,15 +165,17 @@ const STATE = new WeakMap<BrowserContext, InterceptorState>();
  * calls are no-ops.
  */
 export async function ensureInterceptorInstalled(context: BrowserContext): Promise<void> {
-  if (STATE.has(context)) return;
-  const state = new InterceptorState();
-  STATE.set(context, state);
+  if (INSTALLED.has(context)) return;
+  INSTALLED.add(context);
+  const scopeOf = (src: { page?: Page }): StreamScope => src.page ?? context;
 
-  await context.exposeBinding("__cgproStart", (_src, observerId: string) => {
+  await context.exposeBinding("__cgproStart", (src, observerId: string) => {
+    const state = stateFor(scopeOf(src));
     state.observers.set(observerId, state.generation);
   });
 
-  await context.exposeBinding("__cgproChunk", (_src, observerId: string, raw: string) => {
+  await context.exposeBinding("__cgproChunk", (src, observerId: string, raw: string) => {
+    const state = stateFor(scopeOf(src));
     if (state.observers.get(observerId) !== state.generation) return;
     const events = state.parser.feed(raw);
     if (state.emitter) {
@@ -166,7 +185,8 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
 
   await context.exposeBinding(
     "__cgproDone",
-    (_src, observerId: string, payload?: { reason?: string }) => {
+    (src, observerId: string, payload?: { reason?: string }) => {
+      const state = stateFor(scopeOf(src));
       if (state.observers.get(observerId) !== state.generation) return;
       state.observers.delete(observerId);
       if (!state.emitter) return;
@@ -249,18 +269,18 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
 }
 
 /**
- * Switches the active emitter for the given context's interceptor.
- * Resets the SSE parser so the next turn starts from a clean slate.
+ * Switches the active emitter for the given page's interceptor.
+ * Resets that page's SSE parser so the next turn starts from a clean slate;
+ * other pages on the same context are untouched.
  *
  * Returns the previous emitter (caller may want to flush or fail it).
  */
 export function setActiveEmitter(
-  context: BrowserContext,
+  scope: StreamScope,
   emitter: StreamEmitter | null,
   expectedConnector?: string,
 ): StreamEmitter | null {
-  const state = STATE.get(context);
-  if (!state) return null;
+  const state = stateFor(scope);
   const prev = state.emitter;
   state.generation += 1;
   state.observers.clear();
@@ -269,26 +289,23 @@ export function setActiveEmitter(
   return prev;
 }
 
-export function setExpectedReloadNavigation(context: BrowserContext, expected: boolean): void {
-  const state = STATE.get(context);
-  if (state) state.expectedReloadNavigation = expected;
+export function setExpectedReloadNavigation(scope: StreamScope, expected: boolean): void {
+  stateFor(scope).expectedReloadNavigation = expected;
 }
 
 /**
  * Convenience: install (if needed) AND set this emitter as active.
  *
- * The page parameter exists for symmetry with old callers but the binding
- * actually lives at the context level so it survives navigation and
- * additional pages.
+ * The bindings live at the context level so they survive navigation and
+ * additional pages; the emitter is routed per page.
  */
 export async function installSseInterceptor(
   page: Page,
   emitter: StreamEmitter,
   expectedConnector?: string,
 ): Promise<void> {
-  const ctx = page.context();
-  await ensureInterceptorInstalled(ctx);
-  setActiveEmitter(ctx, emitter, expectedConnector);
+  await ensureInterceptorInstalled(page.context());
+  setActiveEmitter(page, emitter, expectedConnector);
 }
 
 /**

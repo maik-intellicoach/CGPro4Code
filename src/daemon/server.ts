@@ -11,9 +11,10 @@
  *   3. On `listen`, we write daemon.json (pid, port, token) so clients
  *      can find us. We accept Bearer-token auth on every protected route.
  *   4. POST /ask → text/event-stream of {delta,thinking,tool,done,error}.
- *      One ask in flight at a time; concurrent calls queue FIFO behind it
- *      (bounded depth + wait, C-092 / C-073 ADR003 p5). No parallel browser
- *      use — same single Chrome profile, one turn at a time.
+ *      One ask in flight per slot (CGPRO_DAEMON_SLOTS, default 1: one tab,
+ *      one turn at a time); concurrent calls queue FIFO behind them
+ *      (bounded depth + wait, C-092 / C-073 ADR003 p5). Extra slots are
+ *      further tabs in the same Chrome profile (P-035 D23.0).
  *   5. POST /shutdown closes the browser, deletes daemon.json, exits.
  *
  * Failure model
@@ -159,8 +160,9 @@ interface WaitingEntry {
 }
 
 /**
- * Bounded FIFO admission for the single browser lane: one ask runs at a
- * time, later arrivals queue in order behind it. A new arrival is rejected
+ * Bounded FIFO admission for the browser lanes: up to `capacity` asks run
+ * at once (one per slot, default 1), later arrivals queue in order behind
+ * them. A new arrival is rejected
  * outright once the *waiting* line (not counting the one in flight) hits
  * maxDepth; a waiter that sits past maxWaitMs is rejected with a timeout
  * instead of running forever. An optional AbortSignal (wired to the
@@ -170,11 +172,12 @@ interface WaitingEntry {
  */
 export class AskQueue {
   private waiting: WaitingEntry[] = [];
-  private active = false;
+  private active = 0;
 
   constructor(
     private readonly maxDepth: number,
     private readonly maxWaitMs: number,
+    private readonly capacity = 1,
   ) {}
 
   /** Requests currently waiting (excludes the one in flight, if any). */
@@ -182,14 +185,14 @@ export class AskQueue {
     return this.waiting.length;
   }
 
-  /** True while an ask is running against the browser. */
+  /** True while every slot is running an ask (no free capacity). */
   get busy(): boolean {
-    return this.active;
+    return this.active >= this.capacity;
   }
 
   tryAcquire(): boolean {
-    if (this.active || this.waiting.length > 0) return false;
-    this.active = true;
+    if (this.busy || this.waiting.length > 0) return false;
+    this.active++;
     return true;
   }
 
@@ -220,7 +223,7 @@ export class AskQueue {
   }
 
   release(): void {
-    this.active = false;
+    if (this.active > 0) this.active--;
     this.pump();
   }
 
@@ -236,13 +239,30 @@ export class AskQueue {
   }
 
   private pump(): void {
-    if (this.active || this.waiting.length === 0) return;
-    const next = this.waiting.shift()!;
-    clearTimeout(next.timer);
-    if (next.signal && next.onAbort) next.signal.removeEventListener("abort", next.onAbort);
-    this.active = true;
-    next.resolve();
+    while (!this.busy && this.waiting.length > 0) {
+      const next = this.waiting.shift()!;
+      clearTimeout(next.timer);
+      if (next.signal && next.onAbort) next.signal.removeEventListener("abort", next.onAbort);
+      this.active++;
+      next.resolve();
+    }
   }
+}
+
+/** One tab the daemon can run a turn on (P-035 D23.0). */
+export interface SlotState {
+  id: number;
+  /** Slot 0 drives `session.page`; higher slots are created lazily and dropped once closed or crashed. */
+  page: Page | null;
+  /** Leased by an /ask, /preflight, /archive-saved or idle /reload. */
+  busy: boolean;
+  askInFlight: boolean;
+  currentInvocation: string | null;
+  currentRunner: AskRunner | null;
+  currentConversation: string | null;
+  lastConversation: string | null;
+  reloadConversation: string | null;
+  interaction: InteractionStatus;
 }
 
 // Exported for the HTTP-level integration test (C-092 P-026 r2).
@@ -254,6 +274,8 @@ export interface ServerState {
   profile?: string;
   queue: AskQueue;
   readerBudget: PreAdmissionReaderBudget;
+  // Slot 0's turn state lives on the server state itself (the shape the
+  // facade tests build); slotsOf() exposes it as slots[0].
   askInFlight: boolean;
   currentInvocation: string | null;
   currentRunner: AskRunner | null;
@@ -266,6 +288,137 @@ export interface ServerState {
     plan: string;
     proModelAvailable: boolean;
   };
+  /** CGPRO_DAEMON_SLOTS clamped to 1..3; absent means 1. */
+  maxSlots?: number;
+  slots?: SlotState[];
+  /** Slot whose turn finished most recently (status lastConversation, bare /reload). */
+  lastFinishedSlot?: number;
+}
+
+export function daemonSlotCount(raw = process.env.CGPRO_DAEMON_SLOTS): number {
+  return Math.min(3, Math.max(1, Math.trunc(Number(raw)) || 1));
+}
+
+export function createServerState(
+  session: Session,
+  opts: DaemonServerOptions,
+  account?: ServerState["account"],
+): ServerState {
+  const maxSlots = daemonSlotCount();
+  return {
+    session,
+    token: randomBytes(32).toString("hex"),
+    startedAt: new Date(),
+    background: opts.background ?? true,
+    profile: opts.profile,
+    queue: new AskQueue(QUEUE_MAX, QUEUE_MAX_WAIT_MS, maxSlots),
+    readerBudget: new PreAdmissionReaderBudget(PREADMIT_MAX_READERS),
+    askInFlight: false,
+    currentInvocation: null,
+    currentRunner: null,
+    currentConversation: null,
+    lastConversation: null,
+    reloadConversation: null,
+    interaction: { state: "unknown" },
+    account,
+    maxSlots,
+  };
+}
+
+/** Slot 0 as a view over the server state's own turn fields. */
+function slotZero(state: ServerState): SlotState {
+  return {
+    id: 0,
+    busy: false,
+    get page() { return state.session.page; },
+    get askInFlight() { return state.askInFlight; },
+    set askInFlight(v) { state.askInFlight = v; },
+    get currentInvocation() { return state.currentInvocation; },
+    set currentInvocation(v) { state.currentInvocation = v; },
+    get currentRunner() { return state.currentRunner; },
+    set currentRunner(v) { state.currentRunner = v; },
+    get currentConversation() { return state.currentConversation; },
+    set currentConversation(v) { state.currentConversation = v; },
+    get lastConversation() { return state.lastConversation; },
+    set lastConversation(v) { state.lastConversation = v; },
+    get reloadConversation() { return state.reloadConversation; },
+    set reloadConversation(v) { state.reloadConversation = v; },
+    get interaction() { return state.interaction; },
+    set interaction(v) { state.interaction = v; },
+  };
+}
+
+export function slotsOf(state: ServerState): SlotState[] {
+  state.slots ??= [
+    slotZero(state),
+    ...Array.from({ length: (state.maxSlots ?? 1) - 1 }, (_, i): SlotState => ({
+      id: i + 1,
+      page: null,
+      busy: false,
+      askInFlight: false,
+      currentInvocation: null,
+      currentRunner: null,
+      currentConversation: null,
+      lastConversation: null,
+      reloadConversation: null,
+      interaction: { state: "unknown" },
+    })),
+  ];
+  return state.slots;
+}
+
+/** Leases the lowest free slot. Callers hold queue capacity first, so one is always free. */
+function leaseSlot(state: ServerState): SlotState {
+  const slot = slotsOf(state).find((s) => !s.busy);
+  if (!slot) throw new Error("no free slot despite free capacity");
+  slot.busy = true;
+  return slot;
+}
+
+/** The slot's page; slots 1..N-1 are opened on first use with the daemon start checks. */
+async function slotPage(state: ServerState, slot: SlotState): Promise<Page> {
+  if (slot.id === 0) return state.session.page;
+  if (slot.page && !slot.page.isClosed()) return slot.page;
+  const page = await state.session.context.newPage();
+  try {
+    await goHome(page);
+    if (!(await isLoggedIn(page, 8_000))) throw new NotLoggedInError();
+  } catch (err) {
+    await page.close().catch(() => undefined);
+    throw err;
+  }
+  page.once("crash", () => {
+    if (slot.page === page) slot.page = null;
+  });
+  slot.page = page;
+  return page;
+}
+
+/** What a runner sees as its session: the daemon session for slot 0, a page-bound view otherwise. */
+function slotSession(state: ServerState, slot: SlotState, page: Page): Session {
+  if (slot.id === 0) return state.session;
+  return {
+    context: state.session.context,
+    page,
+    close: async () => {
+      throw new Error("slot sessions are not closable");
+    },
+  };
+}
+
+/** Conversation of the slot's in-flight turn: the first stream event, else the page URL. */
+function activeConversation(slot: SlotState): string | null {
+  return slot.currentConversation ?? (slot.askInFlight && slot.page ? currentConversationId(slot.page) : null);
+}
+
+const INTERACTION_RANK: Record<InteractionStatus["state"], number> = { unknown: 0, ready: 1, degraded: 2 };
+
+/** Worst-of across slots: degraded > ready > unknown; the latest checkedAt wins a tie. */
+function worstInteraction(slots: SlotState[]): InteractionStatus {
+  return slots.map((s) => s.interaction).reduce((worst, next) => {
+    const rank = INTERACTION_RANK[next.state] - INTERACTION_RANK[worst.state];
+    return rank > 0 || (rank === 0 && (next.checkedAt ?? "") > (worst.checkedAt ?? "")) ? next : worst;
+  });
 }
 
 // C-092 P-026 xfam r2 B1: extracted so a lightweight integration test can
@@ -393,23 +546,7 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
   }
   log.info("auth verified, starting http listener");
 
-  const state: ServerState = {
-    session,
-    token: randomBytes(32).toString("hex"),
-    startedAt: new Date(),
-    background: opts.background ?? true,
-    profile: opts.profile,
-    queue: new AskQueue(QUEUE_MAX, QUEUE_MAX_WAIT_MS),
-    readerBudget: new PreAdmissionReaderBudget(PREADMIT_MAX_READERS),
-    askInFlight: false,
-    currentInvocation: null,
-    currentRunner: null,
-    currentConversation: null,
-    lastConversation: null,
-    reloadConversation: null,
-    interaction: { state: "unknown" },
-    account,
-  };
+  const state = createServerState(session, opts, account);
 
   const server = createServer((req, res) => {
     handleRequest(req, res, state).catch((err: unknown) => {
@@ -436,7 +573,7 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
       background: opts.background ?? true,
     };
     writeDaemonInfo(info);
-    log.info(`listening on 127.0.0.1:${port}`);
+    log.info(`listening on 127.0.0.1:${port} slots=${state.maxSlots}`);
   });
 
   // Graceful shutdown on common signals.
@@ -472,6 +609,8 @@ export async function handleRequest(
   }
 
   if (method === "GET" && url.pathname === "/status") {
+    const slots = slotsOf(state);
+    const busySlots = slots.filter((s) => s.busy).length;
     const status: StatusResponse = {
       pid: process.pid,
       startedAt: state.startedAt.toISOString(),
@@ -480,9 +619,21 @@ export async function handleRequest(
       profile: state.profile,
       busy: state.queue.busy,
       account: state.account,
-      currentConversation: state.currentConversation,
-      lastConversation: state.lastConversation,
-      interaction: state.interaction,
+      currentConversation: slots.find((s) => s.currentConversation !== null)?.currentConversation ?? null,
+      lastConversation: slots[state.lastFinishedSlot ?? 0].lastConversation,
+      interaction: worstInteraction(slots),
+      slots: {
+        total: slots.length,
+        busy: busySlots,
+        free: slots.length - busySlots,
+        items: slots.map((s) => ({
+          slot: s.id,
+          busy: s.busy,
+          invocationId: s.currentInvocation,
+          conversationId: s.currentConversation,
+          interaction: s.interaction,
+        })),
+      },
     };
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(status));
@@ -520,23 +671,24 @@ export async function handleRequest(
       res.end(JSON.stringify({ error: "invalid_invocation_id" }));
       return;
     }
-    if (!state.askInFlight || !state.currentRunner || state.currentInvocation !== invocationId) {
+    const slot = slotsOf(state).find((s) => s.askInFlight && s.currentInvocation === invocationId);
+    const runner = slot?.currentRunner;
+    if (!slot || !runner) {
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "invocation_not_active" }));
       return;
     }
-    const runner = state.currentRunner;
     await runner.cancel();
     // Do not acknowledge cancellation while the original /ask handler can
-    // still report this lane as busy. Its terminal result closes the event
+    // still report this slot as busy. Its terminal result closes the event
     // stream and lets that handler clear askInFlight in its existing finally.
     await runner.result.catch(() => undefined);
-    const partialText = await readLatestAssistantText(state.session.page).catch(() => "");
+    const partialText = await readLatestAssistantText(slot.page!).catch(() => "");
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       ok: true,
       invocationId,
-      conversationId: state.currentConversation,
+      conversationId: slot.currentConversation,
       partialText,
     }));
     return;
@@ -584,13 +736,14 @@ export async function handleRequest(
       res.end(JSON.stringify({ error: "lane_busy" }));
       return;
     }
+    const slot = leaseSlot(state);
     try {
-      const result = await runInteractionPreflight(body, state.session);
-      state.interaction = { state: "ready", checkedAt: new Date().toISOString() };
+      const result = await runInteractionPreflight(body, slotSession(state, slot, await slotPage(state, slot)));
+      slot.interaction = { state: "ready", checkedAt: new Date().toISOString() };
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, ...result }));
     } catch (error) {
-      state.interaction = {
+      slot.interaction = {
         state: "degraded",
         checkedAt: new Date().toISOString(),
         ...(error instanceof PreSubmitInteractionError ? { failureCode: error.code } : {}),
@@ -601,6 +754,7 @@ export async function handleRequest(
         ...(error instanceof PreSubmitInteractionError ? { code: error.code, phase: error.phase } : {}),
       }));
     } finally {
+      slot.busy = false;
       state.queue.release();
     }
     return;
@@ -629,13 +783,14 @@ export async function handleRequest(
     if (!state.queue.tryAcquire()) {
       res.writeHead(409); res.end(JSON.stringify({ error: "lane_busy" })); return;
     }
+    const slot = leaseSlot(state);
     try {
-      const filing = await archiveSavedConversation(state.session.page, body);
+      const filing = await archiveSavedConversation(await slotPage(state, slot), body);
       res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(filing));
     } catch (error) {
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: (error as Error).message }));
-    } finally { state.queue.release(); }
+    } finally { slot.busy = false; state.queue.release(); }
     return;
   }
 
@@ -667,39 +822,55 @@ export async function handleRequest(
       res.end(JSON.stringify({ error: "invalid_conversation_id" }));
       return;
     }
-    const current = state.currentConversation ?? (state.askInFlight ? currentConversationId(state.session.page) : null);
-    if (current && requested && requested !== current) {
-      res.writeHead(409, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "conversation_mismatch", currentConversation: current }));
-      return;
-    }
-    if (current) {
-      state.currentConversation = current;
-      state.reloadConversation = current;
+    const slots = slotsOf(state);
+    // The slot whose in-flight turn is on the requested conversation (with
+    // no id: the first slot with a turn in flight) picks the reload up at
+    // its next poll.
+    const owner = requested
+      ? slots.find((s) => activeConversation(s) === requested)
+      : slots.find((s) => activeConversation(s) !== null);
+    if (owner) {
+      const current = activeConversation(owner)!;
+      owner.currentConversation = current;
+      owner.reloadConversation = current;
       res.writeHead(202, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, conversationId: current, queued: true }));
       return;
     }
+    // Idle path: the slot that last ran the conversation, else the slot that
+    // finished most recently (slot 0 until any turn has run).
+    const slot = (requested && slots.find((s) => s.lastConversation === requested)) ||
+      slots[state.lastFinishedSlot ?? 0];
+    const current = activeConversation(slot);
+    if (current) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "conversation_mismatch", currentConversation: current }));
+      return;
+    }
 
-    const target = requested || state.lastConversation;
+    const target = requested || slot.lastConversation;
     if (!target) {
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "no_conversation" }));
       return;
     }
-    if (!state.queue.tryAcquire()) {
+    if (slot.busy || !state.queue.tryAcquire()) {
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "current_conversation_pending" }));
       return;
     }
+    slot.busy = true;
     try {
-      await openConversation(state.session.page, { conversationId: target });
-      const working = await turnIsWorking(state.session.page);
-      const finalText = working ? "" : await readLatestAssistantText(state.session.page);
-      state.lastConversation = target;
+      const page = await slotPage(state, slot);
+      await openConversation(page, { conversationId: target });
+      const working = await turnIsWorking(page);
+      const finalText = working ? "" : await readLatestAssistantText(page);
+      slot.lastConversation = target;
+      state.lastFinishedSlot = slot.id;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, conversationId: target, queued: false, working, finalText }));
     } finally {
+      slot.busy = false;
       state.queue.release();
     }
     return;
@@ -810,7 +981,8 @@ export async function handleAsk(
     req.off("aborted", onEarlyDisconnect);
   }
 
-  state.askInFlight = true;
+  const slot = leaseSlot(state);
+  slot.askInFlight = true;
   try {
     // 4 hours upper bound — covers the longest GPT-5.5 Pro turns we've
     // seen in practice. Browser-side stays alive because the daemon owns
@@ -841,16 +1013,12 @@ export async function handleAsk(
       background: state.background,
       profile: state.profile,
       consumeReload: () => {
-        if (!state.reloadConversation || state.reloadConversation !== state.currentConversation) return null;
-        const conversationId = state.reloadConversation;
-        state.reloadConversation = null;
+        if (!slot.reloadConversation || slot.reloadConversation !== slot.currentConversation) return null;
+        const conversationId = slot.reloadConversation;
+        slot.reloadConversation = null;
         return conversationId;
       },
     };
-
-    const runner = runAskOnSession(askOpts, state.session);
-    state.currentInvocation = askOpts.invocationId ?? null;
-    state.currentRunner = runner;
 
     const writeEvent = (event: string, data: unknown): void => {
       try {
@@ -868,17 +1036,22 @@ export async function handleAsk(
     });
 
     try {
+      // A slot whose tab must first be opened (slots 1..N-1) fails here on a
+      // login check, so it takes the same error event path as the turn.
+      const runner = runAskOnSession(askOpts, slotSession(state, slot, await slotPage(state, slot)));
+      slot.currentInvocation = askOpts.invocationId ?? null;
+      slot.currentRunner = runner;
       for await (const ev of runner.events) {
         if (ev.type === "started" && ev.conversationId) {
-          state.currentConversation = ev.conversationId;
+          slot.currentConversation = ev.conversationId;
         }
         if (!clientGone) writeEvent(ev.type, ev);
         if (ev.type === "tool" && ev.name === "connector-selected") connectorVerified = true;
         if (ev.type === "tool" && ev.name === "model-thinking-verified" && connectorVerified) {
-          state.interaction = { state: "ready", checkedAt: new Date().toISOString() };
+          slot.interaction = { state: "ready", checkedAt: new Date().toISOString() };
         }
         if (ev.type === "error" && ev.promptSubmitted === false && ev.code) {
-          state.interaction = {
+          slot.interaction = {
             state: "degraded",
             checkedAt: new Date().toISOString(),
             failureCode: ev.code,
@@ -886,7 +1059,8 @@ export async function handleAsk(
         }
       }
       const summary = await runner.result;
-      state.lastConversation = summary.conversationId ?? state.currentConversation;
+      slot.lastConversation = summary.conversationId ?? slot.currentConversation;
+      state.lastFinishedSlot = slot.id;
       if (!clientGone) {
         writeEvent("summary", {
           conversationId: summary.conversationId,
@@ -896,7 +1070,8 @@ export async function handleAsk(
         res.end();
       }
     } catch (err) {
-      state.lastConversation = state.currentConversation ?? state.lastConversation;
+      slot.lastConversation = slot.currentConversation ?? slot.lastConversation;
+      state.lastFinishedSlot = slot.id;
       log.error(`ask turn failed: ${(err as Error).message}`);
       if (!clientGone) {
         writeEvent("error", err instanceof PreSubmitInteractionError
@@ -910,13 +1085,14 @@ export async function handleAsk(
         res.end();
       }
     } finally {
-      state.reloadConversation = null;
-      state.currentConversation = null;
-      state.currentInvocation = null;
-      state.currentRunner = null;
+      slot.reloadConversation = null;
+      slot.currentConversation = null;
+      slot.currentInvocation = null;
+      slot.currentRunner = null;
     }
   } finally {
-    state.askInFlight = false;
+    slot.askInFlight = false;
+    slot.busy = false;
     state.queue.release();
   }
 }
