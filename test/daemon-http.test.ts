@@ -716,3 +716,45 @@ describe("handleAsk HTTP-level wiring", () => {
     }
   });
 });
+
+describe("stop-request attribution", () => {
+  async function post(headers: Record<string, string>) {
+    const { DAEMON_LOG } = await import("../src/daemon/protocol.js");
+    const { readFileSync, statSync } = await import("node:fs");
+    const before = statSync(DAEMON_LOG).size;
+    const req = new FakeReq();
+    (req as unknown as { method: string }).method = "POST";
+    (req as unknown as { url: string }).url = "/shutdown";
+    // Every route except /healthz is authenticated first.
+    req.headers = { authorization: "Bearer test-token", ...headers };
+    const res = new FakeRes();
+    // The route exits the process 50ms after acknowledging; hold that timer.
+    const timer = vi.spyOn(global, "setTimeout").mockImplementation((() => 0) as never);
+    try {
+      await handleRequest(
+        req as unknown as IncomingMessage,
+        res as unknown as ServerResponse,
+        fakeState({ session: { close: vi.fn(async () => {}) } as unknown as Session }),
+      );
+    } finally {
+      timer.mockRestore();
+    }
+    return readFileSync(DAEMON_LOG, "utf8").slice(before);
+  }
+
+  it("names the lane registration file, the caller and the peer address", async () => {
+    // A stop with no attribution is what made the 07:22 incident unreadable:
+    // the log said a stop happened but not which runtime or which caller.
+    const logged = await post({ "x-cgpro-caller": "unit-test" });
+    expect(logged).toContain("requested via");
+    expect(logged).toContain("file=");
+    expect(logged).toContain("caller=unit-test");
+    expect(logged).toContain("remote=");
+    expect(logged).toContain("in_flight=");
+  });
+
+  it("stays fail-open when the caller sends no attribution header", async () => {
+    const logged = await post({});
+    expect(logged).toContain("caller=-");
+  });
+});

@@ -51,6 +51,7 @@ import { NotLoggedInError, PreSubmitInteractionError, SelectorBrokenError } from
 import { SELECTORS } from "../browser/selectors.js";
 import {
   clearDaemonInfo,
+  DAEMON_FILE,
   DAEMON_LOG,
   writeDaemonInfo,
   type DaemonInfo,
@@ -642,7 +643,19 @@ export async function handleRequest(
   }
 
   if (method === "POST" && url.pathname === "/shutdown") {
-    log.info("shutdown requested via /shutdown");
+    // Attribution (P-035 2026-09-16): a stop at 07:22 could not be traced
+    // to any caller, and the registration file is the only thing that says
+    // which lane a runtime belongs to. File, caller header, peer address and
+    // the in-flight count are recorded before the session closes. Every field
+    // is best-effort: a missing header or socket must never turn an accepted
+    // stop into a refused one.
+    const callerHeader = req.headers["x-cgpro-caller"];
+    const caller = typeof callerHeader === "string" && callerHeader ? callerHeader : "-";
+    const remote = req.socket?.remoteAddress ?? "-";
+    const inFlight = slotsOf(state).filter((slot) => slot.busy).length;
+    log.info(
+      `shutdown requested via /shutdown file=${DAEMON_FILE} caller=${caller} remote=${remote} in_flight=${inFlight}`,
+    );
     // Do not acknowledge until the persistent browser has closed. The old
     // fire-and-exit path let the caller start a replacement against the same
     // profile while Chrome was still winding down, leaving crash markers and
