@@ -14,15 +14,38 @@ vi.mock("../src/browser/chatgpt.js", () => ({
 const { openConversation } = await import("../src/browser/conversation.js");
 const target = { id: "g-p-target", shortUrl: "g-p-target-work", name: "Work" };
 
-function pageFor(destination = `/g/${target.id}/project`) {
+function pageFor(
+  destination = `/g/${target.id}/project`,
+  sidebar: { matches: number; visible?: (index: number) => boolean; failFirstAttempts?: number } = { matches: 1 },
+) {
   const rowClick = vi.fn(async () => {});
   const row = {
     waitFor: vi.fn(async () => {}),
     getByText: vi.fn(() => ({ first: () => ({ click: rowClick }) })),
   };
+  // The sidebar link is resolved imperatively (count/nth/isVisible/click) so a
+  // hidden duplicate can be skipped and a timeout can be retried, rather than
+  // one 5s click deciding the turn (P-035 2026-09-16).
+  let clicks = 0;
+  const sidebarMatch = {
+    isVisible: vi.fn(async () => (sidebar.visible ?? (() => true))(sidebarNthIndex)),
+    click: vi.fn(async () => {
+      clicks++;
+      if (clicks <= (sidebar.failFirstAttempts ?? 0)) throw new Error("locator.click: Timeout 5000ms exceeded.");
+    }),
+  };
+  let sidebarNthIndex = 0;
+  const sidebarLocator = {
+    count: vi.fn(async () => sidebar.matches),
+    nth: vi.fn((index: number) => {
+      sidebarNthIndex = index;
+      return sidebarMatch;
+    }),
+  };
   const page = {
     goto: vi.fn(), waitForTimeout: vi.fn(async () => {}), getByRole: vi.fn(), isClosed: vi.fn(() => false),
-    locator: vi.fn(() => ({ filter: vi.fn(() => ({ first: () => row })) })),
+    url: vi.fn(() => "https://chatgpt.com/"),
+    locator: vi.fn(() => ({ ...sidebarLocator, filter: vi.fn(() => ({ first: () => row })) })),
     waitForURL: vi.fn(async (predicate: (url: URL) => boolean) => {
       if (!predicate(new URL(destination, "https://chatgpt.com"))) throw new Error("Wrong Project URL");
     }),
@@ -31,7 +54,7 @@ function pageFor(destination = `/g/${target.id}/project`) {
     if (name === "composer") return {};
     return { click: vi.fn(async () => {}) };
   });
-  return { page, rowClick, row };
+  return { page, rowClick, row, sidebarMatch };
 }
 
 beforeEach(() => { vi.clearAllMocks(); projects.mockResolvedValue([target]); });
@@ -76,5 +99,29 @@ describe("Project directory navigation", () => {
     const { page } = pageFor("/g/g-p-other/project");
     await expect(openConversation(page, { gizmoId: target.id })).rejects.toThrow("Wrong Project URL");
     expect(requireSelector.mock.calls.some(c => c[2] === "composer")).toBe(false);
+  });
+});
+
+describe("Project directory sidebar click", () => {
+  it("skips a hidden sidebar match and clicks the reachable one", async () => {
+    // `a[href="/projects"]` can match more than one node; `.first()` alone
+    // picks whichever came first in the DOM, hidden ones included.
+    const { page, sidebarMatch } = pageFor(undefined, {
+      matches: 2,
+      visible: (index) => index === 1,
+    });
+    await openConversation(page, { gizmoId: target.id });
+    expect(sidebarMatch.click).toHaveBeenCalledOnce();
+  });
+  it("retries the sidebar click instead of failing the turn on the first timeout", async () => {
+    const { page, sidebarMatch } = pageFor(undefined, { matches: 1, failFirstAttempts: 1 });
+    await openConversation(page, { gizmoId: target.id });
+    expect(sidebarMatch.click).toHaveBeenCalledTimes(2);
+  });
+  it("names the match count and URL when the sidebar never becomes clickable", async () => {
+    const { page } = pageFor(undefined, { matches: 2, visible: () => false });
+    await expect(openConversation(page, { gizmoId: target.id })).rejects.toThrow(
+      /Projects navigation could not be clicked after 3 attempts \(matches=2, visible=0/,
+    );
   });
 });

@@ -48,9 +48,9 @@ export async function openConversation(
     }
     // The directory row prepares Project metadata before client navigation.
     // A cold deep link can instead hit the unavailable locked-chats endpoint.
-    const directory = await requireSelectorPatient(page, SELECTORS.projectsNavigation, "Projects navigation");
+    await requireSelectorPatient(page, SELECTORS.projectsNavigation, "Projects navigation");
     await page.waitForTimeout(5_000);
-    await directory.click({ timeout: 5_000 });
+    await clickFirstActionable(page, SELECTORS.projectsNavigation, "Projects navigation");
     // A saturated host can take longer than one budget to hydrate the
     // directory, and this locator is the only place the vendor clicks a
     // sidebar row. Re-resolve it per attempt instead of failing once, the
@@ -1204,4 +1204,57 @@ export async function latestAssistantModelSlug(page: Page): Promise<string | nul
   const bubble = await latestAssistantBubble(page);
   if (!bubble) return null;
   return (await bubble.getAttribute("data-message-model-slug").catch(() => null)) ?? null;
+}
+
+
+/**
+ * Click the first candidate Playwright can actually reach, resolving afresh
+ * each attempt.
+ *
+ * The sidebar link is present long before it is actionable: a saturated host
+ * leaves it mid-transition or under a pointer-intercepting overlay, and a
+ * single 5s click budget then fails a turn the next attempt would pass
+ * (P-035 planning-lane incident 2026-09-16, `a[href="/projects"]`). Resolving
+ * per attempt mirrors the send path; choosing among matches imperatively
+ * avoids a `{ visible: true }` filter, which is re-evaluated at action time
+ * and broke the composer click earlier the same day.
+ *
+ * Readiness gates stay patient (`requireSelectorPatient`); this is only the
+ * click itself.
+ */
+async function clickFirstActionable(
+  page: Page,
+  candidates: string[],
+  name: string,
+  attempts = 3,
+): Promise<void> {
+  const selector = joinSelectors(candidates);
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const matches = page.locator(selector);
+    const count = await matches.count().catch(() => 0);
+    for (let index = 0; index < count; index++) {
+      const candidate = matches.nth(index);
+      if (!(await candidate.isVisible().catch(() => false))) continue;
+      try {
+        await candidate.click({ timeout: 15_000 });
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (page.isClosed()) break;
+    await page.waitForTimeout(3_000);
+  }
+  const matches = page.locator(selector);
+  const count = await matches.count().catch(() => -1);
+  let visible = 0;
+  for (let index = 0; index < count; index++) {
+    if (await matches.nth(index).isVisible().catch(() => false)) visible++;
+  }
+  throw new Error(
+    `${name} could not be clicked after ${attempts} attempts ` +
+      `(matches=${count}, visible=${visible}, url=${page.url()})` +
+      (lastError instanceof Error ? `: ${lastError.message}` : ""),
+  );
 }
