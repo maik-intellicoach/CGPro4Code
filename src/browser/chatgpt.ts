@@ -185,11 +185,13 @@ export async function fetchMeInPage(page: Page): Promise<{
  */
 export async function firstResolved(page: Page, candidates: string[]): Promise<Locator | null> {
   for (const sel of candidates) {
-    // A hidden first match must not hide a visible later one: the candidate
-    // loop only advances to the NEXT selector, so a hidden first node used to
-    // make an otherwise resolvable selector look broken (P-035 2026-09-16,
-    // planning-lane selector failures). filter({visible}) can only widen.
-    const loc = page.locator(sel).filter({ visible: true }).first();
+    // Plain .first(), not filter({visible}).first(): the visibility guard
+    // below already rejects a hidden first match, while a filtered locator
+    // carries that filter into every later action and made clicks time out on
+    // a page whose target flickers (P-035 2026-09-16: two probes failed with
+    // "locator.click: Timeout ... waiting for locator('...').filter({ visible:
+    // true }).first()"). Reverted to the pre-fix line.
+    const loc = page.locator(sel).first();
     try {
       const count = await loc.count();
       if (count > 0 && await loc.isVisible()) {
