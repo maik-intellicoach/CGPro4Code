@@ -29,6 +29,11 @@ export interface DaemonStartOptions {
   background?: boolean;
 }
 
+export interface DaemonStopOptions {
+  /** Stop even while a page is leased (a wedge, not a live turn). */
+  force?: boolean;
+}
+
 export async function daemonStartCmd(opts: DaemonStartOptions): Promise<number> {
   const existing = await getLiveDaemon();
   if (existing) {
@@ -89,7 +94,7 @@ export async function daemonStartCmd(opts: DaemonStartOptions): Promise<number> 
   return 1;
 }
 
-export async function daemonStopCmd(): Promise<number> {
+export async function daemonStopCmd(opts: DaemonStopOptions = {}): Promise<number> {
   const info = readDaemonInfo();
   if (!info) {
     console.log(chalk.dim("No daemon registered."));
@@ -98,8 +103,19 @@ export async function daemonStopCmd(): Promise<number> {
 
   const live = await getLiveDaemon();
   if (live) {
-    const ok = await shutdownDaemon(live);
-    if (ok) {
+    const outcome = await shutdownDaemon(live, opts.force === true);
+    if (outcome.kind === "refused") {
+      // P-035 2026-09-16: the daemon refuses a stop while a page is leased.
+      // Falling through to SIGTERM here killed the exact turn that refusal
+      // protected, which is how the guard read as working while doing nothing.
+      // A refusal now ends the stop and names the escape hatch instead.
+      console.error(
+        chalk.red(`\u2716 Refused to stop: the lane holds a leased page (${outcome.detail})`),
+      );
+      console.error(chalk.dim("  Wait for the turn to finish, or re-run: cgpro daemon stop --force"));
+      return 4;
+    }
+    if (outcome.kind === "stopped") {
       // Wait briefly for the file to disappear.
       const deadline = Date.now() + 5_000;
       while (Date.now() < deadline) {

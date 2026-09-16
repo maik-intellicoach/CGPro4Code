@@ -157,21 +157,55 @@ export async function requestDaemonReload(
   );
 }
 
-export async function shutdownDaemon(info: DaemonInfo): Promise<boolean> {
+export type shutdownOutcome =
+  | { kind: "stopped" }
+  /** The daemon refused: a page is leased. The body names the holders. */
+  | { kind: "refused"; detail: string }
+  /** The request never completed, or the daemon answered something else. */
+  | { kind: "failed" };
+
+export async function shutdownDaemon(info: DaemonInfo, force = false): Promise<shutdownOutcome> {
   // Closing a persistent Chrome profile can take longer than the normal
   // five-second control request. The server acknowledges only after Chrome
   // has closed, preventing a replacement from racing the old profile.
-  const r = await jsonRequest<{ ok: boolean }>(info, "POST", "/shutdown", {}, 30_000);
-  return r?.ok === true;
+  //
+  // The status and body matter here (P-035 2026-09-16): the daemon answers 409
+  // lane_busy when a page is leased, and a caller that reads that as a generic
+  // failure falls through to SIGTERM, which kills the very turn the daemon
+  // just protected. The refusal has to survive as its own outcome.
+  const r = await rawRequest(
+    info,
+    "POST",
+    "/shutdown",
+    {},
+    30_000,
+    force ? { "x-cgpro-force": "1" } : {},
+  );
+  if (r.status === 200) {
+    try {
+      if ((JSON.parse(r.text) as { ok?: boolean }).ok === true) return { kind: "stopped" };
+    } catch {
+      /* fall through to failed */
+    }
+  }
+  if (r.status === 409) return { kind: "refused", detail: r.text.trim() || "lane_busy" };
+  return { kind: "failed" };
 }
 
-function jsonRequest<T>(
+/** Raw HTTP result. `status: 0` means the request never completed. */
+interface RawResponse {
+  status: number;
+  text: string;
+}
+
+function rawRequest(
   info: DaemonInfo,
   method: string,
   path: string,
   body: unknown,
   timeoutMs = 5_000,
-): Promise<T | null> {
+  extraHeaders: Record<string, string> = {},
+): Promise<RawResponse> {
   return new Promise((resolve) => {
     const payload = body === null ? undefined : JSON.stringify(body);
     const req = request(
@@ -194,6 +228,7 @@ function jsonRequest<T>(
           // says force, so a helper that has already established idle (or
           // deliberately overrides a wedged lane) opts in explicitly.
           ...(process.env.CGPRO_FORCE_STOP === "1" ? { "x-cgpro-force": "1" } : {}),
+          ...extraHeaders,
           ...(payload ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) } : {}),
         },
       },
@@ -201,24 +236,33 @@ function jsonRequest<T>(
         let buf = "";
         res.setEncoding("utf-8");
         res.on("data", (c) => (buf += c));
-        res.on("end", () => {
-          if ((res.statusCode ?? 0) >= 400) return resolve(null);
-          try {
-            resolve(JSON.parse(buf) as T);
-          } catch {
-            resolve(null);
-          }
-        });
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, text: buf }));
       },
     );
-    req.on("error", () => resolve(null));
+    req.on("error", () => resolve({ status: 0, text: "" }));
     req.on("timeout", () => {
       req.destroy();
-      resolve(null);
+      resolve({ status: 0, text: "" });
     });
     if (payload) req.write(payload);
     req.end();
   });
+}
+
+async function jsonRequest<T>(
+  info: DaemonInfo,
+  method: string,
+  path: string,
+  body: unknown,
+  timeoutMs = 5_000,
+): Promise<T | null> {
+  const r = await rawRequest(info, method, path, body, timeoutMs);
+  if (r.status === 0 || r.status >= 400) return null;
+  try {
+    return JSON.parse(r.text) as T;
+  } catch {
+    return null;
+  }
 }
 
 /**

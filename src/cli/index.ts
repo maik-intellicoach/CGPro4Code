@@ -230,8 +230,9 @@ daemon
 daemon
   .command("stop")
   .description("Stop the running daemon.")
-  .action(async () => {
-    const code = await runOrExit(() => daemonStopCmd());
+  .option("--force", "stop even while a page is leased (a wedged lane, not a live turn)")
+  .action(async (opts) => {
+    const code = await runOrExit(() => daemonStopCmd(opts));
     process.exit(code);
   });
 
