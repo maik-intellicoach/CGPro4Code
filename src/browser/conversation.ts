@@ -900,10 +900,14 @@ async function insertComposerText(page: Page, composer: Locator, text: string): 
   // whatever the composer already holds, and what must survive intact is the
   // text we just inserted -- ending with the last line we wrote. A drop
   // anywhere inside that text still fails the check.
-  // Fail OPEN on the read: an unreadable composer must not trigger a duplicate
-  // write. Only a composer we can actually read can be judged incomplete.
-  let landed = await readComposer(composer);
-  if (landed === null || landed.endsWith(want)) return;
+  //
+  // Fail CLOSED on an unreadable composer. The old code returned early there,
+  // reasoning that an unreadable read must not cause a duplicate write -- true,
+  // but not writing and not SUBMITTING are different things, and submitting a
+  // prompt we could not verify is the expensive half. Re-typing is safe because
+  // clearComposer wipes the field first, so nothing can be doubled.
+  let landed = await readComposer(page, composer);
+  if (landed !== null && landed.endsWith(want)) return;
 
   // P-035 2026-09-17: the old check asked only "is the composer empty?", so a
   // composer holding the first N of 162 lines passed and was submitted. The
@@ -912,16 +916,18 @@ async function insertComposerText(page: Page, composer: Locator, text: string): 
   // asks for the id it cannot, calls no tool, and the facade reads that as a
   // connector policy failure that latches the account out of routing.
   console.error(
-    `[cgpro:composer] composer holds ${landed.length} of ${want.length} expected characters; re-entering by keystroke`,
+    `[cgpro:composer] composer ${landed === null ? "could not be read" : `holds ${landed.length} of ${want.length} expected characters`}; re-entering by keystroke`,
   );
   await clearComposer(page);
   await typeLines(page, lines);
-  landed = await readComposer(composer);
-  if (landed === null || landed.endsWith(want)) return;
+  landed = await readComposer(page, composer);
+  if (landed !== null && landed.endsWith(want)) return;
   throw new PreSubmitInteractionError(
     "prompt_delivery_incomplete",
     "prompt_delivery",
-    `composer delivery incomplete: ${landed.length} of ${want.length} characters landed after two attempts`,
+    landed === null
+      ? "composer delivery unverifiable: the composer could not be read after two attempts"
+      : `composer delivery incomplete: ${landed.length} of ${want.length} characters landed after two attempts`,
   );
 }
 
@@ -934,10 +940,21 @@ function normaliseComposerText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
-async function readComposer(composer: Locator): Promise<string | null> {
-  const raw = await composer.innerText().catch(() => null);
-  return raw === null ? null : normaliseComposerText(raw);
+/**
+ * Read the composer, tolerating a transient failure. Only a composer that stays
+ * unreadable across attempts is treated as unverifiable, so one flaky read under
+ * load does not fail a turn that was actually fine.
+ */
+async function readComposer(page: Page, composer: Locator): Promise<string | null> {
+  for (let attempt = 0; attempt < COMPOSER_READ_ATTEMPTS; attempt++) {
+    const raw = await composer.innerText().catch(() => null);
+    if (raw !== null) return normaliseComposerText(raw);
+    await page.waitForTimeout(250);
+  }
+  return null;
 }
+
+const COMPOSER_READ_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_COMPOSER_READ_ATTEMPTS ?? 3));
 
 async function insertLines(page: Page, lines: string[]): Promise<void> {
   for (let i = 0; i < lines.length; i++) {

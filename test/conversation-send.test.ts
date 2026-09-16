@@ -153,6 +153,42 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     expect(page.keyboard.press).not.toHaveBeenCalledWith("Enter");
   });
 
+  it("refuses to submit when the composer cannot be read at all", async () => {
+    // Fail CLOSED. Not re-typing into an unreadable composer is right; sending a
+    // prompt we could not verify is not. The read is retried first so one flaky
+    // innerText under load does not fail a turn that was actually fine.
+    const click = vi.fn(async () => {});
+    firstResolved.mockResolvedValue(fakeLocator({ click }));
+    const unreadable = {
+      ...fakeLocator(),
+      innerText: async () => { throw new Error("Target page, context or browser has been closed"); },
+    };
+    requireSelector.mockResolvedValue(unreadable);
+    const page = fakePage();
+
+    await expect(sendPrompt(page, "hello", false)).rejects.toThrow("composer delivery unverifiable");
+
+    expect(click).not.toHaveBeenCalled();
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+  });
+
+  it("accepts a composer that recovers on a later read attempt", async () => {
+    let reads = 0;
+    const flaky = {
+      ...fakeLocator(),
+      innerText: async () => {
+        if (++reads === 1) throw new Error("transient");
+        return composed;
+      },
+    };
+    requireSelector.mockResolvedValue(flaky);
+    firstResolved.mockResolvedValue(fakeLocator());
+    const page = fakePage();
+
+    await expect(sendPrompt(page, "hello", false)).resolves.toBeDefined();
+    expect(page.keyboard.type).not.toHaveBeenCalled(); // no needless retype
+  });
+
   it("accepts a composer that already held text in preserveExisting mode", async () => {
     // preserveExisting appends to an inline connector pill's text, so the
     // composer legitimately holds more than the prompt. What must be intact is
