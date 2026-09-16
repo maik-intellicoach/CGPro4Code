@@ -695,19 +695,23 @@ export async function handleRequest(
     // live turn. Forcing stays available for a wedged lane.
     if (busy.length > 0 && !forced) {
       log.info(
-        `STOP refused via /shutdown file=${DAEMON_FILE} caller=${caller} remote=${remote} in_flight=${busy.length} holders=${busy.map((slot) => `${slot.id}:${slot.leasedBy ?? "unknown"}`).join(",")}`,
+        `STOP refused via /shutdown file=${DAEMON_FILE} caller=${caller} remote=${remote} in_flight=${busy.length} queued=${state.queue.depth} holders=${busy.map((slot) => `${slot.id}:${slot.leasedBy ?? "unknown"}`).join(",")}`,
       );
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         error: "lane_busy",
         in_flight: busy.length,
+        // Waiting requests hold no page, so they cannot appear as holders. They
+        // are recorded because a waiter only exists while every page is busy:
+        // the lease test above already covers them, and this says so.
+        queued: state.queue.depth,
         holders: busy.map((slot) => ({ slot: slot.id, leasedBy: slot.leasedBy, invocationId: slot.currentInvocation })),
         force_hint: "resend with header x-cgpro-force: 1 to stop anyway",
       }));
       return;
     }
     log.info(
-      `shutdown accepted via /shutdown file=${DAEMON_FILE} caller=${caller} remote=${remote} in_flight=${inFlight} forced=${forced}`,
+      `shutdown accepted via /shutdown file=${DAEMON_FILE} caller=${caller} remote=${remote} in_flight=${inFlight} queued=${state.queue.depth} forced=${forced}`,
     );
     // Do not acknowledge until the persistent browser has closed. The old
     // fire-and-exit path let the caller start a replacement against the same

@@ -759,6 +759,58 @@ describe("stop guard while a page is leased", () => {
     const res = await postStop({ "x-cgpro-force": "1" });
     expect((res as unknown as FakeRes).statusCode).toBe(200);
   });
+
+  it("records how many requests were waiting, and refuses on the lease alone", async () => {
+    // P-035 2026-09-16: a waiting request holds no page, so it can never appear
+    // as a holder. It is recorded anyway, because the two facts together are
+    // the argument that the lease test alone is sufficient: a waiter exists
+    // only while every page is busy, so it is never the only thing at risk.
+    const { slotsOf } = await import("../src/daemon/server.js");
+    const state = fakeState({ session: { close: vi.fn(async () => {}) } as unknown as Session });
+    const leased = slotsOf(state)[0];
+    leased.busy = true;
+    leased.leasedBy = "ask";
+    expect(state.queue.tryAcquire()).toBe(true); // the running ask holds capacity
+    const abort = new AbortController();
+    const waiter = state.queue.acquire(abort.signal);
+    waiter.catch(() => {}); // cancelled below; never left unhandled
+    expect(state.queue.depth).toBe(1);
+
+    const req = new FakeReq();
+    (req as unknown as { method: string }).method = "POST";
+    (req as unknown as { url: string }).url = "/shutdown";
+    req.headers = { authorization: "Bearer test-token" };
+    const res = new FakeRes();
+    await handleRequest(req as unknown as IncomingMessage, res as unknown as ServerResponse, state);
+    abort.abort();
+
+    const body = parseJsonBody(res) as { error: string; in_flight: number; queued: number };
+    expect(res.statusCode).toBe(409);
+    expect(body.error).toBe("lane_busy");
+    expect(body.in_flight).toBe(1);
+    expect(body.queued).toBe(1);
+  });
+
+  it("refuses while a reload waits behind a live turn", async () => {
+    // A /reload parks itself on the slot whose turn is running and returns 202
+    // queued. That reservation lives on a leased page, so the lease test covers
+    // it; this pins the assumption rather than leaving it as a reading.
+    const { slotsOf } = await import("../src/daemon/server.js");
+    const state = fakeState({ session: { close: vi.fn(async () => {}) } as unknown as Session });
+    const slot = slotsOf(state)[0];
+    slot.busy = true;
+    slot.leasedBy = "ask";
+    slot.currentConversation = "11111111-1111-1111-1111-111111111111";
+    slot.reloadConversation = slot.currentConversation;
+
+    const req = new FakeReq();
+    (req as unknown as { method: string }).method = "POST";
+    (req as unknown as { url: string }).url = "/shutdown";
+    req.headers = { authorization: "Bearer test-token" };
+    const res = new FakeRes();
+    await handleRequest(req as unknown as IncomingMessage, res as unknown as ServerResponse, state);
+    expect(res.statusCode).toBe(409);
+  });
 });
 
 describe("slot lease attribution", () => {
