@@ -16,7 +16,7 @@ vi.mock("../src/browser/chatgpt.js", () => ({
 // out the real default.
 process.env.CGPRO_SEND_CLICK_ATTEMPTS = "2";
 
-const { sendPrompt } = await import("../src/browser/conversation.js");
+const { sendPrompt, composerHoldsPrompt } = await import("../src/browser/conversation.js");
 
 // What the fake composer currently holds. sendPrompt reads the composer back to
 // confirm the whole prompt landed, so a stub that answers a constant string no
@@ -245,5 +245,50 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     });
     await sendPrompt(page, "hello", true, undefined, async () => { focus = "menu"; });
     expect(page.keyboard.press).toHaveBeenCalledWith("Enter");
+  });
+});
+
+describe("composerHoldsPrompt (P-035 2026-09-17)", () => {
+  // Learned in production, not in review: chatgpt.com's composer RENDERS
+  // markdown, so innerText never contains the backticks, the "# " of a heading
+  // or the "1. " of an ordered list. The first version of this check compared
+  // normalised text with endsWith and failed a perfectly healthy 4,060-character
+  // planning prompt that came back as 4,033 -- 16 backticks + one heading mark +
+  // three list markers, exactly 27 characters of markdown syntax.
+  const render = (s: string) =>
+    s.replace(/`/g, "").replace(/^#+ /gm, "").replace(/^\s*\d+\. /gm, "");
+  const norm = (s: string) => s.replace(/\s+/g, " ").trim();
+  const prompt =
+    "# Heading\n\nSome context with `code` and `more code` and `a third span`.\n\n" +
+    "1. first item\n2. second item\n3. third item\n\n" +
+    "Body text ".repeat(40) +
+    '\n\ninvocation_id="e4adf507-daeb-4a90-be5e-a45bd9f9c40b"';
+
+  it("accepts a composer that merely rendered the markdown away", () => {
+    const want = norm(prompt);
+    const landed = norm(render(prompt));
+    expect(landed.length).toBeLessThan(want.length); // the composer really is shorter
+    expect(composerHoldsPrompt(landed, want)).toBe(true);
+  });
+
+  it("rejects a composer that lost the invocation contract off the end", () => {
+    const want = norm(prompt);
+    const landed = norm(render(prompt.slice(0, prompt.indexOf("invocation_id"))));
+    expect(composerHoldsPrompt(landed, want)).toBe(false);
+  });
+
+  it("rejects a composer holding only the head of the prompt", () => {
+    const want = norm(prompt);
+    expect(composerHoldsPrompt(norm(prompt.slice(0, 120)), want)).toBe(false);
+  });
+
+  it("accepts extra leading content, for preserveExisting", () => {
+    const want = norm(prompt);
+    expect(composerHoldsPrompt(norm("inline pill text " + prompt), want)).toBe(true);
+  });
+
+  it("falls back to the length floor when the prompt has no invariant token", () => {
+    expect(composerHoldsPrompt("hi there", "hi there")).toBe(true);
+    expect(composerHoldsPrompt("hi", "hi there ok fine yes no")).toBe(false);
   });
 });

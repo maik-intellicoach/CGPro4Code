@@ -896,18 +896,13 @@ async function insertComposerText(page: Page, composer: Locator, text: string): 
   if (process.env.CGPRO_SKIP_COMPOSER_VERIFY === "1") return;
 
   const want = normaliseComposerText(text);
-  // endsWith, not equality: sendPrompt's preserveExisting mode appends to
-  // whatever the composer already holds, and what must survive intact is the
-  // text we just inserted -- ending with the last line we wrote. A drop
-  // anywhere inside that text still fails the check.
-  //
   // Fail CLOSED on an unreadable composer. The old code returned early there,
   // reasoning that an unreadable read must not cause a duplicate write -- true,
   // but not writing and not SUBMITTING are different things, and submitting a
   // prompt we could not verify is the expensive half. Re-typing is safe because
   // clearComposer wipes the field first, so nothing can be doubled.
   let landed = await readComposer(page, composer);
-  if (landed !== null && landed.endsWith(want)) return;
+  if (landed !== null && composerHoldsPrompt(landed, want)) return;
 
   // P-035 2026-09-17: the old check asked only "is the composer empty?", so a
   // composer holding the first N of 162 lines passed and was submitted. The
@@ -921,7 +916,7 @@ async function insertComposerText(page: Page, composer: Locator, text: string): 
   await clearComposer(page);
   await typeLines(page, lines);
   landed = await readComposer(page, composer);
-  if (landed !== null && landed.endsWith(want)) return;
+  if (landed !== null && composerHoldsPrompt(landed, want)) return;
   throw new PreSubmitInteractionError(
     "prompt_delivery_incomplete",
     "prompt_delivery",
@@ -933,12 +928,48 @@ async function insertComposerText(page: Page, composer: Locator, text: string): 
 
 /**
  * The composer renders each line as its own node and trims, so whitespace
- * differences are expected and meaningless. Any other difference is a delivery
- * fault, and length alone is immune to quote or entity rewriting.
+ * differences are expected and meaningless.
  */
 function normaliseComposerText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
+
+/**
+ * Does the composer hold the prompt we meant to send?
+ *
+ * NOT a character-for-character comparison, and the first cut of this check
+ * learned that the hard way in production (P-035 2026-09-17): chatgpt.com's
+ * composer RENDERS markdown, so `innerText` never contains the backticks, the
+ * `# ` of a heading, or the `1. ` of an ordered list. A 4,060-character
+ * planning prompt came back as 4,033 -- 16 backticks + one heading mark + three
+ * list markers, exactly 27 -- and an endsWith check failed a healthy turn.
+ * Reimplementing the renderer to compare exactly is a losing game.
+ *
+ * So check two things that markdown rendering cannot touch:
+ *
+ *  - the last rendering-invariant token of the prompt is present. Alphanumeric
+ *    runs survive any formatting, and the final one in a planning prompt is the
+ *    connector's invocation UUID -- the exact thing whose loss caused the
+ *    incident. This is what catches a dropped tail.
+ *  - the composer is not grossly shorter than intended. Markdown syntax is well
+ *    under 1% of a real prompt, so a 10% floor is far outside that noise while
+ *    still catching a prompt that arrived in pieces.
+ *
+ * preserveExisting appends to existing composer content, hence `>=`, not `===`.
+ */
+export function composerHoldsPrompt(landed: string, want: string): boolean {
+  if (landed.length < Math.floor(want.length * COMPOSER_MIN_LANDED_RATIO)) return false;
+  const tail = lastInvariantToken(want);
+  return tail === null || landed.includes(tail);
+}
+
+/** Longest trailing run of characters no markdown renderer rewrites. */
+function lastInvariantToken(text: string): string | null {
+  const tokens = text.match(/[A-Za-z0-9][A-Za-z0-9-]{7,}/g);
+  return tokens === null || tokens.length === 0 ? null : tokens[tokens.length - 1];
+}
+
+const COMPOSER_MIN_LANDED_RATIO = Number(process.env.CGPRO_COMPOSER_MIN_LANDED_RATIO ?? 0.9);
 
 /**
  * Read the composer, tolerating a transient failure. Only a composer that stays
