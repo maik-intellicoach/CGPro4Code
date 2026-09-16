@@ -183,6 +183,13 @@ function jsonRequest<T>(
         timeout: timeoutMs,
         headers: {
           Authorization: `Bearer ${info.token}`,
+          // Attribution (P-035 2026-09-16): the daemon records the caller on
+          // every lifecycle request. The CLI is invoked fresh per restart, so
+          // this is live on rebuild without touching a running lane, and
+          // CGPRO_CALLER lets a governed helper name itself instead of
+          // appearing as an anonymous stop.
+          "x-cgpro-caller":
+            process.env.CGPRO_CALLER || `cgpro-cli:${process.argv[2] ?? "?"}:${process.pid}`,
           ...(payload ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) } : {}),
         },
       },
