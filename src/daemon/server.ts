@@ -580,7 +580,14 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
 
   // Graceful shutdown on common signals.
   const shutdown = async (signal: string): Promise<never> => {
-    log.info(`received ${signal} — shutting down`);
+    // Attribution (P-035 2026-09-16): the signal name alone cannot say
+    // whether a live turn was killed or who asked. The parent pid is the
+    // sender in the common cases (launchd, a shell, a supervisor), and the
+    // in-flight count says what was lost.
+    const inFlight = slotsOf(state).filter((slot) => slot.busy).length;
+    log.info(
+      `received ${signal} file=${DAEMON_FILE} ppid=${process.ppid} in_flight=${inFlight} — shutting down`,
+    );
     server.close();
     return closeDaemonSessionBeforeExit(session);
   };
