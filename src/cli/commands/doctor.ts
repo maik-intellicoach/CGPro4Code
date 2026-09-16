@@ -10,6 +10,20 @@ export interface DoctorOptions {
   headed?: boolean;
 }
 
+/**
+ * How long the sign-in check may take before the audit gives up.
+ *
+ * P-035 2026-09-16: this was 8s, which a cold launch on a healthy profile does
+ * not always beat -- the daemon's own start path allows 60s for the same
+ * profile and reported `proModelAvailable: true` minutes after an 8s check had
+ * declared it signed out. The failure mode is nasty because it is silent: the
+ * audit then runs against the login page, where every selector legitimately
+ * fails, and the operator reads a full table of ✖ as selector drift.
+ */
+const SIGNIN_TIMEOUT_MS = Number(
+  process.env.CGPRO_DOCTOR_SIGNIN_TIMEOUT_MS ?? 60_000,
+);
+
 export async function doctorCommand(opts: DoctorOptions): Promise<number> {
   await assertNoDaemon("doctor", opts.profile);
   const session = await openSession({ headed: !!opts.headed, profilePath: opts.profile });
@@ -17,12 +31,27 @@ export async function doctorCommand(opts: DoctorOptions): Promise<number> {
   let exitCode = 0;
   try {
     await goHome(session.page);
-    const logged = await isLoggedIn(session.page, 8_000);
+    const logged = await isLoggedIn(session.page, SIGNIN_TIMEOUT_MS);
     if (!logged) {
-      spinner.warn("Not signed in — running selector audit on the login page.");
-    } else {
-      spinner.succeed("Signed in. Running selector audit.");
+      // Never audit the login page: every selector fails there by definition,
+      // so the table would report drift that does not exist and bury the real
+      // problem (no usable session). Refuse, and say which profile and how to
+      // fix it.
+      spinner.warn("Not signed in — cannot audit selectors.");
+      console.log("");
+      console.log(
+        chalk.yellow(
+          "The profile has no usable ChatGPT session, so every selector would fail on the login page.",
+        ),
+      );
+      console.log(
+        chalk.dim(
+          `  Profile: ${opts.profile ?? "default"}; sign in with: CGPRO_USE_CHROME=1 cgpro login --profile <dir>`,
+        ),
+      );
+      return 6;
     }
+    spinner.succeed("Signed in. Running selector audit.");
 
     console.log("");
     console.log(chalk.bold("Selector audit"));
