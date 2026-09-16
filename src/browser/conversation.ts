@@ -849,7 +849,7 @@ export async function sendPrompt(
       await page.keyboard.type(lines[i], { delay: 4 });
     }
   } else {
-    await insertComposerText(page, composer, prompt);
+    await insertComposerText(page, prompt);
   }
   const priorAssistantCount = await assistantCount();
   if (cancelled?.()) return priorAssistantCount;
@@ -857,6 +857,12 @@ export async function sendPrompt(
   // Typing may change inline modes. Verify the composed request, not just
   // the empty composer, and let failures stop both click and Enter submission.
   await verifySubmission?.();
+  if (cancelled?.()) return priorAssistantCount;
+
+  // Last thing before the send click: does the composer hold the prompt? This
+  // sits AFTER verifySubmission deliberately -- that step opens and closes the
+  // thinking-power menu, so anything it does to the draft has already happened.
+  await verifyComposerHoldsPrompt(page, composer, prompt, preserveExisting);
   if (cancelled?.()) return priorAssistantCount;
 
   const clicked = await clickSendButtonWithRetries(page, cancelled);
@@ -889,9 +895,29 @@ export async function sendPrompt(
  *
  * Escape hatch: CGPRO_SKIP_COMPOSER_VERIFY=1 restores the unverified path.
  */
-async function insertComposerText(page: Page, composer: Locator, text: string): Promise<void> {
-  const lines = text.split("\n");
-  await insertLines(page, lines);
+async function insertComposerText(page: Page, text: string): Promise<void> {
+  await insertLines(page, text.split("\n"));
+}
+
+/**
+ * Refuse to send a prompt the composer does not actually hold.
+ *
+ * Called immediately before the send click, NOT right after insertion. The
+ * model-thinking check runs in between and opens the thinking-power menu with
+ * three five-second waits; if that interaction is what loses the draft, a check
+ * that ran before it would pass and the turn would still go out empty.
+ *
+ * On a connector turn `preserveExisting` is true (orchestrator.ts: every turn
+ * with a connector), and the connector's inline mention may live INSIDE the
+ * composer. `clearComposer` would therefore strip the connector, and re-typing
+ * would submit a connector-required prompt with no connector attached -- which
+ * produces the genuine `connector_required_not_used` this whole change exists
+ * to prevent. So the re-insert retry only runs when nothing must be preserved;
+ * a connector turn gets one attempt and an honest failure.
+ */
+async function verifyComposerHoldsPrompt(
+  page: Page, composer: Locator, text: string, preserveExisting: boolean,
+): Promise<void> {
   if (text.trim().length === 0) return;
   if (process.env.CGPRO_SKIP_COMPOSER_VERIFY === "1") return;
 
@@ -899,30 +925,25 @@ async function insertComposerText(page: Page, composer: Locator, text: string): 
   // Fail CLOSED on an unreadable composer. The old code returned early there,
   // reasoning that an unreadable read must not cause a duplicate write -- true,
   // but not writing and not SUBMITTING are different things, and submitting a
-  // prompt we could not verify is the expensive half. Re-typing is safe because
-  // clearComposer wipes the field first, so nothing can be doubled.
+  // prompt we could not verify is the expensive half.
   let landed = await readComposer(page, composer);
   if (landed !== null && composerHoldsPrompt(landed, want)) return;
 
-  // P-035 2026-09-17: the old check asked only "is the composer empty?", so a
-  // composer holding the first N of 162 lines passed and was submitted. The
-  // prompt's LAST line carries the connector's mandatory invocation_id, so a
-  // dropped tail costs the whole turn: ChatGPT answers the preamble it can see,
-  // asks for the id it cannot, calls no tool, and the facade reads that as a
-  // connector policy failure that latches the account out of routing.
-  console.error(
-    `[cgpro:composer] composer ${landed === null ? "could not be read" : `holds ${landed.length} of ${want.length} expected characters`}; re-entering by keystroke`,
-  );
-  await clearComposer(page);
-  await typeLines(page, lines);
-  landed = await readComposer(page, composer);
-  if (landed !== null && composerHoldsPrompt(landed, want)) return;
+  if (!preserveExisting) {
+    console.error(
+      `[cgpro:composer] composer ${landed === null ? "could not be read" : `holds ${landed.length} of ${want.length} expected characters`}; re-inserting once`,
+    );
+    await clearComposer(page);
+    await insertLines(page, text.split("\n"));
+    landed = await readComposer(page, composer);
+    if (landed !== null && composerHoldsPrompt(landed, want)) return;
+  }
   throw new PreSubmitInteractionError(
     "prompt_delivery_incomplete",
     "prompt_delivery",
     landed === null
-      ? "composer delivery unverifiable: the composer could not be read after two attempts"
-      : `composer delivery incomplete: ${landed.length} of ${want.length} characters landed after two attempts`,
+      ? "composer delivery unverifiable: the composer could not be read"
+      : `composer delivery incomplete: ${landed.length} of ${want.length} characters landed`,
   );
 }
 
@@ -931,7 +952,10 @@ async function insertComposerText(page: Page, composer: Locator, text: string): 
  * differences are expected and meaningless.
  */
 function normaliseComposerText(text: string): string {
-  return text.replace(/\s+/g, " ").trim();
+  // ProseMirror emits zero-width characters around inline nodes and hard breaks,
+  // and JS \s matches neither U+200B/200C/200D nor U+2060. Strip them first or
+  // they inflate the composer's length against a source text that has none.
+  return text.replace(/[​‌‍⁠﻿]/g, "").replace(/\s+/g, " ").trim();
 }
 
 /**
@@ -994,12 +1018,6 @@ async function insertLines(page: Page, lines: string[]): Promise<void> {
   }
 }
 
-async function typeLines(page: Page, lines: string[]): Promise<void> {
-  for (let i = 0; i < lines.length; i++) {
-    if (i > 0) await page.keyboard.press("Shift+Enter");
-    await page.keyboard.type(lines[i], { delay: 4 });
-  }
-}
 
 const SEND_CLICK_MAX_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_SEND_CLICK_ATTEMPTS ?? 3));
 

@@ -120,10 +120,12 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     expect(page.keyboard.type).not.toHaveBeenCalled();
   });
 
-  it("retypes when the prompt does not land, then refuses to submit", async () => {
-    // insertText silently doing nothing must never submit an empty prompt to a
-    // paid Pro run: the keystroke fallback gets one attempt, and a composer that
-    // still does not hold the prompt throws instead of sending.
+  it("never clears a preserved composer to retry: that would strip the connector", async () => {
+    // preserveExisting is true on EVERY connector turn (orchestrator.ts), and the
+    // connector's inline mention may live inside the composer. Clearing it to
+    // retry would resubmit a connector-required prompt with no connector, which
+    // is the genuine connector_required_not_used this change exists to prevent.
+    // A connector turn therefore gets one attempt and an honest failure.
     requireSelector.mockResolvedValue(fakeLocator({ innerText: "   " }));
     firstResolved.mockResolvedValueOnce(fakeLocator());
     const page = fakePage();
@@ -131,7 +133,21 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     await expect(sendPrompt(page, "hello", true)).rejects.toThrow("composer delivery incomplete");
 
     expect(page.keyboard.insertText).toHaveBeenCalledWith("hello");
-    expect(page.keyboard.type).toHaveBeenCalledWith("hello", { delay: 4 });
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Backspace"); // no clear
+    expect(page.keyboard.type).not.toHaveBeenCalled(); // no slow keystroke retype
+  });
+
+  it("re-inserts once when nothing has to be preserved", async () => {
+    // With no connector mention at risk, clearing and re-inserting is safe and
+    // is worth one attempt before failing the turn.
+    requireSelector.mockResolvedValue(fakeLocator({ innerText: "   " }));
+    firstResolved.mockResolvedValueOnce(fakeLocator());
+    const page = fakePage();
+
+    await expect(sendPrompt(page, "hello", false)).rejects.toThrow("composer delivery incomplete");
+
+    expect(page.keyboard.press).toHaveBeenCalledWith("Backspace"); // cleared
+    expect(vi.mocked(page.keyboard.insertText).mock.calls.filter(c => c[0] === "hello")).toHaveLength(2);
   });
 
   it("refuses to submit a prompt whose tail was dropped (P-035 2026-09-17)", async () => {
@@ -151,6 +167,28 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
 
     expect(click).not.toHaveBeenCalled();
     expect(page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+  });
+
+  it("checks the composer AFTER the model verification, not right after insertion", async () => {
+    // ensureProSixMaximum opens and closes the thinking-power menu between the
+    // insert and the click, with three five-second waits inside it. If that
+    // interaction is what loses the draft, a check placed before it passes and
+    // the turn still goes out empty. Order: insert, verify, check, send.
+    const order: string[] = [];
+    firstResolved.mockResolvedValue(fakeLocator({ click: async () => { order.push("send"); } }));
+    const page = fakePage();
+    vi.mocked(page.keyboard.insertText).mockImplementation(async (text: string) => {
+      order.push("insert");
+      composed += text;
+    });
+    requireSelector.mockResolvedValue({
+      ...fakeLocator(),
+      innerText: async () => { order.push("read-composer"); return composed; },
+    });
+
+    await sendPrompt(page, "hello", true, undefined, async () => { order.push("verify"); });
+
+    expect(order).toEqual(["insert", "verify", "read-composer", "send"]);
   });
 
   it("refuses to submit when the composer cannot be read at all", async () => {
