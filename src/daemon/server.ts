@@ -47,7 +47,8 @@ import {
   type AskOptions,
   type AskRunner,
 } from "../core/orchestrator.js";
-import { NotLoggedInError, PreSubmitInteractionError } from "../errors.js";
+import { NotLoggedInError, PreSubmitInteractionError, SelectorBrokenError } from "../errors.js";
+import { SELECTORS } from "../browser/selectors.js";
 import {
   clearDaemonInfo,
   DAEMON_LOG,
@@ -1072,7 +1073,18 @@ export async function handleAsk(
     } catch (err) {
       slot.lastConversation = slot.currentConversation ?? slot.lastConversation;
       state.lastFinishedSlot = slot.id;
-      log.error(`ask turn failed: ${(err as Error).message}`);
+      // Every failed turn now names its lane, slot, invocation and page, and
+      // a selector failure carries what the DOM actually looked like. Without
+      // this the 2026-09-16 planning-lane incident was undiagnosable after the
+      // fact: the log said "selector broke" and nothing else.
+      log.error(
+        `ask turn failed: ${(err as Error).message} slot=${slot.id} ` +
+        `invocation=${slot.currentInvocation ?? "-"} url=${slot.page?.url() ?? "-"}`,
+      );
+      if (err instanceof SelectorBrokenError && slot.page && !slot.page.isClosed()) {
+        const diagnostic = await describeSelectorState(slot.page).catch(() => "unavailable");
+        log.error(`selector diagnostic: ${diagnostic}`);
+      }
       if (!clientGone) {
         writeEvent("error", err instanceof PreSubmitInteractionError
           ? {
@@ -1172,6 +1184,33 @@ function readJsonBody<T>(
     req.on("close", onClose);
     req.on("aborted", onClose);
   });
+}
+
+/**
+ * A bounded, content-free picture of the page at the moment a selector gate
+ * failed: what resolves, what is visible, and which surface is mounted. It
+ * names selectors and counts only -- never page text.
+ */
+async function describeSelectorState(page: Page): Promise<string> {
+  const groups: Array<[string, string[]]> = [
+    ["composer", SELECTORS.composer],
+    ["projectsNavigation", SELECTORS.projectsNavigation],
+    ["projectRows", SELECTORS.projectRows],
+    ["chatTabRadio", SELECTORS.chatTabRadio],
+  ];
+  const parts: string[] = [];
+  for (const [name, candidates] of groups) {
+    const counts: string[] = [];
+    for (const candidate of candidates.slice(0, 6)) {
+      const count = await page.locator(candidate).count().catch(() => -1);
+      counts.push(`${candidate}=${count}`);
+    }
+    parts.push(`${name}[${counts.join(" ")}]`);
+  }
+  const editables = await page.locator('[contenteditable="true"]').count().catch(() => -1);
+  const rows = await page.locator('[role="row"]').count().catch(() => -1);
+  return `${parts.join(" ")} contenteditable=${editables} roleRow=${rows}`
+    .slice(0, 2000);
 }
 
 function makeLogger(): { info: (m: string) => void; error: (m: string) => void } {

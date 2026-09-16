@@ -36,7 +36,21 @@ export async function listProjects(page: Page): Promise<Project[]> {
     page,
     "/backend-api/gizmos/snorlax/sidebar?conversations_per_gizmo=0",
   );
-  if (!r.ok) return [];
+  // A failed read is not "no projects": returning [] here made a transient
+  // 401/429 surface as "Requested ChatGPT Project could not be uniquely
+  // identified", which sent every diagnosis down the wrong path (P-035
+  // 2026-09-16). Retry once, then say what actually happened.
+  if (!r.ok) {
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    const retry = await backendApiFetch(
+      page,
+      "/backend-api/gizmos/snorlax/sidebar?conversations_per_gizmo=0",
+    );
+    if (!retry.ok) {
+      throw new Error(`ChatGPT project list unavailable (HTTP ${retry.status})`);
+    }
+    return extractProjects(retry.body);
+  }
   return extractProjects(r.body);
 }
 

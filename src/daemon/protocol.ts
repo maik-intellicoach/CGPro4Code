@@ -22,6 +22,8 @@ import { CGPRO_HOME, ensureDirs } from "../store/paths.js";
 // Unset (the default) reproduces the prior hardcoded behavior exactly.
 export const DAEMON_FILE = process.env.CGPRO_DAEMON_JSON || join(CGPRO_HOME, "daemon.json");
 export const DAEMON_LOG = join(CGPRO_HOME, "logs", "daemon.log");
+/** Directory for daemon logs. stderr from a daemon child lands here too. */
+export const DAEMON_LOG_DIR = join(CGPRO_HOME, "logs");
 
 export interface DaemonInfo {
   version: 1;

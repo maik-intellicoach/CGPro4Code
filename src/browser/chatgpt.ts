@@ -111,7 +111,17 @@ export async function backendApiFetch(
   pathOrUrl: string,
   init: { method?: string; body?: unknown; headers?: Record<string, string>; timeoutMs?: number } = {},
 ): Promise<{ ok: boolean; status: number; body: unknown; retryAfter: string | null }> {
-  const token = await getAccessToken(page, init.timeoutMs);
+  // A null token is NOT proof of an expired session: the in-page read races a
+  // document swap (the stall path reloads the page and immediately polls
+  // evidence), and a lost execution context returns null. Reporting that as a
+  // server-side 401 made every caller treat it as decisive and discard
+  // completed turns (P-035: a 23-minute, 101-tool-call answer was thrown away
+  // at the terminal read, 2026-09-16). Retry briefly; a real 401 still fails.
+  let token = await getAccessToken(page, init.timeoutMs);
+  for (let attempt = 0; !token && attempt < 2; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
+    token = await getAccessToken(page, init.timeoutMs);
+  }
   if (!token) return { ok: false, status: 401, body: null, retryAfter: null };
   return await page.evaluate(
     async ({ url, method, body, headers, accessToken, timeoutMs }) => {
@@ -175,7 +185,11 @@ export async function fetchMeInPage(page: Page): Promise<{
  */
 export async function firstResolved(page: Page, candidates: string[]): Promise<Locator | null> {
   for (const sel of candidates) {
-    const loc = page.locator(sel).first();
+    // A hidden first match must not hide a visible later one: the candidate
+    // loop only advances to the NEXT selector, so a hidden first node used to
+    // make an otherwise resolvable selector look broken (P-035 2026-09-16,
+    // planning-lane selector failures). filter({visible}) can only widen.
+    const loc = page.locator(sel).filter({ visible: true }).first();
     try {
       const count = await loc.count();
       if (count > 0 && await loc.isVisible()) {
@@ -186,6 +200,37 @@ export async function firstResolved(page: Page, candidates: string[]): Promise<L
     }
   }
   return null;
+}
+
+/**
+ * Readiness gate that treats "not rendered yet" as slow instead of fatal.
+ *
+ * A saturated host does not hydrate chatgpt.com inside one fixed budget, and
+ * a single cold reload makes it worse, so the escalation is: re-poll, then
+ * re-poll with double the budget, and only then one navigation and a final
+ * poll. Use this ONLY for readiness gates (fresh page, surface, directory
+ * row). Correctness gates -- the Pro-6 control, the Deep Research pre-submit
+ * check, the send path -- must stay strict.
+ */
+export async function requireSelectorPatient(
+  page: Page,
+  candidates: string[],
+  name: string,
+  timeoutMs = 20_000,
+): Promise<Locator> {
+  try {
+    return await requireSelector(page, candidates, name, timeoutMs);
+  } catch (error) {
+    if (!(error instanceof SelectorBrokenError) || page.isClosed()) throw error;
+    await page.waitForTimeout(15_000);
+    try {
+      return await requireSelector(page, candidates, name, timeoutMs * 2);
+    } catch (secondError) {
+      if (!(secondError instanceof SelectorBrokenError)) throw secondError;
+      await goHome(page);
+      return await requireSelector(page, candidates, name, timeoutMs * 2);
+    }
+  }
 }
 
 export async function requireSelector(

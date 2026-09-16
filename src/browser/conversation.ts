@@ -1,6 +1,6 @@
 import type { Page, Locator } from "patchright";
 import { SELECTORS, joinSelectors } from "./selectors.js";
-import { firstResolved, requireSelector, goHome } from "./chatgpt.js";
+import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
 import { listProjects } from "../api/projects.js";
 import { PreSubmitInteractionError, TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation } from "../core/stream.js";
@@ -30,7 +30,14 @@ export async function openConversation(
   } else if (opts.gizmoId || opts.gizmoShortUrl) {
     const slug = opts.gizmoShortUrl ?? opts.gizmoId!;
     await goHome(page, { model: opts.model });
-    await requireSelector(page, SELECTORS.composer, "home composer", 20_000);
+    // The Project directory row below is this branch's real readiness gate;
+    // the home composer was a surface-dependent proxy for the same thing, and
+    // it was required BEFORE the Chat surface was selected -- so a profile
+    // that landed or persisted on the "Work" surface (whose composer cgpro
+    // never types into) failed a check that exists to enable the switch
+    // (P-035 planning-lane incident 2026-09-16: five of eight dispatches).
+    // ensureChatTab is idempotent; it no-ops on a single-surface UI.
+    await ensureChatTab(page);
     await page.waitForTimeout(5_000);
     const projects = await listProjects(page);
     const project = projects.find((p) =>
@@ -41,15 +48,30 @@ export async function openConversation(
     }
     // The directory row prepares Project metadata before client navigation.
     // A cold deep link can instead hit the unavailable locked-chats endpoint.
-    const directory = await requireSelector(page, SELECTORS.projectsNavigation, "Projects navigation");
+    const directory = await requireSelectorPatient(page, SELECTORS.projectsNavigation, "Projects navigation");
     await page.waitForTimeout(5_000);
     await directory.click({ timeout: 5_000 });
-    const row = page.locator(joinSelectors(SELECTORS.projectRows)).filter({
+    // A saturated host can take longer than one budget to hydrate the
+    // directory, and this locator is the only place the vendor clicks a
+    // sidebar row. Re-resolve it per attempt instead of failing once, the
+    // same shape the send button already uses (P-035 2026-09-16).
+    const rowLocator = () => page.locator(joinSelectors(SELECTORS.projectRows)).filter({
       has: page.getByRole("button", { name: `Open project options for ${project.name}`, exact: true }),
-    });
-    await row.waitFor({ state: "visible", timeout: 20_000 });
+    }).first();
+    let row = rowLocator();
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        row = rowLocator();
+        await row.waitFor({ state: "visible", timeout: 20_000 });
+        break;
+      } catch (error) {
+        if (attempt === 2 || page.isClosed()) throw error;
+        await page.waitForTimeout(5_000);
+        row = rowLocator();
+      }
+    }
     await page.waitForTimeout(5_000);
-    await row.getByText(project.name, { exact: true }).click({ timeout: 5_000 });
+    await row.getByText(project.name, { exact: true }).first().click({ timeout: 5_000 });
     await page.waitForURL((url) => url.origin === "https://chatgpt.com" &&
       (url.pathname === `/g/${project.id}/project` ||
        (project.shortUrl !== undefined && url.pathname === `/g/${project.shortUrl}/project`)),
@@ -60,7 +82,7 @@ export async function openConversation(
     await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
   }
 
-  await requireSelector(page, SELECTORS.composer, "composer", 20_000);
+  await requireSelectorPatient(page, SELECTORS.composer, "composer", 20_000);
 
   // C-092: chatgpt.com's Work-area rollout can land (or leave a
   // persisted profile) on the "Work" surface, whose composer has its

@@ -5,6 +5,8 @@
  */
 
 import { spawn } from "node:child_process";
+import { mkdirSync, openSync } from "node:fs";
+import { join } from "node:path";
 import chalk from "chalk";
 import ora from "ora";
 import {
@@ -18,6 +20,7 @@ import {
   pidIsAlive,
   readDaemonInfo,
   DAEMON_LOG,
+  DAEMON_LOG_DIR,
 } from "../../daemon/protocol.js";
 import { runDaemonServer } from "../../daemon/server.js";
 
@@ -52,9 +55,19 @@ export async function daemonStartCmd(opts: DaemonStartOptions): Promise<number> 
   if (opts.background === false) args.push("--no-background");
 
   const spinner = ora("Spawning daemon…").start();
+  // Keep the daemon's stderr. stdio:"ignore" discarded every
+  // [cgpro:connector] / [cgpro:model] diagnostic the child printed, which is
+  // why the 2026-09-16 planning-lane incident could not be diagnosed after the
+  // fact. One bounded file per lane profile, never the CLI's own terminal.
+  mkdirSync(DAEMON_LOG_DIR, { recursive: true });
+  const stderrPath = join(
+    DAEMON_LOG_DIR,
+    `daemon-${(opts.profile ?? "default").split("/").filter(Boolean).pop() ?? "default"}.err.log`,
+  );
+  const stderrFd = openSync(stderrPath, "a");
   const child = spawn(process.argv[0], [process.argv[1], ...args], {
     detached: true,
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", stderrFd],
     windowsHide: true,
     env: { ...process.env, CGPRO_DAEMON: "1" },
   });
