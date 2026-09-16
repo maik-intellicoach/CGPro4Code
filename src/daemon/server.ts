@@ -48,7 +48,7 @@ import {
   type AskRunner,
 } from "../core/orchestrator.js";
 import { NotLoggedInError, PreSubmitInteractionError, SelectorBrokenError } from "../errors.js";
-import { SELECTORS } from "../browser/selectors.js";
+import { SELECTORS, type SelectorSet } from "../browser/selectors.js";
 import {
   clearDaemonInfo,
   DAEMON_FILE,
@@ -636,6 +636,47 @@ export async function handleRequest(
   if (!hasValidToken(req, state.token)) {
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "unauthorized" }));
+    return;
+  }
+
+  // P-035 2026-09-16: a selector audit that runs on the page this process
+  // already holds. `cgpro doctor` opens its own browser against the profile and
+  // could not authenticate on a profile this daemon authenticates on, so it
+  // audited the login page and reported every selector broken. Counting is
+  // read-only -- no click, no type -- so it is safe beside a live turn, and the
+  // in-flight count is returned so a caller knows what it audited.
+  if (method === "GET" && url.pathname === "/selectors") {
+    const slots = slotsOf(state);
+    const page = slots.map((slot) => slot.page).find((candidate): candidate is Page => candidate !== null);
+    if (!page) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "no_page", detail: "no slot holds a page yet" }));
+      return;
+    }
+    const results: Array<{ key: string; candidates: string[]; firstWorking: number }> = [];
+    for (const key of Object.keys(SELECTORS) as Array<keyof SelectorSet>) {
+      const candidates = SELECTORS[key];
+      let firstWorking = -1;
+      for (let i = 0; i < candidates.length; i++) {
+        try {
+          const count = await page.locator(candidates[i]).first().count();
+          if (count > 0) {
+            firstWorking = i;
+            break;
+          }
+        } catch {
+          /* try next */
+        }
+      }
+      results.push({ key: key.toString(), candidates, firstWorking });
+    }
+    const inFlight = slots.filter((slot) => slot.busy).length;
+    const failed = results.filter((result) => result.firstWorking === -1).length;
+    log.info(
+      `selector audit served file=${DAEMON_FILE} in_flight=${inFlight} failed=${failed}/${results.length}`,
+    );
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, inFlight, results }));
     return;
   }
 

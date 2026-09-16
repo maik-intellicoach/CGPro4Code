@@ -120,6 +120,10 @@ program
   .description("Audit selectors against the live chatgpt.com DOM.")
   .option("--headed", "show the browser window")
   .option("--profile <path>", "override the default profile directory")
+  .option(
+    "--via-daemon",
+    "audit the running daemon's own page (already signed in) instead of opening a browser",
+  )
   .action(async (opts) => {
     const code = await runOrExit(() => doctorCommand(opts));
     process.exit(code);

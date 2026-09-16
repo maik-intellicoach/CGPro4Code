@@ -140,6 +140,31 @@ async function healthCheck(info: DaemonInfo, timeoutMs: number): Promise<boolean
   });
 }
 
+export interface SelectorAuditResult {
+  key: string;
+  candidates: string[];
+  firstWorking: number;
+}
+
+/**
+ * Read-only selector audit from the running daemon's own page (P-035
+ * 2026-09-16). `cgpro doctor` cannot authenticate on a profile the daemon
+ * authenticates on, so it audits the login page and reports every selector
+ * broken; this asks the session that already works.
+ */
+export async function fetchSelectorAudit(
+  info: DaemonInfo,
+): Promise<{ inFlight: number; results: SelectorAuditResult[] } | null> {
+  // A busy page can be slow to answer 21 count() calls.
+  return await jsonRequest<{ inFlight: number; results: SelectorAuditResult[] }>(
+    info,
+    "GET",
+    "/selectors",
+    null,
+    120_000,
+  );
+}
+
 export async function getDaemonStatus(info: DaemonInfo): Promise<StatusResponse | null> {
   return await jsonRequest<StatusResponse>(info, "GET", "/status", null);
 }

@@ -717,6 +717,56 @@ describe("handleAsk HTTP-level wiring", () => {
   });
 });
 
+describe("daemon-side selector audit", () => {
+  it("serves a per-selector verdict from the page it already holds", async () => {
+    // P-035 2026-09-16: cgpro doctor could not authenticate on a profile the
+    // daemon authenticates on, so it audited the login page and reported every
+    // selector broken. This route asks the session that already works, and
+    // counting is read-only, so it is safe beside a live turn.
+    const { SELECTORS } = await import("../src/browser/selectors.js");
+    const working = SELECTORS.composer[0];
+    const page = {
+      locator: (selector: string) => ({
+        first: () => ({ count: async () => (selector === working ? 1 : 0) }),
+      }),
+    };
+    const state = fakeState({ session: { page } as unknown as Session });
+    const req = new FakeReq();
+    Object.assign(req, {
+      method: "GET",
+      url: "/selectors",
+      headers: { authorization: "Bearer test-token" },
+    });
+    const res = new FakeRes();
+    await handleRequest(req as unknown as IncomingMessage, res as unknown as ServerResponse, state);
+
+    const body = parseJsonBody(res) as {
+      ok: boolean;
+      inFlight: number;
+      results: Array<{ key: string; firstWorking: number }>;
+    };
+    expect(res.statusCode).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.inFlight).toBe(0);
+    expect(body.results.length).toBe(Object.keys(SELECTORS).length);
+    expect(body.results.find((row) => row.key === "composer")?.firstWorking).toBe(0);
+    expect(body.results.find((row) => row.key === "fileUpload")?.firstWorking).toBe(-1);
+  });
+
+  it("refuses when no slot holds a page yet", async () => {
+    const state = fakeState({ session: {} as unknown as Session });
+    const req = new FakeReq();
+    Object.assign(req, {
+      method: "GET",
+      url: "/selectors",
+      headers: { authorization: "Bearer test-token" },
+    });
+    const res = new FakeRes();
+    await handleRequest(req as unknown as IncomingMessage, res as unknown as ServerResponse, state);
+    expect(res.statusCode).toBe(409);
+  });
+});
+
 describe("stop guard while a page is leased", () => {
   async function postStop(headers: Record<string, string>) {
     const req = new FakeReq();
