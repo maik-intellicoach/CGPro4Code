@@ -717,6 +717,34 @@ describe("handleAsk HTTP-level wiring", () => {
   });
 });
 
+describe("slot lease attribution", () => {
+  it("pairs the lease with its release on the preflight path", async () => {
+    // A slot leased and never released is indistinguishable from a live turn:
+    // the idle-only restart guard then refuses the lane for a reason that is
+    // not true (P-035 2026-09-16). The pairing is asserted directly.
+    const { DAEMON_LOG } = await import("../src/daemon/protocol.js");
+    const { readFileSync, statSync } = await import("node:fs");
+    const before = statSync(DAEMON_LOG).size;
+    runInteractionPreflight.mockResolvedValue({ ok: true, model: "gpt-6-pro", power: 4 });
+    const state = fakeState();
+    const req = new FakeReq() as unknown as IncomingMessage;
+    const res = new FakeRes() as unknown as ServerResponse;
+    Object.assign(req, { method: "POST", url: "/preflight", headers: { authorization: "Bearer test-token" } });
+    const pending = handleRequest(req, res, state);
+    sendBody(req, {
+      model: "gpt-6-pro",
+      connector: "connector",
+      gizmoId: "g-p-project",
+      expectedAccountEmail: "account@example.test",
+    });
+    await pending;
+    const logged = readFileSync(DAEMON_LOG, "utf8").slice(before);
+    expect(logged).toContain("slot leased slot=0 by=preflight");
+    expect(logged).toContain("slot released slot=0 by=preflight");
+    expect(state.slots?.[0].leasedBy ?? null).toBeNull();
+  });
+});
+
 describe("stop-request attribution", () => {
   async function post(headers: Record<string, string>) {
     const { DAEMON_LOG } = await import("../src/daemon/protocol.js");

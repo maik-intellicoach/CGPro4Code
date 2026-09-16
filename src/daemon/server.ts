@@ -258,6 +258,13 @@ export interface SlotState {
   page: Page | null;
   /** Leased by an /ask, /preflight, /archive-saved or idle /reload. */
   busy: boolean;
+  /**
+   * Which handler holds the lease. A slot that is busy with no invocation and
+   * no queue entry used to be indistinguishable from a live turn, and the
+   * idle-only restart guard refused the lane for a reason that was not true
+   * (P-035 2026-09-16).
+   */
+  leasedBy: string | null;
   askInFlight: boolean;
   currentInvocation: string | null;
   currentRunner: AskRunner | null;
@@ -332,6 +339,7 @@ function slotZero(state: ServerState): SlotState {
   return {
     id: 0,
     busy: false,
+    leasedBy: null,
     get page() { return state.session.page; },
     get askInFlight() { return state.askInFlight; },
     set askInFlight(v) { state.askInFlight = v; },
@@ -357,6 +365,7 @@ export function slotsOf(state: ServerState): SlotState[] {
       id: i + 1,
       page: null,
       busy: false,
+      leasedBy: null,
       askInFlight: false,
       currentInvocation: null,
       currentRunner: null,
@@ -370,11 +379,24 @@ export function slotsOf(state: ServerState): SlotState[] {
 }
 
 /** Leases the lowest free slot. Callers hold queue capacity first, so one is always free. */
-function leaseSlot(state: ServerState): SlotState {
+function leaseSlot(state: ServerState, reason: string): SlotState {
   const slot = slotsOf(state).find((s) => !s.busy);
   if (!slot) throw new Error("no free slot despite free capacity");
   slot.busy = true;
+  slot.leasedBy = reason;
+  log.info(`slot leased slot=${slot.id} by=${reason}`);
   return slot;
+}
+
+/**
+ * Releases a lease and says why, so a lease and its release pair up in the log
+ * instead of leaving an absence to interpret (P-035 2026-09-16). Additive: the
+ * flag is cleared exactly as before.
+ */
+function releaseSlot(slot: SlotState, reason: string): void {
+  slot.busy = false;
+  slot.leasedBy = null;
+  log.info(`slot released slot=${slot.id} by=${reason}`);
 }
 
 /** The slot's page; slots 1..N-1 are opened on first use with the daemon start checks. */
@@ -638,6 +660,7 @@ export async function handleRequest(
         items: slots.map((s) => ({
           slot: s.id,
           busy: s.busy,
+          leasedBy: s.leasedBy,
           invocationId: s.currentInvocation,
           conversationId: s.currentConversation,
           interaction: s.interaction,
@@ -757,7 +780,7 @@ export async function handleRequest(
       res.end(JSON.stringify({ error: "lane_busy" }));
       return;
     }
-    const slot = leaseSlot(state);
+    const slot = leaseSlot(state, "preflight");
     try {
       const result = await runInteractionPreflight(body, slotSession(state, slot, await slotPage(state, slot)));
       slot.interaction = { state: "ready", checkedAt: new Date().toISOString() };
@@ -775,7 +798,7 @@ export async function handleRequest(
         ...(error instanceof PreSubmitInteractionError ? { code: error.code, phase: error.phase } : {}),
       }));
     } finally {
-      slot.busy = false;
+      releaseSlot(slot, "preflight");
       state.queue.release();
     }
     return;
@@ -804,14 +827,14 @@ export async function handleRequest(
     if (!state.queue.tryAcquire()) {
       res.writeHead(409); res.end(JSON.stringify({ error: "lane_busy" })); return;
     }
-    const slot = leaseSlot(state);
+    const slot = leaseSlot(state, "archive");
     try {
       const filing = await archiveSavedConversation(await slotPage(state, slot), body);
       res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(filing));
     } catch (error) {
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: (error as Error).message }));
-    } finally { slot.busy = false; state.queue.release(); }
+    } finally { releaseSlot(slot, "archive"); state.queue.release(); }
     return;
   }
 
@@ -881,6 +904,8 @@ export async function handleRequest(
       return;
     }
     slot.busy = true;
+    slot.leasedBy = "reload-inner";
+    log.info(`slot leased slot=${slot.id} by=reload-inner`);
     try {
       const page = await slotPage(state, slot);
       await openConversation(page, { conversationId: target });
@@ -891,7 +916,7 @@ export async function handleRequest(
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, conversationId: target, queued: false, working, finalText }));
     } finally {
-      slot.busy = false;
+      releaseSlot(slot, "reload-inner");
       state.queue.release();
     }
     return;
@@ -1002,7 +1027,7 @@ export async function handleAsk(
     req.off("aborted", onEarlyDisconnect);
   }
 
-  const slot = leaseSlot(state);
+  const slot = leaseSlot(state, "ask");
   slot.askInFlight = true;
   try {
     // 4 hours upper bound — covers the longest GPT-5.5 Pro turns we've
@@ -1124,7 +1149,7 @@ export async function handleAsk(
     }
   } finally {
     slot.askInFlight = false;
-    slot.busy = false;
+    releaseSlot(slot, "ask");
     state.queue.release();
   }
 }
