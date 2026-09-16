@@ -154,9 +154,13 @@ export interface SelectorAuditResult {
  */
 export async function fetchSelectorAudit(
   info: DaemonInfo,
-): Promise<{ inFlight: number; results: SelectorAuditResult[] } | null> {
+): Promise<{ inFlight: number; results: SelectorAuditResult[]; missingCritical: string[] } | null> {
   // A busy page can be slow to answer 21 count() calls.
-  return await jsonRequest<{ inFlight: number; results: SelectorAuditResult[] }>(
+  return await jsonRequest<{
+    inFlight: number;
+    results: SelectorAuditResult[];
+    missingCritical: string[];
+  }>(
     info,
     "GET",
     "/selectors",

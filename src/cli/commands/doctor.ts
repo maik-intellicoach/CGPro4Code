@@ -2,7 +2,7 @@ import chalk from "chalk";
 import ora from "ora";
 import { openSession } from "../../browser/session.js";
 import { goHome, isLoggedIn } from "../../browser/chatgpt.js";
-import { SELECTORS, type SelectorSet } from "../../browser/selectors.js";
+import { SELECTORS, TURN_CRITICAL_SELECTORS, type SelectorSet } from "../../browser/selectors.js";
 import { assertNoDaemon, fetchSelectorAudit, getLiveDaemon } from "../../daemon/client.js";
 import { readDaemonInfo } from "../../daemon/protocol.js";
 
@@ -33,15 +33,28 @@ export interface AuditRow {
   firstWorking: number;
 }
 
-/** One table renderer for both sources, so they cannot read differently. */
-function renderAudit(rows: AuditRow[]): number {
+/**
+ * One table renderer for both sources, so they cannot read differently.
+ *
+ * Only three outcomes matter, and only one of them is a failure (P-035
+ * 2026-09-16): a fallback or an unresolved surface-scoped key is normal on a
+ * bare page, while a miss on `TURN_CRITICAL_SELECTORS` means a turn cannot
+ * start. Before this split every healthy lane exited 5 with 12 of 22 keys
+ * "failed", which made the audit useless as a pre-flight check.
+ */
+function renderAudit(rows: AuditRow[], critical: string[]): number {
   let exitCode = 0;
   const widthKey = Math.max(...rows.map((row) => row.key.length)) + 2;
   for (const row of rows) {
     const padded = row.key.padEnd(widthKey);
+    const isCritical = critical.includes(row.key);
     if (row.firstWorking === -1) {
-      console.log(`${chalk.red("✖")} ${padded}${chalk.red("no candidate matched")}`);
-      exitCode = 5;
+      if (isCritical) {
+        console.log(`${chalk.red("✖")} ${padded}${chalk.red("no candidate matched (turn-critical)")}`);
+        exitCode = 5;
+      } else {
+        console.log(`${chalk.dim(`· ${padded}not on this surface`)}`);
+      }
     } else if (row.firstWorking === 0) {
       console.log(`${chalk.green("✔")} ${padded}${chalk.dim(row.candidates[0])}`);
     } else {
@@ -52,11 +65,11 @@ function renderAudit(rows: AuditRow[]): number {
   }
   console.log("");
   if (exitCode === 0) {
-    console.log(chalk.green("All selectors resolve."));
+    console.log(chalk.green("Every turn-critical selector resolves."));
   } else {
     console.log(
       chalk.yellow(
-        "Some selectors failed. File a bug at https://github.com/yannabadie/CGPro4Code/issues",
+        "A turn-critical selector does not resolve. File a bug at https://github.com/yannabadie/CGPro4Code/issues",
       ),
     );
   }
@@ -66,6 +79,8 @@ function renderAudit(rows: AuditRow[]): number {
 const UNKNOWN_ROWS: AuditRow[] = (Object.keys(SELECTORS) as Array<keyof SelectorSet>).map(
   (key) => ({ key: key.toString(), candidates: SELECTORS[key], firstWorking: -1 }),
 );
+
+const criticalKeys: string[] = TURN_CRITICAL_SELECTORS.map((key) => key.toString());
 
 /**
  * Audit the page the daemon already holds (P-035 2026-09-16).
@@ -105,7 +120,10 @@ async function doctorViaDaemon(): Promise<number> {
   console.log("");
   console.log(chalk.bold("Selector audit"));
   console.log(chalk.dim("─".repeat(60)));
-  return renderAudit(audit.results.length > 0 ? audit.results : UNKNOWN_ROWS);
+  return renderAudit(
+    audit.results.length > 0 ? audit.results : UNKNOWN_ROWS,
+    audit.missingCritical ?? [],
+  );
 }
 
 export async function doctorCommand(opts: DoctorOptions): Promise<number> {
@@ -160,7 +178,7 @@ export async function doctorCommand(opts: DoctorOptions): Promise<number> {
       }
       rows.push({ ...row, firstWorking });
     }
-    return renderAudit(rows);
+    return renderAudit(rows, criticalKeys);
   } finally {
     await session.close();
   }

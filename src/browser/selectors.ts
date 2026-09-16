@@ -83,10 +83,13 @@ export const SELECTORS: SelectorSet = {
     'header button[aria-label*="Sélecteur"]',
     'button[aria-haspopup="menu"]:has(svg)',
   ],
+    // Working candidate first (P-035 2026-09-16): every lane probed had this
+    // entry matching and the ones after it dead, so the daemon paid a failed
+    // probe per turn. Kept as tail fallbacks in case the attributes return.
   thinkingPowerButton: [
+    'button:has(:text-matches("^(?:6\\\\s*Pro|High|Instant)$", "i"))',
     'button:has-text("Thinking effort")',
     'button:text-matches("^(?:6\\\\s*Pro|High|Instant)$", "i")',
-    'button:has(:text-matches("^(?:6\\\\s*Pro|High|Instant)$", "i"))',
   ],
   selectedPowerModel: ['[role="menuitem"][aria-label="Select model"]'],
   thinkingPowerSlider: ['[role="slider"][aria-valuemax]'],
@@ -150,27 +153,54 @@ export const SELECTORS: SelectorSet = {
     '[data-message-author-role="assistant"] .markdown',
     '[data-message-author-role="assistant"]',
   ],
+    // Working candidate first (P-035 2026-09-16): every lane probed had this
+    // entry matching and the ones after it dead, so the daemon paid a failed
+    // probe per turn. Kept as tail fallbacks in case the attributes return.
   conversationList: [
-    '[data-testid="conversation-list"]',
     'nav[aria-label="Chat history"]',
     'nav[aria-label*="historique" i]',
+    '[data-testid="conversation-list"]',
   ],
   conversationItem: [
     '[data-testid^="history-item-"]',
     '[data-testid="conversation-item"]',
     'nav a[href^="/c/"]',
   ],
+    // Working candidate first (P-035 2026-09-16): every lane probed had this
+    // entry matching and the ones after it dead, so the daemon paid a failed
+    // probe per turn. Kept as tail fallbacks in case the attributes return.
   newChatButton: [
+    'a[href="/"]:has(svg)',
     'button[data-testid="create-new-chat-button"]',
     'button[data-testid="new-chat-button"]',
-    'a[href="/"]:has(svg)',
   ],
+    // Working candidate first (P-035 2026-09-16): every lane probed had this
+    // entry matching and the ones after it dead, so the daemon paid a failed
+    // probe per turn. Kept as tail fallbacks in case the attributes return.
   fileUpload: [
+    'input[type="file"]',
     'input[type="file"][data-testid="file-upload"]',
     'input[type="file"][data-testid="file-upload-button"]',
-    'input[type="file"]',
   ],
 };
+
+/**
+ * Selectors a turn cannot start without, and which therefore must resolve on
+ * any authenticated page (P-035 2026-09-16).
+ *
+ * The read-only selector audit (`GET /selectors`, `cgpro doctor --via-daemon`)
+ * deliberately counts what is attached, so it cannot tell a stale selector from
+ * a surface that is simply not open: on a healthy lane 12 of 22 keys resolve to
+ * nothing because the conversation, the tools popover or the Projects directory
+ * is not mounted. Only absence of a key listed here is drift. Surface-scoped
+ * keys (`projectRows`, `deepResearchToggle`, `assistantMessages`, ...) are
+ * reported but never fail the audit.
+ */
+export const TURN_CRITICAL_SELECTORS: Array<keyof SelectorSet> = [
+  "composer",
+  "modelSwitcher",
+  "projectsNavigation",
+];
 
 export function joinSelectors(set: string[]): string {
   return set.join(", ");

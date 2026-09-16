@@ -22,7 +22,7 @@ import {
 } from "./stream.js";
 import { NotLoggedInError, PreSubmitInteractionError } from "../errors.js";
 import { requireAccount, verifyFiling, type FilingProof } from "../api/conversation-filing.js";
-import { SELECTORS as SELECTORS_DUMP } from "../browser/selectors.js";
+import { joinSelectors, SELECTORS as SELECTORS_DUMP } from "../browser/selectors.js";
 import { fetchLatestTurnConnectorState, type LatestTurnConnectorState, fetchLatestNativeResearchReport, fetchNativeResearchUserNodes, type NativeResearchReport } from "../api/conversations.js";
 
 const CONNECTOR_EVIDENCE_POLL_MS = 30_000;
@@ -581,7 +581,9 @@ function runAskInner(
 
 async function attachImages(page: Page, paths: string[]): Promise<void> {
   if (paths.length === 0) return;
-  const inputs = page.locator('input[type="file"]');
+  // Through the table, not a repeated literal: selectors.ts is the single place
+  // a ChatGPT UI change is absorbed (P-035 2026-09-16).
+  const inputs = page.locator(joinSelectors(SELECTORS_DUMP.fileUpload));
   const count = await inputs.count();
   if (count === 0) return;
   await inputs.first().setInputFiles(paths).catch(() => {

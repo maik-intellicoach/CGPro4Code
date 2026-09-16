@@ -48,7 +48,7 @@ import {
   type AskRunner,
 } from "../core/orchestrator.js";
 import { NotLoggedInError, PreSubmitInteractionError, SelectorBrokenError } from "../errors.js";
-import { SELECTORS, type SelectorSet } from "../browser/selectors.js";
+import { SELECTORS, TURN_CRITICAL_SELECTORS, type SelectorSet } from "../browser/selectors.js";
 import {
   clearDaemonInfo,
   DAEMON_FILE,
@@ -671,12 +671,22 @@ export async function handleRequest(
       results.push({ key: key.toString(), candidates, firstWorking });
     }
     const inFlight = slots.filter((slot) => slot.busy).length;
-    const failed = results.filter((result) => result.firstWorking === -1).length;
+    // A bare lane page legitimately resolves fewer than half of these keys: no
+    // conversation is open, no tools popover, no Projects directory. Only a
+    // TURN_CRITICAL_SELECTORS miss is drift, so the caller can act on it
+    // (P-035 2026-09-16).
+    const missingCritical = results
+      .filter((result) => result.firstWorking === -1)
+      .map((result) => result.key)
+      .filter((key) => TURN_CRITICAL_SELECTORS.some((critical) => critical.toString() === key));
+    const stale = results.filter((result) => result.firstWorking > 0).map((result) => result.key);
     log.info(
-      `selector audit served file=${DAEMON_FILE} in_flight=${inFlight} failed=${failed}/${results.length}`,
+      `selector audit served file=${DAEMON_FILE} in_flight=${inFlight} ` +
+        `unresolved=${results.length - missingCritical.length - stale.length}/${results.length} ` +
+        `stale=${stale.length} critical_missing=${missingCritical.length}`,
     );
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, inFlight, results }));
+    res.end(JSON.stringify({ ok: true, inFlight, results, critical: TURN_CRITICAL_SELECTORS, missingCritical }));
     return;
   }
 

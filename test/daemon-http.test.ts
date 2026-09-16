@@ -744,6 +744,7 @@ describe("daemon-side selector audit", () => {
       ok: boolean;
       inFlight: number;
       results: Array<{ key: string; firstWorking: number }>;
+      missingCritical: string[];
     };
     expect(res.statusCode).toBe(200);
     expect(body.ok).toBe(true);
@@ -751,6 +752,65 @@ describe("daemon-side selector audit", () => {
     expect(body.results.length).toBe(Object.keys(SELECTORS).length);
     expect(body.results.find((row) => row.key === "composer")?.firstWorking).toBe(0);
     expect(body.results.find((row) => row.key === "fileUpload")?.firstWorking).toBe(-1);
+    // Only a TURN_CRITICAL_SELECTORS miss is drift: the absent fileUpload and
+    // the other surface-scoped keys must not read as an audit failure, or every
+    // healthy lane exits 5 (P-035 2026-09-16). This fake page resolves the
+    // composer and nothing else, so exactly the two other critical keys are
+    // named -- no surface-scoped key leaks into the list.
+    expect(body.missingCritical).not.toContain("composer");
+    expect(body.missingCritical).not.toContain("fileUpload");
+    expect(body.missingCritical).toEqual(["modelSwitcher", "projectsNavigation"]);
+  });
+
+  it("names the drift when a turn-critical selector stops resolving", async () => {
+    const { SELECTORS, TURN_CRITICAL_SELECTORS } = await import("../src/browser/selectors.js");
+    const page = {
+      locator: () => ({ first: () => ({ count: async () => 0 }) }),
+    };
+    const state = fakeState({ session: { page } as unknown as Session });
+    const req = new FakeReq();
+    Object.assign(req, {
+      method: "GET",
+      url: "/selectors",
+      headers: { authorization: "Bearer test-token" },
+    });
+    const res = new FakeRes();
+    await handleRequest(req as unknown as IncomingMessage, res as unknown as ServerResponse, state);
+
+    const body = parseJsonBody(res) as { missingCritical: string[] };
+    expect(res.statusCode).toBe(200);
+    expect(body.missingCritical).toEqual(TURN_CRITICAL_SELECTORS.map((key) => key.toString()));
+    expect(body.missingCritical).not.toContain("fileUpload");
+    expect(SELECTORS.composer.length).toBeGreaterThan(0);
+  });
+
+  it("reports a stale leading candidate without failing the audit", async () => {
+    // A later candidate matching while an earlier one does not is the signal
+    // that OpenAI moved the element; it costs one wasted probe per turn but
+    // does not stop a turn, so it is reported and not treated as failure.
+    const { SELECTORS } = await import("../src/browser/selectors.js");
+    const working = SELECTORS.thinkingPowerButton[1];
+    const page = {
+      locator: (selector: string) => ({
+        first: () => ({ count: async () => (selector === working ? 1 : 0) }),
+      }),
+    };
+    const state = fakeState({ session: { page } as unknown as Session });
+    const req = new FakeReq();
+    Object.assign(req, {
+      method: "GET",
+      url: "/selectors",
+      headers: { authorization: "Bearer test-token" },
+    });
+    const res = new FakeRes();
+    await handleRequest(req as unknown as IncomingMessage, res as unknown as ServerResponse, state);
+
+    const body = parseJsonBody(res) as {
+      results: Array<{ key: string; firstWorking: number }>;
+      missingCritical: string[];
+    };
+    expect(body.results.find((row) => row.key === "thinkingPowerButton")?.firstWorking).toBe(1);
+    expect(body.missingCritical).not.toContain("thinkingPowerButton");
   });
 
   it("refuses when no slot holds a page yet", async () => {
