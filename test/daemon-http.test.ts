@@ -717,6 +717,50 @@ describe("handleAsk HTTP-level wiring", () => {
   });
 });
 
+describe("stop guard while a page is leased", () => {
+  async function postStop(headers: Record<string, string>) {
+    const req = new FakeReq();
+    (req as unknown as { method: string }).method = "POST";
+    (req as unknown as { url: string }).url = "/shutdown";
+    req.headers = { authorization: "Bearer test-token", ...headers };
+    const res = new FakeRes();
+    const timer = vi.spyOn(global, "setTimeout").mockImplementation((() => 0) as never);
+    try {
+      await handleRequest(
+        req as unknown as IncomingMessage,
+        res as unknown as ServerResponse,
+        fakeState({ session: { close: vi.fn(async () => {}) } as unknown as Session }),
+      );
+    } finally {
+      timer.mockRestore();
+    }
+    return res as unknown as FakeRes;
+  }
+
+  it("refuses an unforced stop while a page is leased, naming the holder", async () => {
+    // A raw CLI stop carried a live turn at 13:38:08 (P-035 2026-09-16). The
+    // refusal has to name the holder, so a stuck lease is distinguishable from
+    // a turn that is genuinely running.
+    const { slotsOf } = await import("../src/daemon/server.js");
+    const state = fakeState({ session: { close: vi.fn(async () => {}) } as unknown as Session });
+    const leased = slotsOf(state)[0];
+    leased.busy = true;
+    leased.leasedBy = "ask";
+    const req = new FakeReq();
+    (req as unknown as { method: string }).method = "POST";
+    (req as unknown as { url: string }).url = "/shutdown";
+    req.headers = { authorization: "Bearer test-token" };
+    const res = new FakeRes();
+    await handleRequest(req as unknown as IncomingMessage, res as unknown as ServerResponse, state);
+    expect((res as unknown as FakeRes).statusCode).toBe(409);
+  });
+
+  it("accepts a forced stop", async () => {
+    const res = await postStop({ "x-cgpro-force": "1" });
+    expect((res as unknown as FakeRes).statusCode).toBe(200);
+  });
+});
+
 describe("slot lease attribution", () => {
   it("pairs the lease with its release on the preflight path", async () => {
     // A slot leased and never released is indistinguishable from a live turn:
@@ -774,7 +818,7 @@ describe("stop-request attribution", () => {
     // A stop with no attribution is what made the 07:22 incident unreadable:
     // the log said a stop happened but not which runtime or which caller.
     const logged = await post({ "x-cgpro-caller": "unit-test" });
-    expect(logged).toContain("requested via");
+    expect(logged).toContain("accepted via");
     expect(logged).toContain("file=");
     expect(logged).toContain("caller=unit-test");
     expect(logged).toContain("remote=");

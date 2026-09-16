@@ -676,15 +676,38 @@ export async function handleRequest(
     // Attribution (P-035 2026-09-16): a stop at 07:22 could not be traced
     // to any caller, and the registration file is the only thing that says
     // which lane a runtime belongs to. File, caller header, peer address and
-    // the in-flight count are recorded before the session closes. Every field
-    // is best-effort: a missing header or socket must never turn an accepted
-    // stop into a refused one.
+    // the in-flight count are recorded before the session closes. Those fields
+    // are best-effort — a missing header or socket only makes the log less
+    // informative. The one thing that can refuse is an unforced stop while a
+    // page is leased, below.
     const callerHeader = req.headers["x-cgpro-caller"];
     const caller = typeof callerHeader === "string" && callerHeader ? callerHeader : "-";
     const remote = req.socket?.remoteAddress ?? "-";
     const inFlight = slotsOf(state).filter((slot) => slot.busy).length;
+    const forceHeader = req.headers["x-cgpro-force"];
+    const forced = typeof forceHeader === "string" && forceHeader === "1";
+    const busy = slotsOf(state).filter((slot) => slot.busy);
+    // P-035 2026-09-16 (Maik approved): a raw stop that carried a live turn is
+    // the incident this room keeps having. The governed helper waits for idle
+    // and then stops, but a caller that skips the wait used to end the turn.
+    // The route now refuses while any page is leased unless the caller says
+    // force, and names the holder so a stuck lease is distinguishable from a
+    // live turn. Forcing stays available for a wedged lane.
+    if (busy.length > 0 && !forced) {
+      log.info(
+        `STOP refused via /shutdown file=${DAEMON_FILE} caller=${caller} remote=${remote} in_flight=${busy.length} holders=${busy.map((slot) => `${slot.id}:${slot.leasedBy ?? "unknown"}`).join(",")}`,
+      );
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "lane_busy",
+        in_flight: busy.length,
+        holders: busy.map((slot) => ({ slot: slot.id, leasedBy: slot.leasedBy, invocationId: slot.currentInvocation })),
+        force_hint: "resend with header x-cgpro-force: 1 to stop anyway",
+      }));
+      return;
+    }
     log.info(
-      `shutdown requested via /shutdown file=${DAEMON_FILE} caller=${caller} remote=${remote} in_flight=${inFlight}`,
+      `shutdown accepted via /shutdown file=${DAEMON_FILE} caller=${caller} remote=${remote} in_flight=${inFlight} forced=${forced}`,
     );
     // Do not acknowledge until the persistent browser has closed. The old
     // fire-and-exit path let the caller start a replacement against the same

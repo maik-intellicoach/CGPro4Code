@@ -190,6 +190,10 @@ function jsonRequest<T>(
           // appearing as an anonymous stop.
           "x-cgpro-caller":
             process.env.CGPRO_CALLER || `cgpro-cli:${process.argv[2] ?? "?"}:${process.pid}`,
+          // The daemon refuses a stop while a page is leased unless the caller
+          // says force, so a helper that has already established idle (or
+          // deliberately overrides a wedged lane) opts in explicitly.
+          ...(process.env.CGPRO_FORCE_STOP === "1" ? { "x-cgpro-force": "1" } : {}),
           ...(payload ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) } : {}),
         },
       },
