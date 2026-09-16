@@ -32,11 +32,18 @@ function fakeLocator(overrides: { click?: () => Promise<void>; innerText?: strin
   };
 }
 
-/** Accepts every write; `dropAfter` makes it accept only the first N writes. */
-function fakePage(dropAfter = Infinity): Page {
+/**
+ * Accepts every write. `dropAfter` makes it accept only the first N writes (a
+ * prompt that lands partially); `dropFirst` swallows the first M outright (an
+ * insert that went somewhere other than the composer, because CDP insertText
+ * targets whatever holds focus).
+ */
+function fakePage(dropAfter = Infinity, dropFirst = 0): Page {
   let writes = 0;
   const write = (text: string): void => {
-    if (++writes > dropAfter) return;
+    const n = ++writes;
+    if (n <= dropFirst) return;
+    if (n - dropFirst > dropAfter) return;
     composed += text;
   };
   return {
@@ -122,10 +129,11 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
 
   it("never clears a preserved composer to retry: that would strip the connector", async () => {
     // preserveExisting is true on EVERY connector turn (orchestrator.ts), and the
-    // connector's inline mention may live inside the composer. Clearing it to
-    // retry would resubmit a connector-required prompt with no connector, which
-    // is the genuine connector_required_not_used this change exists to prevent.
-    // A connector turn therefore gets one attempt and an honest failure.
+    // connector's inline mention lives inside the composer. Clearing it to retry
+    // would resubmit a connector-required prompt with no connector, which is the
+    // genuine connector_required_not_used this change exists to prevent. The
+    // retry a connector turn does get appends instead, and still fails honestly
+    // when the append does not land either.
     requireSelector.mockResolvedValue(fakeLocator({ innerText: "   " }));
     firstResolved.mockResolvedValueOnce(fakeLocator());
     const page = fakePage();
@@ -135,6 +143,45 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     expect(page.keyboard.insertText).toHaveBeenCalledWith("hello");
     expect(page.keyboard.press).not.toHaveBeenCalledWith("Backspace"); // no clear
     expect(page.keyboard.type).not.toHaveBeenCalled(); // no slow keystroke retype
+  });
+
+  it("recovers a connector turn whose insert was swallowed, by appending", async () => {
+    // Measured on intelli at 2026-09-17T23:33Z: 33 of 2982 characters landed,
+    // and `p035-low-risk-workstation-intelli` is exactly 33 characters. The
+    // composer held the connector mention and nothing else. The mention
+    // surviving proves the insert never landed rather than being cleared after
+    // the fact -- a clear would have taken the mention with it. Re-focusing and
+    // appending repairs that, and leaves the mention in front of the prompt.
+    const click = vi.fn(async () => {});
+    firstResolved.mockResolvedValue(fakeLocator({ click }));
+    const prompt = `${"planning context ".repeat(120)}\ninvocation_id="e4adf507"`;
+    composed = "p035-low-risk-workstation-intelli"; // the mention, alone
+    const page = fakePage(Infinity, 1); // the first insert goes nowhere
+
+    await sendPrompt(page, prompt, true);
+
+    expect(click).toHaveBeenCalledTimes(1); // the turn went out
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Backspace"); // mention kept
+    expect(composed).toContain("p035-low-risk-workstation-intelli");
+    expect(composed).toContain('invocation_id="e4adf507"');
+  });
+
+  it("refuses to append onto a partially landed prompt: that would duplicate its head", async () => {
+    // An append is only safe when the prompt is wholly absent. Half a prompt
+    // plus a whole one is a different corruption, not a repair, so a partial
+    // landing still fails closed.
+    const click = vi.fn(async () => {});
+    firstResolved.mockResolvedValue(fakeLocator({ click }));
+    const page = fakePage(1); // the first line lands, the rest is dropped
+
+    await expect(
+      sendPrompt(page, `${"planning context ".repeat(40)}\ninvocation_id="e4adf507"`, true),
+    ).rejects.toThrow("composer delivery incomplete");
+
+    expect(click).not.toHaveBeenCalled();
+    // insertLines emits one insertText per line, so a two-line prompt is two
+    // calls for ONE attempt. A retry would have made it four.
+    expect(vi.mocked(page.keyboard.insertText).mock.calls).toHaveLength(2);
   });
 
   it("re-inserts once when nothing has to be preserved", async () => {

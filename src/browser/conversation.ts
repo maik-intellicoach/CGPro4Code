@@ -908,12 +908,20 @@ async function insertComposerText(page: Page, text: string): Promise<void> {
  * that ran before it would pass and the turn would still go out empty.
  *
  * On a connector turn `preserveExisting` is true (orchestrator.ts: every turn
- * with a connector), and the connector's inline mention may live INSIDE the
+ * with a connector), and the connector's inline mention lives INSIDE the
  * composer. `clearComposer` would therefore strip the connector, and re-typing
  * would submit a connector-required prompt with no connector attached -- which
  * produces the genuine `connector_required_not_used` this whole change exists
- * to prevent. So the re-insert retry only runs when nothing must be preserved;
- * a connector turn gets one attempt and an honest failure.
+ * to prevent. A connector turn therefore retries by APPENDING, never clearing.
+ *
+ * That append is safe only when the prompt is wholly absent, which is the shape
+ * this actually fails in. Measured on intelli 2026-09-17T23:33Z: 33 of 2982
+ * characters landed, and `p035-low-risk-workstation-intelli` is exactly 33 --
+ * the composer held the mention and nothing else. The mention surviving while
+ * the prompt did not proves the insert never landed rather than being cleared
+ * afterwards; a later clear would have taken the mention with it. So the retry
+ * re-establishes focus and inserts again. A PARTIAL prompt gets no retry: an
+ * append would duplicate the head, so that case still fails honestly.
  */
 async function verifyComposerHoldsPrompt(
   page: Page, composer: Locator, text: string, preserveExisting: boolean,
@@ -929,11 +937,24 @@ async function verifyComposerHoldsPrompt(
   let landed = await readComposer(page, composer);
   if (landed !== null && composerHoldsPrompt(landed, want)) return;
 
-  if (!preserveExisting) {
+  const retry = !preserveExisting
+    ? "clear"
+    : landed !== null && promptIsWhollyAbsent(landed, want)
+      ? "append"
+      : "none";
+  if (retry !== "none") {
     console.error(
-      `[cgpro:composer] composer ${landed === null ? "could not be read" : `holds ${landed.length} of ${want.length} expected characters`}; re-inserting once`,
+      `[cgpro:composer] composer ${landed === null ? "could not be read" : `holds ${landed.length} of ${want.length} expected characters`}; re-inserting once (${retry})`,
     );
-    await clearComposer(page);
+    if (retry === "clear") {
+      await clearComposer(page);
+    } else {
+      // Put the caret back in the composer before inserting. CDP insertText
+      // targets whatever holds focus, so the whole point of this retry is the
+      // re-focus; appending at the end keeps the mention in front of the prompt.
+      await composer.click();
+      await page.keyboard.press("Meta+End");
+    }
     await insertLines(page, text.split("\n"));
     landed = await readComposer(page, composer);
     if (landed !== null && composerHoldsPrompt(landed, want)) return;
@@ -994,6 +1015,20 @@ function lastInvariantToken(text: string): string | null {
 }
 
 const COMPOSER_MIN_LANDED_RATIO = Number(process.env.CGPRO_COMPOSER_MIN_LANDED_RATIO ?? 0.9);
+
+/**
+ * Did the prompt fail to arrive at all, as opposed to arriving partially?
+ *
+ * Only an outright absence is repairable by appending; appending on top of a
+ * partial prompt would duplicate its head. The observed failure leaves the
+ * connector mention alone in the composer -- 33 characters against 2982 -- so
+ * any ceiling comfortably above the longest connector name and far below a real
+ * prompt separates the two. The floor matters for short prompts, where a ratio
+ * alone would drop under the mention's own length.
+ */
+function promptIsWhollyAbsent(landed: string, want: string): boolean {
+  return landed.length <= Math.max(80, Math.floor(want.length * 0.05));
+}
 
 /**
  * Read the composer, tolerating a transient failure. Only a composer that stays
