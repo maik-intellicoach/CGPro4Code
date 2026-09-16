@@ -679,11 +679,12 @@ export async function handleRequest(
       .filter((result) => result.firstWorking === -1)
       .map((result) => result.key)
       .filter((key) => TURN_CRITICAL_SELECTORS.some((critical) => critical.toString() === key));
-    const stale = results.filter((result) => result.firstWorking > 0).map((result) => result.key);
+    const fallback = results.filter((result) => result.firstWorking > 0).length;
+    const resolved = results.filter((result) => result.firstWorking === 0).length;
     log.info(
       `selector audit served file=${DAEMON_FILE} in_flight=${inFlight} ` +
-        `unresolved=${results.length - missingCritical.length - stale.length}/${results.length} ` +
-        `stale=${stale.length} critical_missing=${missingCritical.length}`,
+        `resolved=${resolved}/${results.length} absent=${results.length - resolved - fallback} ` +
+        `fallback=${fallback} critical_missing=${missingCritical.length}`,
     );
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, inFlight, results, critical: TURN_CRITICAL_SELECTORS, missingCritical }));
