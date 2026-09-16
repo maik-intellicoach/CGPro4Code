@@ -148,7 +148,16 @@ export async function ensureProSixMaximum(page: Page): Promise<{ model: string; 
     if (!Number.isFinite(max) || !Number.isFinite(min) || max <= min) {
       throw new Error("6 Pro thinking power range could not be verified");
     }
-    await slider.press("End", { timeout: 5_000 });
+    // P-035 2026-09-16: ChatGPT renders `role="slider"` on its hidden
+    // ThumbInput span, which is sometimes not visible. `press()` waits for an
+    // actionability check that a hidden element can never pass, so it timed out
+    // at 5s and failed the whole turn ("locator.press: Timeout 5000ms
+    // exceeded", observed on the personal lane during the 18:30 sweep).
+    // Focus only requires the element to be attached, and the keyboard event
+    // reaches it either way; the aria-valuenow postcondition below still
+    // rejects a press that did not land, so this cannot fail silently.
+    await slider.focus({ timeout: 5_000 });
+    await page.keyboard.press("End");
     await page.waitForTimeout(5_000);
     const current = await slider.getAttribute("aria-valuenow");
     if (current === null || Number(current) !== max) {

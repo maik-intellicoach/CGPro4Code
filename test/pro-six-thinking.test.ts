@@ -30,10 +30,13 @@ function setup(options: {
       "aria-valuemax": options.max === undefined ? "4" : options.max,
       "aria-valuenow": value,
     })[name] ?? null),
-    press: vi.fn(async () => { if (options.sticks !== false) value = options.max ?? "4"; }),
+    // P-035 2026-09-16: the slider is focused and the keyboard drives it,
+    // because ChatGPT's role="slider" span is hidden and `press()` needs an
+    // actionability check it can never pass.
+    focus: vi.fn(async () => {}),
   };
   const page = {
-    keyboard: { press: vi.fn(async () => {}) },
+    keyboard: { press: vi.fn(async (key: string) => { if (key === "End" && options.sticks !== false) value = options.max ?? "4"; }) },
     waitForTimeout: vi.fn(async () => {}),
   } as unknown as Page;
   requireSelector.mockResolvedValueOnce(model).mockResolvedValueOnce(slider).mockResolvedValueOnce(selected);
@@ -47,7 +50,8 @@ describe("6 Pro maximum thinking admission", () => {
   it("moves a lower slider value to the observed maximum and verifies it", async () => {
     const s = setup();
     await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 4 });
-    expect(s.slider.press).toHaveBeenCalledWith("End", { timeout: 5_000 });
+    expect(s.slider.focus).toHaveBeenCalledWith({ timeout: 5_000 });
+    expect(s.page.keyboard.press).toHaveBeenCalledWith("End");
     expect(s.page.keyboard.press).toHaveBeenCalledWith("Escape");
   });
 
@@ -65,7 +69,7 @@ describe("6 Pro maximum thinking admission", () => {
   it("refuses an unverified slider range", async () => {
     const s = setup({ max: null });
     await expect(ensureProSixMaximum(s.page)).rejects.toThrow("range could not be verified");
-    expect(s.slider.press).not.toHaveBeenCalled();
+    expect(s.slider.focus).not.toHaveBeenCalled();
   });
 
   it("upgrades High to maximum power and verifies the resulting 6 Pro model", async () => {
@@ -76,14 +80,14 @@ describe("6 Pro maximum thinking admission", () => {
   it("refuses an older Pro model even when its power is at maximum", async () => {
     const s = setup({ modelLabel: "5.6Pro" });
     await expect(ensureProSixMaximum(s.page)).rejects.toThrow("6 Pro is not selected");
-    expect(s.slider.press).toHaveBeenCalledOnce();
+    expect(s.slider.focus).toHaveBeenCalledOnce();
   });
 
   it("refuses a missing 6 Pro control before changing any thinking setting", async () => {
     const s = setup();
     requireSelector.mockReset().mockRejectedValue(new Error("6 Pro model missing"));
     await expect(ensureProSixMaximum(s.page)).rejects.toThrow("6 Pro model missing");
-    expect(s.slider.press).not.toHaveBeenCalled();
+    expect(s.slider.focus).not.toHaveBeenCalled();
   });
 
   it("accepts a timed-out activation when the live menu postcondition is already open", async () => {

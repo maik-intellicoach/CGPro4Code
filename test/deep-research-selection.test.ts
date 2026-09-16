@@ -52,7 +52,11 @@ function scenario(options: {
     getAttribute: vi.fn(async () => null),
   };
   const page = {
-    keyboard: { press: vi.fn(async () => { popoverOpen = false; }) },
+    keyboard: {
+      // "End" now drives the thinking-power slider (it is focused first);
+      // Escape is what closes the popover.
+      press: vi.fn(async (key: string) => { if (key === "End") power = "4"; else popoverOpen = false; }),
+    },
     waitForTimeout: vi.fn(async () => {}),
   } as unknown as Page;
   let power = "2";
@@ -70,7 +74,10 @@ function scenario(options: {
     if (name === "selected thinking model") return effort;
     if (name === "thinking power") return {
       getAttribute: async (attr: string) => attr === "aria-valuemin" ? "0" : attr === "aria-valuemax" ? "4" : power,
-      press: async () => { power = "4"; },
+      // Focused, then driven by the keyboard: ChatGPT's role="slider" span is
+      // hidden, so `press()` would wait on an actionability check it can never
+      // pass (P-035 2026-09-16).
+      focus: async () => {},
     };
     throw new Error(`Unexpected selector: ${name}`);
   });
