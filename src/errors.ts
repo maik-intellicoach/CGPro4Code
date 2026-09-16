@@ -73,11 +73,13 @@ export class BotChallengeError extends CgproError {
 
 export type PreSubmitInteractionCode =
   | "model_control_activation_timeout"
-  | "connector_control_activation_timeout";
+  | "connector_control_activation_timeout"
+  | "prompt_delivery_incomplete";
 
 export type PreSubmitInteractionPhase =
   | "model_verification"
-  | "connector_selection";
+  | "connector_selection"
+  | "prompt_delivery";
 
 /** A browser-control failure that is proven to occur before Send. */
 export class PreSubmitInteractionError extends Error {

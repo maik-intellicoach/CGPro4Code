@@ -880,24 +880,73 @@ export async function sendPrompt(
  * treats a bare "\n" as submit-adjacent; that is a handful of keypresses
  * instead of one per character.
  *
- * Falls back to per-character typing if insertion leaves the composer empty,
- * so a build that rejects inserted text degrades to the old behaviour rather
- * than submitting an empty prompt to a paid run.
+ * Falls back to per-character typing when the inserted text does not land
+ * COMPLETE, so a build that rejects or drops inserted text degrades to the old
+ * behaviour rather than submitting a partial prompt to a paid run. A second
+ * incomplete attempt throws: a truncated prompt burns a Pro turn, returns an
+ * answer to a question nobody asked, and takes the account out of routing, so
+ * refusing to submit is strictly cheaper than submitting.
+ *
+ * Escape hatch: CGPRO_SKIP_COMPOSER_VERIFY=1 restores the unverified path.
  */
 async function insertComposerText(page: Page, composer: Locator, text: string): Promise<void> {
   const lines = text.split("\n");
+  await insertLines(page, lines);
+  if (text.trim().length === 0) return;
+  if (process.env.CGPRO_SKIP_COMPOSER_VERIFY === "1") return;
+
+  const want = normaliseComposerText(text);
+  // endsWith, not equality: sendPrompt's preserveExisting mode appends to
+  // whatever the composer already holds, and what must survive intact is the
+  // text we just inserted -- ending with the last line we wrote. A drop
+  // anywhere inside that text still fails the check.
+  // Fail OPEN on the read: an unreadable composer must not trigger a duplicate
+  // write. Only a composer we can actually read can be judged incomplete.
+  let landed = await readComposer(composer);
+  if (landed === null || landed.endsWith(want)) return;
+
+  // P-035 2026-09-17: the old check asked only "is the composer empty?", so a
+  // composer holding the first N of 162 lines passed and was submitted. The
+  // prompt's LAST line carries the connector's mandatory invocation_id, so a
+  // dropped tail costs the whole turn: ChatGPT answers the preamble it can see,
+  // asks for the id it cannot, calls no tool, and the facade reads that as a
+  // connector policy failure that latches the account out of routing.
+  console.error(
+    `[cgpro:composer] composer holds ${landed.length} of ${want.length} expected characters; re-entering by keystroke`,
+  );
+  await clearComposer(page);
+  await typeLines(page, lines);
+  landed = await readComposer(composer);
+  if (landed === null || landed.endsWith(want)) return;
+  throw new PreSubmitInteractionError(
+    "prompt_delivery_incomplete",
+    "prompt_delivery",
+    `composer delivery incomplete: ${landed.length} of ${want.length} characters landed after two attempts`,
+  );
+}
+
+/**
+ * The composer renders each line as its own node and trims, so whitespace
+ * differences are expected and meaningless. Any other difference is a delivery
+ * fault, and length alone is immune to quote or entity rewriting.
+ */
+function normaliseComposerText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+async function readComposer(composer: Locator): Promise<string | null> {
+  const raw = await composer.innerText().catch(() => null);
+  return raw === null ? null : normaliseComposerText(raw);
+}
+
+async function insertLines(page: Page, lines: string[]): Promise<void> {
   for (let i = 0; i < lines.length; i++) {
     if (i > 0) await page.keyboard.press("Shift+Enter");
     if (lines[i].length > 0) await page.keyboard.insertText(lines[i]);
   }
-  if (text.trim().length === 0) return;
-  // Fail OPEN on the read: only fall back when we positively observe an empty
-  // composer. An unreadable composer must not trigger a duplicate write.
-  const landed = await composer.innerText().catch(() => null);
-  if (landed === null || landed.trim().length > 0) return;
-  console.error(
-    "[cgpro:composer] insertText left the composer empty; falling back to keystroke typing",
-  );
+}
+
+async function typeLines(page: Page, lines: string[]): Promise<void> {
   for (let i = 0; i < lines.length; i++) {
     if (i > 0) await page.keyboard.press("Shift+Enter");
     await page.keyboard.type(lines[i], { delay: 4 });

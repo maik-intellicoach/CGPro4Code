@@ -18,29 +18,43 @@ process.env.CGPRO_SEND_CLICK_ATTEMPTS = "2";
 
 const { sendPrompt } = await import("../src/browser/conversation.js");
 
+// What the fake composer currently holds. sendPrompt reads the composer back to
+// confirm the whole prompt landed, so a stub that answers a constant string no
+// longer models anything useful -- it would pass the completeness check for a
+// composer that had never been written to.
+let composed = "";
+
 function fakeLocator(overrides: { click?: () => Promise<void>; innerText?: string } = {}) {
   return {
     click: overrides.click ?? (async () => {}),
     getAttribute: async () => null, // disabled=null, aria-disabled!=="true" -> enabled
-    // Non-empty by default: sendPrompt reads the composer back to confirm the
-    // inserted prompt landed, and only retypes when it observes it empty.
-    innerText: async () => overrides.innerText ?? "composed",
+    innerText: async () => overrides.innerText ?? composed,
   };
 }
 
-function fakePage(): Page {
+/** Accepts every write; `dropAfter` makes it accept only the first N writes. */
+function fakePage(dropAfter = Infinity): Page {
+  let writes = 0;
+  const write = (text: string): void => {
+    if (++writes > dropAfter) return;
+    composed += text;
+  };
   return {
     locator: vi.fn(() => ({ count: async () => 0 })),
     keyboard: {
-      press: vi.fn(async () => {}),
-      type: vi.fn(async () => {}),
-      insertText: vi.fn(async () => {}),
+      press: vi.fn(async (key: string) => {
+        if (key === "Shift+Enter") write("\n");
+        if (key === "Backspace") composed = ""; // Meta+A then Backspace clears
+      }),
+      type: vi.fn(async (text: string) => write(text)),
+      insertText: vi.fn(async (text: string) => write(text)),
     },
     waitForTimeout: vi.fn(async () => {}),
   } as unknown as Page;
 }
 
 beforeEach(() => {
+  composed = "";
   firstResolved.mockReset();
   requireSelector.mockReset();
   requireSelector.mockImplementation(async () => fakeLocator());
@@ -106,18 +120,48 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     expect(page.keyboard.type).not.toHaveBeenCalled();
   });
 
-  it("retypes the prompt only when the composer is positively observed empty", async () => {
+  it("retypes when the prompt does not land, then refuses to submit", async () => {
     // insertText silently doing nothing must never submit an empty prompt to a
-    // paid Pro run, so an observed-empty composer falls back to typing.
-    const composer = fakeLocator({ innerText: "   " });
-    requireSelector.mockResolvedValueOnce(composer);
+    // paid Pro run: the keystroke fallback gets one attempt, and a composer that
+    // still does not hold the prompt throws instead of sending.
+    requireSelector.mockResolvedValue(fakeLocator({ innerText: "   " }));
     firstResolved.mockResolvedValueOnce(fakeLocator());
     const page = fakePage();
 
-    await sendPrompt(page, "hello", true);
+    await expect(sendPrompt(page, "hello", true)).rejects.toThrow("composer delivery incomplete");
 
     expect(page.keyboard.insertText).toHaveBeenCalledWith("hello");
     expect(page.keyboard.type).toHaveBeenCalledWith("hello", { delay: 4 });
+  });
+
+  it("refuses to submit a prompt whose tail was dropped (P-035 2026-09-17)", async () => {
+    // The invocation_id every connector tool requires is the LAST line of a
+    // planning prompt. On 2026-09-17 two prompts reached ChatGPT without it:
+    // the model answered the preamble it could see, asked for the id it could
+    // not, called no tool, and both accounts were latched out of routing. The
+    // old check asked only "is the composer empty?", so a composer holding the
+    // head and nothing else passed.
+    const click = vi.fn(async () => {});
+    firstResolved.mockResolvedValue(fakeLocator({ click }));
+    const page = fakePage(2); // takes the first line, drops everything after
+
+    await expect(
+      sendPrompt(page, 'question\nmore context\ninvocation_id="e4adf507"', false),
+    ).rejects.toThrow("composer delivery incomplete");
+
+    expect(click).not.toHaveBeenCalled();
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+  });
+
+  it("accepts a composer that already held text in preserveExisting mode", async () => {
+    // preserveExisting appends to an inline connector pill's text, so the
+    // composer legitimately holds more than the prompt. What must be intact is
+    // the text just inserted, which is why the check is endsWith, not equality.
+    composed = "pill text ";
+    firstResolved.mockResolvedValue(fakeLocator());
+    const page = fakePage();
+
+    await expect(sendPrompt(page, "hello", true)).resolves.toBeDefined();
   });
 
   it("does not compose or submit after exact cancellation owns the turn", async () => {
@@ -135,7 +179,10 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     const order: string[] = [];
     firstResolved.mockResolvedValue(fakeLocator({ click: async () => { order.push("send"); } }));
     const page = fakePage();
-    vi.mocked(page.keyboard.insertText).mockImplementation(async () => { order.push("insert"); });
+    vi.mocked(page.keyboard.insertText).mockImplementation(async (text: string) => {
+      order.push("insert");
+      composed += text;
+    });
     await sendPrompt(page, "research this", true, undefined, async () => { order.push("verify"); });
     expect(order).toEqual(["insert", "verify", "send"]);
     expect(page.keyboard.press).not.toHaveBeenCalledWith("Backspace");
