@@ -21,9 +21,12 @@ import { CGPRO_HOME, ensureDirs } from "../store/paths.js";
 // distinct path instead of colliding with the default single-lane file.
 // Unset (the default) reproduces the prior hardcoded behavior exactly.
 export const DAEMON_FILE = process.env.CGPRO_DAEMON_JSON || join(CGPRO_HOME, "daemon.json");
-export const DAEMON_LOG = join(CGPRO_HOME, "logs", "daemon.log");
+// CGPRO_DAEMON_LOG overrides the shared daemon log path — lets a test run or
+// a second lane write its own file instead of appending to the live log.
+// Unset (the default) reproduces the prior hardcoded behavior exactly.
+export const DAEMON_LOG = process.env.CGPRO_DAEMON_LOG || join(CGPRO_HOME, "logs", "daemon.log");
 /** Directory for daemon logs. stderr from a daemon child lands here too. */
-export const DAEMON_LOG_DIR = join(CGPRO_HOME, "logs");
+export const DAEMON_LOG_DIR = process.env.CGPRO_DAEMON_LOG_DIR || join(CGPRO_HOME, "logs");
 
 export interface DaemonInfo {
   version: 1;

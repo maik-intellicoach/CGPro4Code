@@ -6,6 +6,7 @@ export default defineConfig({
     environment: "node",
     globals: false,
     pool: "forks",
+    setupFiles: ["test/setup.ts"],
   },
   resolve: {
     extensions: [".ts", ".js"],
