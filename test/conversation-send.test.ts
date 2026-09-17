@@ -24,11 +24,22 @@ const { sendPrompt, composerHoldsPrompt } = await import("../src/browser/convers
 // composer that had never been written to.
 let composed = "";
 
+// Does the caret sit in the composer's text flow? CDP insertText writes to the
+// focused EDITABLE, so while the connector's inline pill holds focus every
+// insert is silently dropped. Captured on intelli 2026-09-17:
+// active="a.focus-visible:focus-ring.inline-flex", activeEditable=false,
+// activeInComposer=true.
+let caretInComposer = true;
+
 function fakeLocator(overrides: { click?: () => Promise<void>; innerText?: string } = {}) {
   return {
     click: overrides.click ?? (async () => {}),
     getAttribute: async () => null, // disabled=null, aria-disabled!=="true" -> enabled
     innerText: async () => overrides.innerText ?? composed,
+    // focusComposerEnd: focuses the contenteditable host and collapses the
+    // selection past the pill. A plain click does NOT do this -- it targets the
+    // element centre, which on a composer holding only a pill is the pill.
+    evaluate: async () => { caretInComposer = true; },
   };
 }
 
@@ -42,6 +53,7 @@ function fakePage(dropAfter = Infinity, dropFirst = 0): Page {
   let writes = 0;
   const write = (text: string): void => {
     const n = ++writes;
+    if (!caretInComposer) return; // focus is on the pill: insertText is dropped
     if (n <= dropFirst) return;
     if (n - dropFirst > dropAfter) return;
     composed += text;
@@ -66,6 +78,7 @@ function fakePage(dropAfter = Infinity, dropFirst = 0): Page {
 
 beforeEach(() => {
   composed = "";
+  caretInComposer = true;
   firstResolved.mockReset();
   requireSelector.mockReset();
   requireSelector.mockImplementation(async () => fakeLocator());
@@ -168,6 +181,33 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     expect(page.keyboard.press).not.toHaveBeenCalledWith("Backspace"); // mention kept
     expect(composed).toContain("p035-low-risk-workstation-intelli");
     expect(composed).toContain('invocation_id="e4adf507"');
+  });
+
+  it("recovers when the connector pill holds focus and insertText is dropped", async () => {
+    // The 2026-09-17 root cause, captured in production. The connector attaches
+    // as an inline selection pill -- an anchor carrying contenteditable="false"
+    // inside the ProseMirror document -- and focus lands ON it. insertText
+    // writes to the focused editable, so the prompt went nowhere and the
+    // composer kept only the mention: 33 of 2982 characters, five times.
+    //
+    // Two earlier repairs failed against exactly this. composer.click() targets
+    // the element CENTRE, and a composer holding only a pill has the pill at its
+    // centre, so re-clicking re-focused the anchor. Meta+End on a non-editable
+    // anchor moves no ProseMirror selection at all.
+    const click = vi.fn(async () => {});
+    firstResolved.mockResolvedValue(fakeLocator({ click }));
+    composed = "p035-low-risk-workstation-intelli"; // the pill, alone
+    caretInComposer = false; // and it holds the focus
+    const page = fakePage();
+
+    await sendPrompt(page, `${"planning context ".repeat(120)}\ninvocation_id="e4adf507"`, true);
+
+    expect(click).toHaveBeenCalledTimes(1); // the turn went out
+    expect(composed).toContain("p035-low-risk-workstation-intelli"); // pill kept
+    expect(composed).toContain('invocation_id="e4adf507"'); // prompt delivered
+    // Two lines, two insertText calls: the caret was seated BEFORE the first
+    // insert, so the delivery check never had to fall back to its retry.
+    expect(vi.mocked(page.keyboard.insertText).mock.calls).toHaveLength(2);
   });
 
   it("refuses to append onto a partially landed prompt: that would duplicate its head", async () => {

@@ -854,9 +854,10 @@ export async function sendPrompt(
   // or stale picker query cannot contaminate the actual prompt.
   if (!preserveExisting) {
     await clearComposer(page);
-  } else {
-    await page.keyboard.press("Meta+End");
   }
+  // Put the caret in the composer's text flow before inserting anything. This
+  // replaces a "Meta+End" that could not do the job: see focusComposerEnd.
+  await focusComposerEnd(page, composer);
   // Composer is a contenteditable div on modern chatgpt.com. Insert the whole
   // prompt in one CDP `Input.insertText` instead of typing it character by
   // character: at 4ms/char a planning prompt spent MINUTES streaming synthetic
@@ -926,6 +927,47 @@ async function insertComposerText(page: Page, text: string): Promise<void> {
 }
 
 /**
+ * Focus the composer and collapse the caret to the end of its content.
+ *
+ * This is the 2026-09-17 prompt-loss fix, and the capture that earned it reads:
+ *
+ *   active: "a.focus-visible:focus-ring.inline-flex", activeEditable: false,
+ *   activeIsComposer: false, activeInComposer: true, editables: 1
+ *
+ * The connector attaches as an inline selection pill -- an anchor carrying
+ * `contenteditable="false"` inside the ProseMirror document. After the click
+ * that attaches it, focus sits ON that anchor: inside the composer, but on a
+ * node that cannot be typed into. CDP Input.insertText writes to the focused
+ * editable, so every insert was silently dropped and the composer kept only the
+ * mention -- 33 of 2982 characters on intelli, five times, identical counts.
+ *
+ * It looked account-specific because it is only reliably reached through the
+ * slow Developer mode route, which is the only way intelli's personal Pro custom
+ * MCP connector can be selected.
+ *
+ * Two earlier repairs failed against exactly this, and both failures make sense
+ * here. `composer.click()` targets the element's CENTRE, and when the composer
+ * holds nothing but the pill, the centre IS the pill -- so re-clicking put focus
+ * straight back on the anchor. `Meta+End` on a non-editable anchor moves no
+ * ProseMirror selection at all. Focusing the contenteditable host directly and
+ * collapsing a Range past the pill avoids both traps.
+ */
+async function focusComposerEnd(page: Page, composer: Locator): Promise<void> {
+  await composer
+    .evaluate((element) => {
+      (element as HTMLElement).focus();
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      range.collapse(false); // to the end, past any inline pill
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    })
+    .catch(() => undefined);
+  await page.waitForTimeout(80);
+}
+
+/**
  * Refuse to send a prompt the composer does not actually hold.
  *
  * Called immediately before the send click, NOT right after insertion. The
@@ -974,16 +1016,11 @@ async function verifyComposerHoldsPrompt(
     );
     if (retry === "clear") {
       await clearComposer(page);
-    } else {
-      // Put the caret back in the composer before inserting. CDP insertText
-      // targets whatever holds focus, so the whole point of this retry is the
-      // re-focus; appending at the end keeps the mention in front of the prompt.
-      // Escape first: an open picker popover is what steals the focus, and
-      // clicking the composer underneath it does not reliably take it back.
-      await page.keyboard.press("Escape").catch(() => undefined);
-      await composer.click();
-      await page.keyboard.press("Meta+End");
     }
+    // Re-seat the caret in the composer's text flow. An earlier version clicked
+    // the composer here, which is what a centre-click does to a composer holding
+    // only a pill: it re-focused the pill and the retry inserted nothing either.
+    await focusComposerEnd(page, composer);
     await insertLines(page, text.split("\n"));
     landed = await readComposer(page, composer);
     if (landed !== null && composerHoldsPrompt(landed, want)) return;
