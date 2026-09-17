@@ -804,6 +804,18 @@ export async function setConnector(page: Page, name: string): Promise<void> {
   }
   await page.waitForTimeout(300);
   await assertConnectorAttached(page, connectorName);
+  // The fallback path's missing dismissal. Every other exit from setConnector
+  // escapes -- the not-exposed throw, the already-attached return, the failed
+  // click -- but the two post-click success exits did not, and this is the one
+  // intelli takes. Its connector is a personal Pro custom MCP, so the ordinary
+  // `@` search never surfaces it and selection always runs the Developer mode
+  // route: 25s of picker work against 1-2s on the fast path, every single turn.
+  // The menu stayed open, CDP insertText wrote the prompt into it, and the
+  // composer kept only the mention -- 33 of 2982 characters, three times, with
+  // identical counts. Deterministic per account, which is why intelli failed
+  // every canary while personal, strengths and ms1980 passed.
+  await page.keyboard.press("Escape").catch(() => undefined);
+  await page.waitForTimeout(150);
 }
 
 export async function clearComposer(page: Page): Promise<void> {
