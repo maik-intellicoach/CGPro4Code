@@ -57,6 +57,10 @@ function fakePage(dropAfter = Infinity, dropFirst = 0): Page {
       insertText: vi.fn(async (text: string) => write(text)),
     },
     waitForTimeout: vi.fn(async () => {}),
+    // The refusal path captures page state before throwing. It must never be the
+    // reason a turn fails, so the real one is wrapped in .catch() and this stub
+    // only has to exist.
+    evaluate: vi.fn(async () => '{"stub":true}'),
   } as unknown as Page;
 }
 

@@ -994,18 +994,58 @@ async function verifyComposerHoldsPrompt(
   // `matches` separates them -- more than one match means this locator is
   // ambiguous and the refusal may be reading the wrong node. `head` shows
   // whether what landed is the connector mention or the start of the prompt.
-  const matches = await page
-    .locator(joinSelectors(SELECTORS.composer))
-    .count()
-    .catch(() => -1);
+  const selector = joinSelectors(SELECTORS.composer);
+  const matches = await page.locator(selector).count().catch(() => -1);
+  const diagnostics = await composerDiagnostics(page, selector);
   throw new PreSubmitInteractionError(
     "prompt_delivery_incomplete",
     "prompt_delivery",
     landed === null
-      ? "composer delivery unverifiable: the composer could not be read"
+      ? `composer delivery unverifiable: the composer could not be read ${diagnostics}`
       : `composer delivery incomplete: ${landed.length} of ${want.length} characters landed `
-        + `(composer matches=${matches}, held=${JSON.stringify(landed.slice(0, 60))})`,
+        + `(composer matches=${matches}, held=${JSON.stringify(landed.slice(0, 60))}) ${diagnostics}`,
   );
+}
+
+/**
+ * Page state at the moment delivery is refused.
+ *
+ * CDP insertText writes to whatever the page treats as focused, so a refusal is
+ * only actionable if it says what that was. Three fixes were shipped against
+ * this fault on inference alone and all three missed; this reports the facts
+ * each of them assumed instead. `activeInComposer` separates a focus problem
+ * from everything else, `editables` and `composer` separate "wrote to the wrong
+ * node" from "wrote nowhere", and `menus` shows whether a picker is still open.
+ */
+async function composerDiagnostics(page: Page, selector: string): Promise<string> {
+  return page
+    .evaluate((sel) => {
+      const describe = (el: Element | null): string => {
+        if (el === null) return "none";
+        const id = el.id ? `#${el.id}` : "";
+        const role = el.getAttribute("role");
+        const cls = typeof el.className === "string" && el.className
+          ? `.${el.className.trim().split(/\s+/).slice(0, 2).join(".")}`
+          : "";
+        return `${el.tagName.toLowerCase()}${id}${cls}${role ? `[role=${role}]` : ""}`;
+      };
+      const active = document.activeElement;
+      const composer = document.querySelector(sel);
+      return JSON.stringify({
+        active: describe(active),
+        activeEditable: active instanceof HTMLElement ? active.isContentEditable : null,
+        activeIsComposer: composer !== null && active === composer,
+        activeInComposer: composer !== null && active !== null ? composer.contains(active) : null,
+        composer: describe(composer),
+        composerEditable: composer instanceof HTMLElement ? composer.isContentEditable : null,
+        editables: document.querySelectorAll('[contenteditable="true"]').length,
+        menus: document.querySelectorAll(
+          '[role="menu"],[role="listbox"],[role="dialog"],[aria-modal="true"]',
+        ).length,
+        html: composer === null ? null : composer.outerHTML.slice(0, 400),
+      });
+    }, selector)
+    .catch((error) => `capture failed: ${error instanceof Error ? error.message : String(error)}`);
 }
 
 /**
