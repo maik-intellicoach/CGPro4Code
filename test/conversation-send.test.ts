@@ -39,7 +39,7 @@ function fakeLocator(overrides: { click?: () => Promise<void>; innerText?: strin
     // focusComposerEnd: focuses the contenteditable host and collapses the
     // selection past the pill. A plain click does NOT do this -- it targets the
     // element centre, which on a composer holding only a pill is the pill.
-    evaluate: async () => { caretInComposer = true; },
+    evaluate: async () => { caretInComposer = true; return true; }, // seated
   };
 }
 

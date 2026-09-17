@@ -857,7 +857,11 @@ export async function sendPrompt(
   }
   // Put the caret in the composer's text flow before inserting anything. This
   // replaces a "Meta+End" that could not do the job: see focusComposerEnd.
-  await focusComposerEnd(page, composer);
+  // Fail OPEN here and let the delivery check decide -- it is the thing that
+  // actually knows whether the prompt arrived.
+  if (!(await focusComposerEnd(page, composer))) {
+    console.error("[cgpro:composer] could not seat the caret in the composer text flow; inserting anyway");
+  }
   // Composer is a contenteditable div on modern chatgpt.com. Insert the whole
   // prompt in one CDP `Input.insertText` instead of typing it character by
   // character: at 4ms/char a planning prompt spent MINUTES streaming synthetic
@@ -952,20 +956,50 @@ async function insertComposerText(page: Page, text: string): Promise<void> {
  * ProseMirror selection at all. Focusing the contenteditable host directly and
  * collapsing a Range past the pill avoids both traps.
  */
-async function focusComposerEnd(page: Page, composer: Locator): Promise<void> {
-  await composer
-    .evaluate((element) => {
-      (element as HTMLElement).focus();
-      const range = document.createRange();
-      range.selectNodeContents(element);
-      range.collapse(false); // to the end, past any inline pill
-      const selection = window.getSelection();
-      selection?.removeAllRanges();
-      selection?.addRange(range);
-    })
-    .catch(() => undefined);
-  await page.waitForTimeout(80);
+async function focusComposerEnd(page: Page, composer: Locator): Promise<boolean> {
+  for (let attempt = 0; attempt < COMPOSER_CARET_ATTEMPTS; attempt++) {
+    const seated = await composer
+      .evaluate((element) => {
+        const counter = window as unknown as { __cgproInputCount?: number };
+        const marked = element as unknown as { __cgproCounted?: boolean };
+        if (marked.__cgproCounted !== true) {
+          marked.__cgproCounted = true;
+          element.addEventListener("beforeinput", () => {
+            counter.__cgproInputCount = (counter.__cgproInputCount ?? 0) + 1;
+          });
+        }
+        counter.__cgproInputCount = 0;
+
+        (element as HTMLElement).focus();
+        const range = document.createRange();
+        // The last BLOCK CHILD, not the host. Collapsing to the host's content
+        // end lands between block children, and ProseMirror can map that
+        // position straight back onto the pill's NodeSelection -- which is the
+        // state this function exists to escape.
+        range.selectNodeContents(element.lastElementChild ?? element);
+        range.collapse(false);
+        const selection = window.getSelection();
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+
+        // Postcondition, not hope. Without it this is a blind write followed by
+        // a timeout, which is exactly how the previous three repairs passed
+        // their own checks and lost the prompt anyway.
+        const anchor = selection?.anchorNode ?? null;
+        const anchorElement = anchor instanceof Element ? anchor : anchor?.parentElement ?? null;
+        return document.activeElement === element
+          && anchorElement !== null
+          && element.contains(anchorElement)
+          && anchorElement.closest('[contenteditable="false"]') === null;
+      })
+      .catch(() => false);
+    if (seated) return true;
+    await page.waitForTimeout(120);
+  }
+  return false;
 }
+
+const COMPOSER_CARET_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_COMPOSER_CARET_ATTEMPTS ?? 3));
 
 /**
  * Refuse to send a prompt the composer does not actually hold.
@@ -1079,7 +1113,26 @@ async function composerDiagnostics(page: Page, selector: string): Promise<string
         menus: document.querySelectorAll(
           '[role="menu"],[role="listbox"],[role="dialog"],[aria-modal="true"]',
         ).length,
-        html: composer === null ? null : composer.outerHTML.slice(0, 400),
+        // document.activeElement is a proxy for what Blink commits against; the
+        // editing selection is the real target. These separate "the caret never
+        // got there" from "the caret got there and something moved it back".
+        sel: (() => {
+          const selection = window.getSelection();
+          const anchor = selection?.anchorNode ?? null;
+          const anchorElement = anchor instanceof Element ? anchor : anchor?.parentElement ?? null;
+          return {
+            anchor: describe(anchorElement),
+            collapsed: selection?.isCollapsed ?? null,
+            inComposer: composer !== null && anchor !== null ? composer.contains(anchor) : null,
+            inNonEditable: anchorElement?.closest('[contenteditable="false"]') != null,
+          };
+        })(),
+        // Counted from just before the first insert. Greater than zero on a
+        // refusal means the insert DID commit and was then reverted -- a
+        // different bug from the insert never arriving, and the only field that
+        // tells the two apart.
+        inputEvents: (window as unknown as { __cgproInputCount?: number }).__cgproInputCount ?? null,
+        html: composer === null ? null : composer.outerHTML.slice(0, 1200),
       });
     }, selector)
     .catch((error) => `capture failed: ${error instanceof Error ? error.message : String(error)}`);
