@@ -535,16 +535,33 @@ export async function closeDaemonSession(session: Session): Promise<void> {
 export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<void> {
   log.info(`daemon-server starting (pid=${process.pid})`);
 
+  // Headed by default: the long-standing claim is that chatgpt.com challenges
+  // headless Chromium even with a warmed profile. That claim carries no test
+  // date and predates Chrome 132 removing the separate headless shell, so
+  // CGPRO_HEADLESS=1 exists to MEASURE it on one lane at a time. Absent the
+  // env var nothing changes. Screening evidence must cover several separate
+  // launches and a long turn before anyone considers moving the default; one
+  // lucky pass is not evidence (P-035 D23.s14, 2026-09-17).
+  const headless = process.env.CGPRO_HEADLESS === "1";
   const session = await openSession({
-    headed: true, // we always need a real Chromium fingerprint
+    headed: !headless,
     profilePath: opts.profile,
     background: opts.background ?? true,
   });
+  if (headless) log.info("launched HEADLESS (CGPRO_HEADLESS=1) - screening mode, not the default");
 
   let account: { email?: string; plan: string; proModelAvailable: boolean };
   try {
     log.info("session open, going home…");
     await goHome(session.page);
+    // Chromium still prefixes the product with "Headless" when the headless
+    // switch is set, so the UA is the single cheapest fingerprint fact worth
+    // having in the log. Recorded on every start, not only headless ones: a
+    // baseline you did not capture before the change is not a baseline.
+    const userAgent = await session.page
+      .evaluate(() => navigator.userAgent)
+      .catch(() => "unreadable");
+    log.info(`userAgent=${userAgent}`);
     if (!(await isLoggedIn(session.page, 8_000))) {
       log.error("not logged in — refusing to start daemon");
       throw new NotLoggedInError();
