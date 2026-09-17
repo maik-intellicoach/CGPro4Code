@@ -171,7 +171,56 @@ export async function ensureProSixMaximum(page: Page): Promise<{ model: string; 
     }
     return { model: "gpt-6-pro", power: max };
   } finally {
-    await page.keyboard.press("Escape");
+    await closeOpenMenus(page);
+  }
+}
+
+const MENU_CLOSE_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_MENU_CLOSE_ATTEMPTS ?? 4));
+
+/** Count Radix-style overlays that trap focus. Mirrors the `menus` field in the delivery diagnostic. */
+const OPEN_MENU_SELECTOR = '[role="menu"],[role="listbox"],[role="dialog"],[aria-modal="true"]';
+
+/**
+ * Close any open menu and PROVE it closed.
+ *
+ * P-035 2026-09-18: the Escape here used to be fire-and-forget, and a menu left
+ * open is not cosmetic -- it is a focus trap. `focusComposerEnd` still seats the
+ * caret and its postcondition passes honestly (activeElement IS the composer at
+ * that moment), the insert begins, and part way through the trap pulls focus
+ * back to the slider it owns, so the remainder of the prompt goes nowhere.
+ *
+ * That is exactly the 2026-09-17T03:36:43Z failure: caret in the composer,
+ * `inputEvents: 64`, then `active: "span._9wXMRW_ThumbInput[role=slider]"` with
+ * `menus: 1` and "6059 of 7026 characters landed". The same invocation lost the
+ * SAME 6059 characters on the pre-fix build (pid 8863) and the fixed build
+ * (pid 88424), so this is deterministic, not the load race the plan assumed.
+ *
+ * The slider named there is the one `ensureProSixMaximum` focuses above, which
+ * is why closing its menu belongs here rather than in the insert path. Retrying
+ * the insert cannot help: the existing per-character fallback re-ran and lost
+ * the text again, because the trap is still there on the second attempt.
+ *
+ * Warn rather than throw: `verifyComposerHoldsPrompt` already refuses to submit
+ * a short prompt, so the expensive failure is already prevented. This removes
+ * the cause; that guard stays the backstop.
+ */
+async function closeOpenMenus(page: Page): Promise<void> {
+  // This runs from a `finally`, so it must never throw: an exception here would
+  // replace whatever real error the caller was already reporting.
+  try {
+    for (let attempt = 0; attempt < MENU_CLOSE_ATTEMPTS; attempt++) {
+      await page.keyboard.press("Escape").catch(() => undefined);
+      const open = await page
+        .evaluate((selector) => document.querySelectorAll(selector).length, OPEN_MENU_SELECTOR)
+        .catch(() => -1);
+      if (open === 0) return;
+      await page.waitForTimeout(250);
+    }
+    console.error(
+      "[cgpro:model] WARNING: a menu is still open after setting the thinking control. Its focus trap can truncate the prompt mid-insert; the composer verification will refuse to submit if it does.",
+    );
+  } catch {
+    // Best effort only. The composer verification remains the backstop.
   }
 }
 

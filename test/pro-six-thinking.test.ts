@@ -15,6 +15,8 @@ function setup(options: {
   modelLabel?: string;
   clickTimesOut?: boolean;
   menuOpened?: boolean;
+  openMenus?: number;
+  menuStaysOpen?: boolean;
 } = {}) {
   let value = "1";
   const model = {
@@ -35,9 +37,18 @@ function setup(options: {
     // actionability check it can never pass.
     focus: vi.fn(async () => {}),
   };
+  // P-035 2026-09-18: `evaluate` is part of the real page shape and the menu
+  // close postcondition needs it. Without it the fake made every path throw
+  // "page.evaluate is not a function" from inside a finally, which masked the
+  // real assertion. openMenus counts what is still open after each Escape.
+  let openMenus = options.openMenus ?? 1;
   const page = {
-    keyboard: { press: vi.fn(async (key: string) => { if (key === "End" && options.sticks !== false) value = options.max ?? "4"; }) },
+    keyboard: { press: vi.fn(async (key: string) => {
+      if (key === "End" && options.sticks !== false) value = options.max ?? "4";
+      if (key === "Escape" && !options.menuStaysOpen) openMenus = 0;
+    }) },
     waitForTimeout: vi.fn(async () => {}),
+    evaluate: vi.fn(async () => openMenus),
   } as unknown as Page;
   requireSelector.mockResolvedValueOnce(model).mockResolvedValueOnce(slider).mockResolvedValueOnce(selected);
   firstResolved.mockResolvedValue(options.menuOpened ? slider : null);
@@ -105,5 +116,38 @@ describe("6 Pro maximum thinking admission", () => {
     });
     expect(s.model.getAttribute).toHaveBeenCalledWith("aria-expanded", { timeout: 1_000 });
     expect(s.model.getAttribute).toHaveBeenCalledWith("data-state", { timeout: 1_000 });
+  });
+
+  // P-035 2026-09-18. A menu left open is a focus trap: the caret is seated in
+  // the composer, the insert starts, and part way through the trap pulls focus
+  // back to the slider this function owns, truncating the prompt. Observed
+  // 2026-09-17T03:36:43Z, "6059 of 7026 characters landed", identical on the
+  // pre-fix and post-fix builds. The Escape used to be fire-and-forget.
+  it("proves the thinking menu actually closed instead of assuming Escape worked", async () => {
+    const s = setup();
+    await ensureProSixMaximum(s.page);
+    expect(s.page.keyboard.press).toHaveBeenCalledWith("Escape");
+    // The postcondition, not just the keystroke.
+    expect(s.page.evaluate).toHaveBeenCalled();
+  });
+
+  it("retries Escape and warns, without throwing, when the menu refuses to close", async () => {
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+    const s = setup({ menuStaysOpen: true });
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 4 });
+    const escapes = (s.page.keyboard.press as unknown as { mock: { calls: string[][] } }).mock.calls
+      .filter((call) => call[0] === "Escape").length;
+    expect(escapes).toBeGreaterThan(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("a menu is still open"));
+    warn.mockRestore();
+  });
+
+  it("never lets menu cleanup replace the real error", async () => {
+    // The close runs from a finally. If it throws, it masks the failure the
+    // caller was already reporting -- which is exactly what a page without
+    // `evaluate` did before this was guarded.
+    const s = setup({ max: null });
+    (s.page as unknown as { evaluate: unknown }).evaluate = undefined;
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow("range could not be verified");
   });
 });
