@@ -707,6 +707,20 @@ export async function setConnector(page: Page, name: string): Promise<void> {
     await clickConnector(page, connector, connectorName);
     await page.waitForTimeout(300);
     await assertConnectorAttached(page, connectorName);
+    // Dismiss the @-picker, exactly as the already-attached branch above does.
+    // Leaving it open was the 2026-09-17 prompt-loss bug: CDP insertText goes to
+    // whatever holds focus, so the whole prompt was typed into the picker's
+    // search field and the composer kept only the mention. Measured twice on
+    // intelli, same numbers both times -- 33 of 2982 characters, and
+    // `p035-low-risk-workstation-intelli` is exactly 33 characters long.
+    //
+    // It reads as intermittent because it depends on which branch runs: a page
+    // whose connector is already attached escapes and delivers, a freshly
+    // started one clicks and did not. That is the cold-page failure rate (3 of
+    // 10 cold first turns against 12 of 999 warm), and it is why a restart --
+    // when every lane is cold -- looked like a connector outage.
+    await page.keyboard.press("Escape").catch(() => undefined);
+    await page.waitForTimeout(150);
     return;
   }
 
@@ -952,6 +966,9 @@ async function verifyComposerHoldsPrompt(
       // Put the caret back in the composer before inserting. CDP insertText
       // targets whatever holds focus, so the whole point of this retry is the
       // re-focus; appending at the end keeps the mention in front of the prompt.
+      // Escape first: an open picker popover is what steals the focus, and
+      // clicking the composer underneath it does not reliably take it back.
+      await page.keyboard.press("Escape").catch(() => undefined);
       await composer.click();
       await page.keyboard.press("Meta+End");
     }
@@ -959,12 +976,23 @@ async function verifyComposerHoldsPrompt(
     landed = await readComposer(page, composer);
     if (landed !== null && composerHoldsPrompt(landed, want)) return;
   }
+  // Diagnostics, because "33 of 2982 landed" twice with identical numbers does
+  // not say WHICH of two very different faults this is: the prompt never
+  // reached the composer, or it reached a composer we are not the one reading.
+  // `matches` separates them -- more than one match means this locator is
+  // ambiguous and the refusal may be reading the wrong node. `head` shows
+  // whether what landed is the connector mention or the start of the prompt.
+  const matches = await page
+    .locator(joinSelectors(SELECTORS.composer))
+    .count()
+    .catch(() => -1);
   throw new PreSubmitInteractionError(
     "prompt_delivery_incomplete",
     "prompt_delivery",
     landed === null
       ? "composer delivery unverifiable: the composer could not be read"
-      : `composer delivery incomplete: ${landed.length} of ${want.length} characters landed`,
+      : `composer delivery incomplete: ${landed.length} of ${want.length} characters landed `
+        + `(composer matches=${matches}, held=${JSON.stringify(landed.slice(0, 60))})`,
   );
 }
 
