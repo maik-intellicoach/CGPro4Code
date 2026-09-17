@@ -1136,8 +1136,48 @@ async function verifyComposerHoldsPrompt(
     landed === null
       ? `composer delivery unverifiable: the composer could not be read ${diagnostics}`
       : `composer delivery incomplete: ${landed.length} of ${want.length} characters landed `
-        + `(composer matches=${matches}, held=${JSON.stringify(landed.slice(0, 60))}) ${diagnostics}`,
+        + `(composer matches=${matches}, held=${JSON.stringify(landed.slice(0, 60))}) `
+        + `${describeDivergence(landed, want)} ${diagnostics}`,
   );
+}
+
+/**
+ * Where the composer's text first stops matching the prompt, and what sits there.
+ *
+ * P-035 2026-09-18. Every explanation of this fault so far has been about the
+ * TAIL, and the tail is not where the loss is. The 22:39Z and 22:48Z refusals
+ * held both the head ("p035-...SYSTEM: You are supporting") and the invocation
+ * contract at the end, so the missing 1426 characters came out of the middle.
+ * A length and an endpoint cannot locate a middle drop; only the first
+ * mismatching offset can.
+ *
+ * `resumes_at` is the part that turns this into a diagnosis rather than a
+ * coordinate. If the text after the divergence reappears further along the
+ * prompt, the loss is one contiguous block, `dropped` is exactly its length,
+ * and the `want` window shows what sits immediately before whatever swallowed
+ * it. If it never reappears, the composer holds something we never sent, which
+ * is a different fault entirely.
+ *
+ * Both sides are already whitespace-normalised, so a difference here is real
+ * content rather than a rendering artefact.
+ */
+export function describeDivergence(landed: string, want: string): string {
+  const limit = Math.min(landed.length, want.length);
+  let at = 0;
+  while (at < limit && landed[at] === want[at]) at += 1;
+  if (at === landed.length) {
+    return `divergence=none landed_is_prefix short_by=${want.length - landed.length}`;
+  }
+  const window = (text: string): string =>
+    JSON.stringify(text.slice(Math.max(0, at - 30), at + 30));
+  // 40 characters is long enough that a coincidental re-match is implausible
+  // and short enough to survive a second, later drop.
+  const probe = landed.slice(at, at + 40);
+  const resume = probe.length > 0 ? want.indexOf(probe, at) : -1;
+  return `divergence=${at}/${want.length} want=${window(want)} landed=${window(landed)} `
+    + (resume >= 0
+      ? `dropped=${resume - at} resumes_at=${resume}`
+      : "resume=not-found (composer holds text that is not in the prompt)");
 }
 
 /**
