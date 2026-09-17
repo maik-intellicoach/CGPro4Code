@@ -1161,12 +1161,23 @@ async function verifyComposerHoldsPrompt(
  * Both sides are already whitespace-normalised, so a difference here is real
  * content rather than a rendering artefact.
  */
-export function describeDivergence(landed: string, want: string): string {
+export function describeDivergence(landedRaw: string, want: string): string {
+  // On a connector turn the composer holds the connector mention BEFORE the
+  // prompt, and `want` never contains it, so a comparison anchored at index 0
+  // mismatches on the first character and reports nothing. The first run of
+  // this function did exactly that: `divergence=0/7978`, want "SYSTEM: You are
+  // supporting Mai", landed "p035-low-risk-workstation-inte". Align on where
+  // the prompt actually starts inside the composer before comparing anything.
+  const anchor = want.slice(0, 40);
+  const start = anchor.length > 0 ? landedRaw.indexOf(anchor) : 0;
+  const prefix = start > 0 ? `mention_prefix=${start} ` : "";
+  const landed = start > 0 ? landedRaw.slice(start) : landedRaw;
+
   const limit = Math.min(landed.length, want.length);
   let at = 0;
   while (at < limit && landed[at] === want[at]) at += 1;
   if (at === landed.length) {
-    return `divergence=none landed_is_prefix short_by=${want.length - landed.length}`;
+    return `${prefix}divergence=none landed_is_prefix short_by=${want.length - landed.length}`;
   }
   const window = (text: string): string =>
     JSON.stringify(text.slice(Math.max(0, at - 30), at + 30));

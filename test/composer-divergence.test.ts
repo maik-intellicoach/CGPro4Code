@@ -35,6 +35,17 @@ describe("composer divergence", () => {
     expect(describeDivergence(landed, want)).toContain("resume=not-found");
   });
 
+  it("aligns past the connector mention before comparing", () => {
+    // The first live run failed exactly here: the composer holds the mention
+    // and `want` does not, so an index-0 comparison reported divergence=0 and
+    // resume=not-found for a prompt whose body matched perfectly.
+    const want = "SYSTEM: You are supporting Maik as a planning partner on this task today.";
+    const landed = `p035-low-risk-workstation-intelli ${want}`;
+    const out = describeDivergence(landed, want);
+    expect(out).toContain("mention_prefix=34");
+    expect(out).toContain("divergence=none");
+  });
+
   it("shows the characters on both sides of the boundary", () => {
     const want = "0123456789".repeat(8);
     const landed = `${want.slice(0, 40)}XY${want.slice(42)}`;
