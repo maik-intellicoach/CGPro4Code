@@ -1239,6 +1239,22 @@ async function composerDiagnostics(page: Page, selector: string): Promise<string
         inputEvents: (window as unknown as { __cgproInputCount?: number }).__cgproInputCount ?? null,
         inputCommitted:
           (window as unknown as { __cgproCommitCount?: number }).__cgproCommitCount ?? null,
+        // P-035 2026-09-18. `readComposer` verifies against `innerText`, which
+        // is the RENDERED text; `textContent` is everything in the node. On the
+        // 22:39:12Z refusal every insert committed (inputEvents 109 ===
+        // inputCommitted 109), the head and the trailing invocation contract
+        // were both present, and 1426 characters were missing from the middle --
+        // a shape that fits a read that cannot see all of the node far better
+        // than it fits a write that lost content from the centre. If these two
+        // lengths disagree, the prompt is intact and this guard has been
+        // refusing good turns; if they agree, the loss is real. Nothing else
+        // separates those two, and they need opposite fixes.
+        innerTextChars: composer instanceof HTMLElement
+          ? composer.innerText.replace(/[​-‍⁠﻿]/g, "").replace(/\s+/g, " ").trim().length
+          : null,
+        textContentChars: composer === null
+          ? null
+          : (composer.textContent ?? "").replace(/[​-‍⁠﻿]/g, "").replace(/\s+/g, " ").trim().length,
         // The composer's last 80 characters. A truncation names its own boundary
         // here: the tail is the connector invocation contract, so seeing where
         // the text actually stops separates a lost tail from a lost middle.
