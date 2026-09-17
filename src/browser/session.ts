@@ -71,15 +71,27 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
     "--hide-crash-restore-bubble",
   ];
   // Background mode: keep the headed Chromium fingerprint (Cloudflare
-  // challenges headless), but park the window off-screen + minimised
-  // so it never pops up in front of the user.
+  // challenges headless), but park every window out of the user's way
+  // so it never pops up in front of them.
   // DEFAULT IS ON — the user wants cgpro to be transparent. Pass
   // `background: false` (or set CGPRO_NO_BACKGROUND=1) to actually see
   // the browser (used by `cgpro login` because the user must interact).
+  //
+  // The launch argument alone does NOT achieve this, which is why cgpro
+  // windows sat on a physical monitor for months:
+  //   - it places only the FIRST window; pages opened later through CDP get
+  //     Chrome's default centred placement, so each daemon slot added a
+  //     visible "Untitled" window;
+  //   - Chrome's window sizer clamps an off-display position back onto the
+  //     nearest screen, so -32000 lands on whichever monitor is closest.
+  // It still helps (the first window opens in a corner rather than centre
+  // screen for the moment before `parkWindow` runs), so it stays. The
+  // companion `--start-minimized` was removed: it is not a Chromium switch
+  // on any platform, and Chrome silently ignores what it does not know.
   const envForceShow = process.env.CGPRO_NO_BACKGROUND === "1";
   const background = (opts.background ?? !envForceShow) && !envForceShow;
   if (background && !headless) {
-    launchArgs.push("--window-position=-32000,-32000", "--start-minimized");
+    launchArgs.push("--window-position=-32000,-32000");
   }
 
   let context: BrowserContext;
@@ -135,6 +147,14 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
 
   installFileChooserGuard(context, page);
 
+  // Enforce the background posture per WINDOW, not once at launch. The first
+  // window is parked before this function returns so the caller never races a
+  // visible window; later windows are parked as they appear.
+  if (background && !headless) {
+    await parkWindow(context, page);
+    context.on("page", (opened: Page) => void parkWindow(context, opened));
+  }
+
   return {
     context,
     page,
@@ -145,6 +165,37 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
       }
     },
   };
+}
+
+/**
+ * Minimise one browser window so it leaves the user's desktop.
+ *
+ * Chromium has no start-minimized switch, so the only way to minimise a window
+ * is to ask for it after the window exists: `Browser.setWindowBounds` with
+ * `windowState: "minimized"`. The bounds fields must be omitted — CDP rejects a
+ * state change combined with left/top/width/height.
+ *
+ * Never throws. A window that could not be minimised is strictly better than a
+ * dead daemon, so a failure is one loud stderr line and nothing else.
+ */
+export async function parkWindow(context: BrowserContext, page: Page): Promise<void> {
+  try {
+    const cdp = await context.newCDPSession(page);
+    try {
+      const { windowId } = (await cdp.send("Browser.getWindowForTarget")) as { windowId: number };
+      await cdp.send("Browser.setWindowBounds", {
+        windowId,
+        bounds: { windowState: "minimized" },
+      });
+    } finally {
+      await cdp.detach().catch(() => undefined);
+    }
+  } catch (err: unknown) {
+    console.error(
+      `[cgpro:background] could not minimise a browser window: ${(err as Error).message}. ` +
+        "It may be visible on the desktop; the session continues.",
+    );
+  }
 }
 
 /**
