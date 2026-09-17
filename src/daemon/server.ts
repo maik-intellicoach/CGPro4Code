@@ -563,7 +563,20 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
       .catch(() => "unreadable");
     log.info(`userAgent=${userAgent}`);
     if (!(await isLoggedIn(session.page, 8_000))) {
-      log.error("not logged in — refusing to start daemon");
+      // "not logged in" is where this daemon refuses to start, and on its own
+      // it cannot tell apart an expired profile, an anonymous /api/auth/session
+      // and an edge challenge holding the page. isLoggedIn already polled for
+      // 8s, so slowness is not the explanation by the time we get here; say
+      // what was actually on the page instead of leaving the next reader to
+      // guess. Every probe is best-effort: diagnostics must not mask the
+      // original refusal.
+      const url = session.page.url();
+      const title = await session.page.title().catch(() => "unreadable");
+      const probe = await fetchAuthSessionInPage(session.page).catch(() => null);
+      const identity = probe?.user?.id ? `user_id=${probe.user.id}` : "no user in session payload";
+      log.error(
+        `not logged in — refusing to start daemon (url=${url} title="${title}" ${identity})`,
+      );
       throw new NotLoggedInError();
     }
     const auth = await fetchAuthSessionInPage(session.page);
