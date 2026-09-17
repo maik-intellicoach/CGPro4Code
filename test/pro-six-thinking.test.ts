@@ -118,11 +118,13 @@ describe("6 Pro maximum thinking admission", () => {
     expect(s.model.getAttribute).toHaveBeenCalledWith("data-state", { timeout: 1_000 });
   });
 
-  // P-035 2026-09-18. A menu left open is a focus trap: the caret is seated in
-  // the composer, the insert starts, and part way through the trap pulls focus
-  // back to the slider this function owns, truncating the prompt. Observed
-  // 2026-09-17T03:36:43Z, "6059 of 7026 characters landed", identical on the
-  // pre-fix and post-fix builds. The Escape used to be fire-and-forget.
+  // P-035 2026-09-18. This function opens a menu, so it owes proof the menu
+  // closed; the Escape used to be fire-and-forget. It was originally written as
+  // the fix for the 2026-09-17T03:36:43Z truncation, and that causal claim was
+  // withdrawn the same day (see closeOpenMenus' honesty note): the diagnostic
+  // that "showed" the trap is captured after this function runs, and its
+  // `inputEvents: 64` on a 64-line prompt rules a mid-insert focus steal out.
+  // The postcondition is still owed on its own merits, so the test stays.
   it("proves the thinking menu actually closed instead of assuming Escape worked", async () => {
     const s = setup();
     await ensureProSixMaximum(s.page);

@@ -183,26 +183,27 @@ const OPEN_MENU_SELECTOR = '[role="menu"],[role="listbox"],[role="dialog"],[aria
 /**
  * Close any open menu and PROVE it closed.
  *
- * P-035 2026-09-18: the Escape here used to be fire-and-forget, and a menu left
- * open is not cosmetic -- it is a focus trap. `focusComposerEnd` still seats the
- * caret and its postcondition passes honestly (activeElement IS the composer at
- * that moment), the insert begins, and part way through the trap pulls focus
- * back to the slider it owns, so the remainder of the prompt goes nowhere.
+ * P-035 2026-09-18: the Escape here used to be fire-and-forget, so this function
+ * opened a menu and left proving it closed to nobody. Leaving a Radix overlay
+ * open behind us is wrong on its own terms -- it holds a focus trap over a
+ * composer the very next step types into -- and closing it is cheap.
  *
- * That is exactly the 2026-09-17T03:36:43Z failure: caret in the composer,
- * `inputEvents: 64`, then `active: "span._9wXMRW_ThumbInput[role=slider]"` with
- * `menus: 1` and "6059 of 7026 characters landed". The same invocation lost the
- * SAME 6059 characters on the pre-fix build (pid 8863) and the fixed build
- * (pid 88424), so this is deterministic, not the load race the plan assumed.
- *
- * The slider named there is the one `ensureProSixMaximum` focuses above, which
- * is why closing its menu belongs here rather than in the insert path. Retrying
- * the insert cannot help: the existing per-character fallback re-ran and lost
- * the text again, because the trap is still there on the second attempt.
+ * HONESTY NOTE, same day. This was first written claiming it fixed the
+ * 2026-09-17T03:36:43Z truncation ("6059 of 7026 characters landed", with
+ * `menus: 1` and `active: "span._9wXMRW_ThumbInput[role=slider]"` in the
+ * capture). That claim does not survive review, twice over. The capture is
+ * taken at VERIFY time, and `ensureProSixMaximum` runs between the insert and
+ * the verify, so a focused slider and an open menu there are what a normal turn
+ * looks like -- not evidence about what held focus during the insert. And
+ * `inputEvents` was 64 on a prompt with 64 non-empty lines, so every insert
+ * dispatched on the composer; a trap that stole focus mid-insert would have
+ * sent the tail somewhere else and left that count short. The real cause is
+ * still open; `inputCommitted` and `landedTail` in the delivery diagnostic exist
+ * to settle it.
  *
  * Warn rather than throw: `verifyComposerHoldsPrompt` already refuses to submit
- * a short prompt, so the expensive failure is already prevented. This removes
- * the cause; that guard stays the backstop.
+ * a short prompt, so the expensive failure is prevented either way. Treat this
+ * as hygiene, not as the repair.
  */
 async function closeOpenMenus(page: Page): Promise<void> {
   // This runs from a `finally`, so it must never throw: an exception here would
@@ -1009,15 +1010,27 @@ async function focusComposerEnd(page: Page, composer: Locator): Promise<boolean>
   for (let attempt = 0; attempt < COMPOSER_CARET_ATTEMPTS; attempt++) {
     const seated = await composer
       .evaluate((element) => {
-        const counter = window as unknown as { __cgproInputCount?: number };
+        const counter = window as unknown as {
+          __cgproInputCount?: number;
+          __cgproCommitCount?: number;
+        };
         const marked = element as unknown as { __cgproCounted?: boolean };
         if (marked.__cgproCounted !== true) {
           marked.__cgproCounted = true;
+          // `beforeinput` is cancellable and fires BEFORE the mutation, so it
+          // counts attempts. `input` fires only after one committed. Counting
+          // just the first is what made 2026-09-17T03:36:43Z unreadable: 64
+          // events on a 64-line prompt was taken as proof every line landed,
+          // when a prevented insert increments it exactly the same way.
           element.addEventListener("beforeinput", () => {
             counter.__cgproInputCount = (counter.__cgproInputCount ?? 0) + 1;
           });
+          element.addEventListener("input", () => {
+            counter.__cgproCommitCount = (counter.__cgproCommitCount ?? 0) + 1;
+          });
         }
         counter.__cgproInputCount = 0;
+        counter.__cgproCommitCount = 0;
 
         (element as HTMLElement).focus();
         const range = document.createRange();
@@ -1176,11 +1189,22 @@ async function composerDiagnostics(page: Page, selector: string): Promise<string
             inNonEditable: anchorElement?.closest('[contenteditable="false"]') != null,
           };
         })(),
-        // Counted from just before the first insert. Greater than zero on a
-        // refusal means the insert DID commit and was then reverted -- a
-        // different bug from the insert never arriving, and the only field that
-        // tells the two apart.
+        // Both counted from just before the first insert. `inputEvents` counts
+        // ATTEMPTS (`beforeinput`, cancellable, fires before the mutation);
+        // `inputCommitted` counts the mutations that actually happened. Equal
+        // means every insert landed and the loss is downstream; a shortfall
+        // means the editor refused the difference. Reading `inputEvents` alone
+        // as "the insert committed" is how the 03:36:43Z capture was
+        // misdiagnosed as a focus trap.
         inputEvents: (window as unknown as { __cgproInputCount?: number }).__cgproInputCount ?? null,
+        inputCommitted:
+          (window as unknown as { __cgproCommitCount?: number }).__cgproCommitCount ?? null,
+        // The composer's last 80 characters. A truncation names its own boundary
+        // here: the tail is the connector invocation contract, so seeing where
+        // the text actually stops separates a lost tail from a lost middle.
+        landedTail: composer === null
+          ? null
+          : ((composer as HTMLElement).innerText ?? "").replace(/\s+/g, " ").trim().slice(-80),
         html: composer === null ? null : composer.outerHTML.slice(0, 1200),
       });
     }, selector)
