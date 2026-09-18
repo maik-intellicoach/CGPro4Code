@@ -16,9 +16,9 @@ describe("composer divergence", () => {
     const want = `${"head ".repeat(10)}LOST BLOCK ${"tail ".repeat(10)}`;
     const landed = want.replace("LOST BLOCK ", "");
     const out = describeDivergence(landed, want);
-    expect(out).toMatch(/^divergence=50\//);
-    expect(out).toContain("dropped=11");
-    expect(out).toContain("resumes_at=61");
+    expect(out).toContain("drops=1");
+    expect(out).toContain("at=50 dropped=11");
+    expect(out).toContain('text="LOST BLOCK "');
   });
 
   it("reports a plain tail truncation as a prefix rather than a divergence", () => {
@@ -46,14 +46,29 @@ describe("composer divergence", () => {
     expect(out).toContain("divergence=none");
   });
 
+  // P-035 2026-09-18, second revision. The first live divergence measured 77
+  // characters against a 1451-character shortfall, so nineteen-ish further
+  // drops follow it. One sample cannot show what the dropped lines share.
+  it("reports several drops from one reading", () => {
+    const lines = Array.from({ length: 12 }, (_, i) => `line ${i} of the prompt`);
+    const want = lines.join("\n");
+    const landed = lines.filter((_, i) => i % 3 !== 1).join("\n");
+    const out = describeDivergence(landed, want);
+    expect(out).toContain("drops=4");
+    // Each drop is one whole line plus its newline. The reported span is phase
+    // shifted by whatever prefix the surrounding lines share ("line "), so the
+    // LENGTH is the reliable fact and the text is a window, not a quotation.
+    expect(out).toContain("dropped=21");
+    expect(out).toContain("short_by=85");
+  });
+
   it("shows the characters on both sides of the boundary", () => {
     const want = "0123456789".repeat(8);
     const landed = `${want.slice(0, 40)}XY${want.slice(42)}`;
     const out = describeDivergence(landed, want);
-    // The window is what names the cause: whatever sits immediately before the
-    // drop is the thing that swallowed it.
-    expect(out).toContain("want=");
-    expect(out).toContain("landed=");
-    expect(out).toMatch(/divergence=40\//);
+    // Two characters replaced, not removed: the landed text never resumes, so
+    // this must not be reported as a drop of unknown size.
+    expect(out).toContain("at=40");
+    expect(out).toContain("resume=not-found");
   });
 });

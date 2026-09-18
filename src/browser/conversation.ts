@@ -1173,22 +1173,37 @@ export function describeDivergence(landedRaw: string, want: string): string {
   const prefix = start > 0 ? `mention_prefix=${start} ` : "";
   const landed = start > 0 ? landedRaw.slice(start) : landedRaw;
 
-  const limit = Math.min(landed.length, want.length);
-  let at = 0;
-  while (at < limit && landed[at] === want[at]) at += 1;
-  if (at === landed.length) {
+  // Report every drop, not just the first. The first live measurement on
+  // 2026-09-18 returned dropped=77, which is EXACTLY one source line of the
+  // planning preamble plus its joining newline -- against a total shortfall of
+  // 1451 characters. So this fault drops whole lines, repeatedly, and a single
+  // sample cannot show what the dropped lines have in common. Five samples from
+  // one free reproduction can.
+  const drops: string[] = [];
+  let l = 0;
+  let w = 0;
+  while (drops.length < 5 && l < landed.length && w < want.length) {
+    if (landed[l] === want[w]) {
+      l += 1;
+      w += 1;
+      continue;
+    }
+    // 40 characters is long enough that a coincidental re-match is implausible
+    // and short enough to survive a second, later drop.
+    const probe = landed.slice(l, l + 40);
+    const resume = probe.length > 0 ? want.indexOf(probe, w) : -1;
+    if (resume < 0) {
+      drops.push(`at=${w} resume=not-found landed=${JSON.stringify(probe)}`);
+      break;
+    }
+    drops.push(`at=${w} dropped=${resume - w} text=${JSON.stringify(want.slice(w, resume))}`);
+    w = resume;
+  }
+  if (drops.length === 0) {
     return `${prefix}divergence=none landed_is_prefix short_by=${want.length - landed.length}`;
   }
-  const window = (text: string): string =>
-    JSON.stringify(text.slice(Math.max(0, at - 30), at + 30));
-  // 40 characters is long enough that a coincidental re-match is implausible
-  // and short enough to survive a second, later drop.
-  const probe = landed.slice(at, at + 40);
-  const resume = probe.length > 0 ? want.indexOf(probe, at) : -1;
-  return `divergence=${at}/${want.length} want=${window(want)} landed=${window(landed)} `
-    + (resume >= 0
-      ? `dropped=${resume - at} resumes_at=${resume}`
-      : "resume=not-found (composer holds text that is not in the prompt)");
+  return `${prefix}drops=${drops.length} short_by=${want.length - landed.length} `
+    + drops.map((drop, i) => `[${i} ${drop}]`).join(" ");
 }
 
 /**
