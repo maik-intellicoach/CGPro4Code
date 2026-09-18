@@ -1078,7 +1078,11 @@ export async function probePromptDelivery(page: Page, prompt: string): Promise<P
     arrivedChars: landed?.length ?? -1,
     complete: landed !== null && composerHoldsPrompt(landed, want),
   };
-  if (!probe.complete) {
+  // Also on a shortfall that PASSES the floor: the 2026-09-18 replay delivered
+  // 30 of 30 prompts whole by the completeness rule, while the largest of them
+  // arrived 193 characters short on all three lanes. A probe that hides the one
+  // number it exists to expose is worth nothing.
+  if (!probe.complete || (landed !== null && landed.length < want.length)) {
     probe.divergence = landed === null
       ? "composer unreadable"
       : describeDivergence(landed, want);
