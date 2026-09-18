@@ -16,8 +16,19 @@ const target = { id: "g-p-target", shortUrl: "g-p-target-work", name: "Work" };
 
 function pageFor(
   destination = `/g/${target.id}/project`,
-  sidebar: { matches: number; visible?: (index: number) => boolean; failFirstAttempts?: number } = { matches: 1 },
+  sidebar: {
+    matches: number;
+    visible?: (index: number) => boolean;
+    failFirstAttempts?: number;
+    // The attempt (1-based) on which the click actually moves the page.
+    // Independent of whether that same click's promise rejects, because on the
+    // real page those two came apart (P-035 2026-09-18, invocation d3518975).
+    // Defaults to the first attempt that does not throw.
+    navigatesOnAttempt?: number;
+    startUrl?: string;
+  } = { matches: 1 },
 ) {
+  let currentUrl = sidebar.startUrl ?? "https://chatgpt.com/";
   const rowClick = vi.fn(async () => {});
   // The row's LABEL is what gets clicked, and it carries its own waitFor: the
   // row being visible never made the text node inside it clickable, which is
@@ -36,6 +47,8 @@ function pageFor(
     isVisible: vi.fn(async () => (sidebar.visible ?? (() => true))(sidebarNthIndex)),
     click: vi.fn(async () => {
       clicks++;
+      const navigatesOn = sidebar.navigatesOnAttempt ?? (sidebar.failFirstAttempts ?? 0) + 1;
+      if (clicks === navigatesOn) currentUrl = "https://chatgpt.com/projects";
       if (clicks <= (sidebar.failFirstAttempts ?? 0)) throw new Error("locator.click: Timeout 5000ms exceeded.");
     }),
   };
@@ -49,7 +62,7 @@ function pageFor(
   };
   const page = {
     goto: vi.fn(), waitForTimeout: vi.fn(async () => {}), getByRole: vi.fn(), isClosed: vi.fn(() => false),
-    url: vi.fn(() => "https://chatgpt.com/"),
+    url: vi.fn(() => currentUrl),
     locator: vi.fn(() => ({ ...sidebarLocator, filter: vi.fn(() => ({ first: () => row })) })),
     waitForURL: vi.fn(async (predicate: (url: URL) => boolean) => {
       if (!predicate(new URL(destination, "https://chatgpt.com"))) throw new Error("Wrong Project URL");
@@ -143,6 +156,31 @@ describe("Project directory sidebar click", () => {
     labelWait.mockRejectedValue(new Error("locator.waitFor: Timeout 20000ms exceeded."));
     await expect(openConversation(page, { gizmoId: target.id })).rejects.toThrow(/Timeout 20000ms/);
     expect(rowClick).not.toHaveBeenCalled();
+  });
+
+  // P-035 2026-09-18, invocation d3518975. The turn failed with "Projects
+  // navigation could not be clicked after 3 attempts (matches=1, visible=1,
+  // url=https://chatgpt.com/projects)" -- and that url IS the destination.
+  // `goHome` navigates to chatgpt.com/ and `listProjects` is a pure API read,
+  // so one of those three clicks had already arrived. The helper judged the
+  // click promise instead of the outcome, retried twice against a page that
+  // was already correct, hung both times in "scrolling into view if needed",
+  // and failed a turn that had succeeded at this step 51 seconds earlier.
+  it("treats a click that navigated as done even when its promise timed out", async () => {
+    const { page, sidebarMatch } = pageFor(undefined, {
+      matches: 1, failFirstAttempts: 1, navigatesOnAttempt: 1,
+    });
+    await openConversation(page, { gizmoId: target.id });
+    expect(sidebarMatch.click).toHaveBeenCalledOnce();
+  });
+
+  it("does not click the sidebar at all when the page is already on the directory", async () => {
+    const { page, sidebarMatch, rowClick } = pageFor(undefined, {
+      matches: 1, startUrl: "https://chatgpt.com/projects",
+    });
+    await openConversation(page, { gizmoId: target.id });
+    expect(sidebarMatch.click).not.toHaveBeenCalled();
+    expect(rowClick).toHaveBeenCalledOnce();
   });
 
   it("names the match count and URL when the sidebar never becomes clickable", async () => {

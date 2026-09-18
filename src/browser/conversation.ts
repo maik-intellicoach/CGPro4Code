@@ -48,9 +48,23 @@ export async function openConversation(
     }
     // The directory row prepares Project metadata before client navigation.
     // A cold deep link can instead hit the unavailable locked-chats endpoint.
-    await requireSelectorPatient(page, SELECTORS.projectsNavigation, "Projects navigation");
-    await page.waitForTimeout(5_000);
-    await clickFirstActionable(page, SELECTORS.projectsNavigation, "Projects navigation");
+    // The click exists to land on the projects directory, so that is what
+    // counts as done -- not whether the click promise resolved. See
+    // clickFirstActionable for the measurement behind this.
+    const onProjectsDirectory = () => {
+      try {
+        return new URL(page.url()).pathname === "/projects";
+      } catch {
+        return false;
+      }
+    };
+    if (!onProjectsDirectory()) {
+      await requireSelectorPatient(page, SELECTORS.projectsNavigation, "Projects navigation");
+      await page.waitForTimeout(5_000);
+      await clickFirstActionable(
+        page, SELECTORS.projectsNavigation, "Projects navigation", 3, onProjectsDirectory,
+      );
+    }
     // A saturated host can take longer than one budget to hydrate the
     // directory, and this locator is the only place the vendor clicks a
     // sidebar row. Re-resolve it per attempt instead of failing once, the
@@ -1934,15 +1948,35 @@ export async function latestAssistantModelSlug(page: Page): Promise<string | nul
  * Readiness gates stay patient (`requireSelectorPatient`); this is only the
  * click itself.
  */
+/**
+ * `settled` asks whether the click's PURPOSE is already achieved, which is a
+ * different question from whether the click promise resolved.
+ *
+ * Measured 2026-09-18, invocation d3518975: the Projects navigation click
+ * reported "could not be clicked after 3 attempts (matches=1, visible=1,
+ * url=https://chatgpt.com/projects)". That url is the destination. `goHome`
+ * had navigated to chatgpt.com/ and `listProjects` is a pure API read, so
+ * nothing but one of those three clicks could have moved the page there: the
+ * first click did its job, its promise timed out anyway, and the two retries
+ * then ran against an already-correct page whose sidebar item now carried
+ * `data-active`. Both hung in "scrolling into view if needed" and never
+ * reached the hit test. That is 3 x 15s plus 6s of waiting, and then a failed
+ * turn, for a navigation that had already happened.
+ *
+ * Without a predicate a click helper cannot tell those apart, so it re-tries
+ * the one case where re-trying is both useless and prone to hang.
+ */
 async function clickFirstActionable(
   page: Page,
   candidates: string[],
   name: string,
   attempts = 3,
+  settled?: () => boolean,
 ): Promise<void> {
   const selector = joinSelectors(candidates);
   let lastError: unknown;
   for (let attempt = 0; attempt < attempts; attempt++) {
+    if (settled?.()) return;
     const matches = page.locator(selector);
     const count = await matches.count().catch(() => 0);
     for (let index = 0; index < count; index++) {
@@ -1953,11 +1987,13 @@ async function clickFirstActionable(
         return;
       } catch (error) {
         lastError = error;
+        if (settled?.()) return;
       }
     }
     if (page.isClosed()) break;
     await page.waitForTimeout(3_000);
   }
+  if (settled?.()) return;
   const matches = page.locator(selector);
   const count = await matches.count().catch(() => -1);
   let visible = 0;
