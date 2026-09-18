@@ -1160,7 +1160,19 @@ async function verifyComposerHoldsPrompt(
   // but not writing and not SUBMITTING are different things, and submitting a
   // prompt we could not verify is the expensive half.
   let landed = await readComposer(page, composer);
-  if (landed !== null && composerHoldsPrompt(landed, want)) return;
+  if (landed !== null && composerHoldsPrompt(landed, want)) {
+    // Passing this check is not the same as losing nothing: it allows a 10%
+    // shortfall by design. After the 2026-09-18 paste repair the expected
+    // shortfall is zero, so say so when it is not, rather than letting a
+    // smaller version of the same fault pass silently under the threshold.
+    if (landed.length < want.length) {
+      console.error(
+        `[cgpro:composer] prompt delivered with a shortfall: ${landed.length} of ${want.length} characters `
+        + `(within the ${COMPOSER_MIN_LANDED_RATIO} floor, so this turn proceeds) ${describeDivergence(landed, want)}`,
+      );
+    }
+    return;
+  }
 
   const retry = !preserveExisting
     ? "clear"
