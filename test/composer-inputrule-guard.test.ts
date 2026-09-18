@@ -41,10 +41,23 @@ const INPUT_RULE_FIRES = /`[^`]*`$/;
  * behaves this way: a 154-character paste lands, a 12,000-character one does
  * not, so a long prompt falls through to typing line by line.
  */
-function fakePage(pasteBody: (body: string) => boolean): Page {
+function fakePage(pasteBody: (body: string) => boolean, onLengthRead?: () => void): Page {
+  // Every poll read inside pasteComposerText is preceded by a waitForTimeout;
+  // the give-up check afterwards is not. That difference is the only
+  // deterministic way for a fake to commit a paste strictly AFTER the
+  // deadline -- read COUNTS are not deterministic here, because
+  // waitForTimeout is a no-op and the loop spins on wall-clock milliseconds.
+  let sleptSinceRead = 0;
   const composer = {
     innerText: async () => composed,
-    evaluate: async (_fn: unknown, body: string) => {
+    // Two distinct callers: the paste dispatch, which carries the body, and
+    // the cheap length read, which carries nothing.
+    evaluate: async (_fn: unknown, body?: string) => {
+      if (body === undefined) {
+        if (sleptSinceRead === 0) onLengthRead?.();
+        sleptSinceRead = 0;
+        return composed.length;
+      }
       if (pasteBody(body)) composed += body;
       return true;
     },
@@ -66,7 +79,7 @@ function fakePage(pasteBody: (body: string) => boolean): Page {
         composed += text;
       }),
     },
-    waitForTimeout: vi.fn(async () => {}),
+    waitForTimeout: vi.fn(async () => { sleptSinceRead += 1; }),
     evaluate: vi.fn(async () => '{"stub":true}'),
   } as unknown as Page;
 }
@@ -111,6 +124,30 @@ describe("delivering lines the inline-code input rule destroys", () => {
     expect(composed).toBe(prompt);
     expect(page.keyboard.insertText).not.toHaveBeenCalled();
     expect(page.keyboard.press).not.toHaveBeenCalledWith("Shift+Enter");
+  });
+
+  it("never types a line whose paste landed after the deadline", async () => {
+    // Found in review 2026-09-18. `false` from the paste guard means "not
+    // landed YET", not "will never land". Typing on top of a late paste puts
+    // the line in twice, and composerHoldsPrompt only enforces a length FLOOR,
+    // so a too-LONG composer passes the completeness check and a Pro turn is
+    // spent on corrupted input -- the exact failure this guard exists to stop.
+    let queued: string | null = null;
+    const page = fakePage((body) => {
+      if (body.includes("\n")) return false;      // the whole-prompt paste fails
+      queued = body;                              // this one lands, but late
+      return false;
+    }, () => {
+      // Only ever called on a read with no sleep before it, i.e. the check
+      // that runs after pasteComposerText has already given up.
+      if (queued !== null) { composed += queued; queued = null; }
+    });
+    await sendPrompt(page, prompt);
+
+    expect(composed).toBe(prompt);
+    expect(page.keyboard.insertText).not.toHaveBeenCalledWith(
+      "Read the composer helper in `src/browser/conversation.ts`",
+    );
   });
 
   it("refuses to submit when neither path can carry the line", async () => {

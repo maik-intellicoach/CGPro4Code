@@ -34,7 +34,11 @@ describe("composer paste delivery", () => {
   function fakePage(delivers: "all" | "nothing" | "throws"): Page {
     const composer = {
       innerText: async () => composed,
-      evaluate: async (_fn: unknown, body: string) => {
+      // Two distinct callers: the paste dispatch, which carries the body, and
+      // the cheap length read, which carries nothing and must not be treated
+      // as a paste of `undefined`.
+      evaluate: async (_fn: unknown, body?: string) => {
+        if (body === undefined) return composed.length;
         if (delivers === "throws") throw new Error("Illegal invocation");
         if (delivers === "all") composed += body;
         return true;

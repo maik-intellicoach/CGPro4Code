@@ -1035,10 +1035,24 @@ export type DeliveryPath = "paste" | "typed";
  * `verifyComposerHoldsPrompt` is still the thing that decides whether this turn
  * may be submitted.
  */
+/**
+ * The composer's rendered length, without shipping the composer back.
+ *
+ * `innerText()` returns the whole thing, and the per-line guard below calls
+ * this twice per rule-fatal line against a composer that grows to tens of
+ * thousands of characters -- measured in review at roughly 3.6 MB over CDP for
+ * one large delivery. Nothing here wants the text, only whether it grew.
+ */
+async function composerTextLength(composer: Locator): Promise<number> {
+  return composer
+    .evaluate((element) => (element as HTMLElement).innerText.length)
+    .catch(() => 0);
+}
+
 async function pasteComposerText(page: Page, text: string): Promise<boolean> {
   if (process.env.CGPRO_SKIP_COMPOSER_PASTE === "1") return false;
   const composer = page.locator(joinSelectors(SELECTORS.composer)).first();
-  const read = async (): Promise<string> => composer.innerText().catch(() => "");
+  const read = async (): Promise<number> => composerTextLength(composer);
   const before = await read();
   const dispatched = await composer
     .evaluate((element, body) => {
@@ -1064,9 +1078,24 @@ async function pasteComposerText(page: Page, text: string): Promise<boolean> {
   const deadline = Date.now() + COMPOSER_PASTE_SETTLE_MAX_MS;
   for (;;) {
     await page.waitForTimeout(COMPOSER_PASTE_POLL_MS);
-    if ((await read()).length > before.length) return true;
+    if (await read() > before) return true;
     if (Date.now() >= deadline) return false;
   }
+}
+
+/**
+ * Did a paste that we gave up on land anyway?
+ *
+ * A `false` from `pasteComposerText` means "it had not landed by the deadline",
+ * not "it will never land". Typing the line on top of a late one duplicates it,
+ * and `composerHoldsPrompt` only enforces a length FLOOR -- a composer that is
+ * too LONG passes -- so the duplicate would be submitted and a Pro turn spent
+ * on corrupted input, which is the exact failure this guard exists to prevent.
+ * Found in review 2026-09-18; never observed live, and cheap to make impossible.
+ */
+async function pasteLandedLate(page: Page, before: number): Promise<boolean> {
+  const composer = page.locator(joinSelectors(SELECTORS.composer)).first();
+  return (await composerTextLength(composer)) > before;
 }
 
 /** React commits the pasted transaction asynchronously, and a big one takes its time. */
@@ -1607,8 +1636,15 @@ async function insertLines(page: Page, lines: string[]): Promise<void> {
     // trigger. Paste is parsed by a different code path and carries both
     // shapes intact, so the fallback hands those lines to paste rather than
     // trying to out-type an input rule.
-    if (CODE_SPAN_AT_LINE_END.test(line) && await pasteComposerText(page, line)) {
-      lastInsert.pasted += 1;
+    if (CODE_SPAN_AT_LINE_END.test(line)) {
+      const before = await composerTextLength(
+        page.locator(joinSelectors(SELECTORS.composer)).first(),
+      );
+      if (await pasteComposerText(page, line) || await pasteLandedLate(page, before)) {
+        lastInsert.pasted += 1;
+      } else {
+        await page.keyboard.insertText(line);
+      }
     } else {
       await page.keyboard.insertText(line);
     }
