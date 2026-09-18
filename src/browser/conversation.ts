@@ -987,10 +987,18 @@ export async function sendPrompt(
  *
  * Escape hatch: CGPRO_SKIP_COMPOSER_VERIFY=1 restores the unverified path.
  */
-async function insertComposerText(page: Page, text: string): Promise<void> {
-  if (await pasteComposerText(page, text)) return;
+async function insertComposerText(
+  page: Page,
+  text: string,
+  force?: DeliveryPath,
+): Promise<DeliveryPath> {
+  if (force !== "typed" && await pasteComposerText(page, text)) return "paste";
   await insertLines(page, text.split("\n"));
+  return "typed";
 }
+
+/** Which of the two delivery paths actually put the prompt in the composer. */
+export type DeliveryPath = "paste" | "typed";
 
 /**
  * Deliver the whole prompt through the composer's PASTE path, in one operation.
@@ -1034,19 +1042,46 @@ async function pasteComposerText(page: Page, text: string): Promise<boolean> {
       return false;
     });
   if (!dispatched) return false;
-  await page.waitForTimeout(COMPOSER_PASTE_SETTLE_MS);
-  return (await read()).length > before.length;
+  // Poll rather than sleep once. A single 250 ms wait silently failed every
+  // prompt above roughly 6,000 characters (measured 2026-09-18: 2.0 KB and
+  // 5.7 KB pasted, 12.0 KB, 19.7 KB and 27.9 KB did not), because a large
+  // paste has not rendered yet when the one read happens. The fallback that
+  // then ran is the typed path, which is exactly the path that loses lines.
+  const deadline = Date.now() + COMPOSER_PASTE_SETTLE_MAX_MS;
+  for (;;) {
+    await page.waitForTimeout(COMPOSER_PASTE_POLL_MS);
+    if ((await read()).length > before.length) return true;
+    if (Date.now() >= deadline) return false;
+  }
 }
 
-/** React commits the pasted transaction asynchronously; give it one frame. */
-const COMPOSER_PASTE_SETTLE_MS = Math.max(0, Number(process.env.CGPRO_COMPOSER_PASTE_SETTLE_MS ?? 250));
+/** React commits the pasted transaction asynchronously, and a big one takes its time. */
+const COMPOSER_PASTE_POLL_MS = Math.max(1, Number(process.env.CGPRO_COMPOSER_PASTE_POLL_MS ?? 250));
+// Bounded deliberately low. Measured 2026-09-18: a whole-prompt paste above
+// roughly 6,000 characters does not land at all, however long you wait, so a
+// generous ceiling buys nothing and costs that much dead time on every large
+// prompt. A paste that WILL land does so inside one poll.
+const COMPOSER_PASTE_SETTLE_MAX_MS = Math.max(
+  COMPOSER_PASTE_POLL_MS,
+  Number(process.env.CGPRO_COMPOSER_PASTE_SETTLE_MAX_MS ?? 1_500),
+);
 
 export interface PromptDeliveryProbe {
   requestedChars: number;
   /** -1 when the composer could not be read at all. */
   arrivedChars: number;
   complete: boolean;
+  deliveredBy?: DeliveryPath;
   divergence?: string;
+  /**
+   * The composer's own text, returned ONLY when less arrived than was asked
+   * for. `describeDivergence` is a greedy anchor scan: its drop LENGTHS are
+   * reliable and its excerpts are windows rather than quotations, which is
+   * enough to notice a loss and not enough to diagnose one. The caller diffs
+   * this against the prompt it already holds. It is a probe-only field; a real
+   * turn never carries it.
+   */
+  landed?: string;
 }
 
 /**
@@ -1063,13 +1098,17 @@ export interface PromptDeliveryProbe {
  * asserting the composer is empty is what makes the probe safe to point at
  * production.
  */
-export async function probePromptDelivery(page: Page, prompt: string): Promise<PromptDeliveryProbe> {
+export async function probePromptDelivery(
+  page: Page,
+  prompt: string,
+  force?: DeliveryPath,
+): Promise<PromptDeliveryProbe> {
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
   await composer.click();
   await page.waitForTimeout(120);
   await clearComposer(page);
   await focusComposerEnd(page, composer);
-  await insertComposerText(page, prompt);
+  const deliveredBy = await insertComposerText(page, prompt, force);
 
   const want = normaliseComposerText(prompt);
   const landed = await readComposer(page, composer);
@@ -1077,6 +1116,7 @@ export async function probePromptDelivery(page: Page, prompt: string): Promise<P
     requestedChars: want.length,
     arrivedChars: landed?.length ?? -1,
     complete: landed !== null && composerHoldsPrompt(landed, want),
+    deliveredBy,
   };
   // Also on a shortfall that PASSES the floor: the 2026-09-18 replay delivered
   // 30 of 30 prompts whole by the completeness rule, while the largest of them
@@ -1086,6 +1126,7 @@ export async function probePromptDelivery(page: Page, prompt: string): Promise<P
     probe.divergence = landed === null
       ? "composer unreadable"
       : describeDivergence(landed, want);
+    if (landed !== null) probe.landed = landed;
   }
 
   await clearComposer(page);
@@ -1536,25 +1577,24 @@ const COMPOSER_READ_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_COMPOSER_REA
  * A module-level counter is safe because a lane serialises turns behind a
  * single page lease; there is no second insert run to interleave with.
  */
-let lastInsert = { lines: 0, requested: 0, chars: 0 };
+let lastInsert = { lines: 0, requested: 0, chars: 0, pasted: 0 };
 
 async function insertLines(page: Page, lines: string[]): Promise<void> {
-  lastInsert = { lines: lines.length, requested: 0, chars: 0 };
+  lastInsert = { lines: lines.length, requested: 0, chars: 0, pasted: 0 };
   for (let i = 0; i < lines.length; i++) {
     if (i > 0) await page.keyboard.press("Shift+Enter");
     const line = lines[i];
     if (line.length === 0) continue;
-    // A closing backtick at the END of an insertion is what triggers the
-    // composer's inline-code input rule, and that rule destroyed 18 of 18 such
-    // lines on 2026-09-18. Ending the insertion one character later and then
-    // deleting that character keeps the text identical while denying the rule
-    // its trigger, because ProseMirror runs input rules on text input and never
-    // on deletion. Paste is the default path; this is the fallback, and a
-    // fallback that loses exactly what the default was fixed to keep is not a
-    // fallback at all.
-    if (CODE_SPAN_AT_LINE_END.test(line)) {
-      await page.keyboard.insertText(`${line} `);
-      await page.keyboard.press("Backspace");
+    // A line whose inline-code span closes at its end is destroyed by the
+    // composer's markdown input rule. The first repair typed the line with a
+    // trailing space and deleted the space again; measured on 2026-09-18 that
+    // saves a line ending `x`. and does NOT save one ending `x`, because a
+    // space typed straight after the closing backtick is itself the rule's
+    // trigger. Paste is parsed by a different code path and carries both
+    // shapes intact, so the fallback hands those lines to paste rather than
+    // trying to out-type an input rule.
+    if (CODE_SPAN_AT_LINE_END.test(line) && await pasteComposerText(page, line)) {
+      lastInsert.pasted += 1;
     } else {
       await page.keyboard.insertText(line);
     }

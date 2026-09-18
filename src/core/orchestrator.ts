@@ -8,6 +8,7 @@ import {
   openConversation,
   ensureProSixMaximum,
   probePromptDelivery,
+  type DeliveryPath,
   type PromptDeliveryProbe,
   readLatestAssistantText,
   sendPrompt,
@@ -82,6 +83,8 @@ export interface InteractionPreflightOptions {
   expectedAccountEmail: string;
   /** When present, deliver and measure this prompt WITHOUT submitting it. */
   probePrompt?: string;
+  /** Force one delivery path, so either can be tested on demand. */
+  probeDeliveryPath?: DeliveryPath;
 }
 
 export interface InteractionPreflightResult {
@@ -117,7 +120,7 @@ export async function runInteractionPreflight(
     // use: same account, same Project, same connector, same model selection.
     const promptDelivery = opts.probePrompt === undefined
       ? undefined
-      : await probePromptDelivery(page, opts.probePrompt);
+      : await probePromptDelivery(page, opts.probePrompt, opts.probeDeliveryPath);
     return {
       accountVerified: true,
       projectVerified: true,

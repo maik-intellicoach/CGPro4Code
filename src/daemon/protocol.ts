@@ -174,6 +174,8 @@ export interface PreflightRequest {
   expectedAccountEmail: string;
   /** Deliver and measure this prompt without submitting it (P-035 2026-09-18). */
   probePrompt?: string;
+  /** Force `paste` or `typed`, so a delivery fault can be pinned to one path. */
+  probeDeliveryPath?: "paste" | "typed";
 }
 
 export interface ReloadResponse {

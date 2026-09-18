@@ -883,7 +883,9 @@ export async function handleRequest(
         typeof body.expectedAccountEmail !== "string" || body.expectedAccountEmail.length > 320 ||
         !body.expectedAccountEmail.includes("@") ||
         (body.probePrompt !== undefined
-          && (typeof body.probePrompt !== "string" || body.probePrompt.length > PROBE_PROMPT_MAX_CHARS))) {
+          && (typeof body.probePrompt !== "string" || body.probePrompt.length > PROBE_PROMPT_MAX_CHARS))
+        || (body.probeDeliveryPath !== undefined
+          && body.probeDeliveryPath !== "paste" && body.probeDeliveryPath !== "typed")) {
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "invalid_preflight_identity" }));
       return;

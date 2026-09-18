@@ -9,7 +9,10 @@ vi.mock("../src/browser/chatgpt.js", () => ({
 }));
 
 process.env.CGPRO_SEND_CLICK_ATTEMPTS = "1";
-process.env.CGPRO_COMPOSER_PASTE_SETTLE_MS = "0";
+// The real poll waits up to 10 s for a large paste to render. These fakes
+// answer instantly, so the bound is collapsed to keep the suite quick.
+process.env.CGPRO_COMPOSER_PASTE_POLL_MS = "1";
+process.env.CGPRO_COMPOSER_PASTE_SETTLE_MAX_MS = "1";
 
 const { sendPrompt } = await import("../src/browser/conversation.js");
 

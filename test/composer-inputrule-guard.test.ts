@@ -8,8 +8,8 @@ vi.mock("../src/browser/chatgpt.js", () => ({
   requireSelector: (...args: unknown[]) => requireSelector(...args),
 }));
 
-// This file is about the TYPED fallback, so paste stays off throughout.
-process.env.CGPRO_SKIP_COMPOSER_PASTE = "1";
+process.env.CGPRO_COMPOSER_PASTE_POLL_MS = "1";
+process.env.CGPRO_COMPOSER_PASTE_SETTLE_MAX_MS = "1";
 
 const { sendPrompt } = await import("../src/browser/conversation.js");
 
@@ -25,32 +25,41 @@ function fakeLocator() {
 }
 
 /**
- * The measured ChatGPT behaviour: ProseMirror runs its markdown input rules on
- * TYPED input, and the inline-code rule destroys the whole line when the
- * closing backtick is the LAST character of the insertion. 18 of 18 such lines
- * vanished on 2026-09-18; lines with code spans anywhere else survived.
- * Deletion never triggers an input rule, which is what the guard exploits.
+ * The measured ChatGPT behaviour, 2026-09-18. ProseMirror runs its markdown
+ * input rules on TYPED input, and the inline-code rule destroys the whole line
+ * when the closing backtick is the last character of the insertion. Paste is
+ * parsed by a different code path and is unaffected.
  *
- * Note this is NARROWER than `CODE_SPAN_AT_LINE_END` in the source, and that is
- * the point: the source predicate DETECTS a line at risk and may be a little
- * over-broad, while this models when the rule actually FIRES. One trailing
- * space is enough to move the backtick off the end, so the guard works.
+ * Narrower than `CODE_SPAN_AT_LINE_END` in the source, and that is the point:
+ * the source predicate DETECTS a line at risk and may be a little over-broad,
+ * while this models when the rule actually FIRES.
  */
 const INPUT_RULE_FIRES = /`[^`]*`$/;
 
-function fakePage(): Page {
+/**
+ * `pasteBody` decides which paste events this page honours. The real page
+ * behaves this way: a 154-character paste lands, a 12,000-character one does
+ * not, so a long prompt falls through to typing line by line.
+ */
+function fakePage(pasteBody: (body: string) => boolean): Page {
+  const composer = {
+    innerText: async () => composed,
+    evaluate: async (_fn: unknown, body: string) => {
+      if (pasteBody(body)) composed += body;
+      return true;
+    },
+  };
   return {
-    locator: vi.fn(() => ({ count: async () => 0 })),
+    locator: vi.fn(() => ({ count: async () => 1, first: () => composer })),
     keyboard: {
       press: vi.fn(async (key: string) => {
         if (key === "Shift+Enter") composed += "\n";
-        if (key === "Backspace") composed = composed.slice(0, -1);
         if (key === "Meta+A") composed = "";
+        if (key === "Backspace") composed = composed.slice(0, -1);
       }),
       type: vi.fn(async (text: string) => { composed += text; }),
       insertText: vi.fn(async (text: string) => {
         if (INPUT_RULE_FIRES.test(text)) {
-          // The rule eats the line it just completed, back to the last newline.
           composed = composed.slice(0, composed.lastIndexOf("\n") + 1);
           return;
         }
@@ -62,6 +71,13 @@ function fakePage(): Page {
   } as unknown as Page;
 }
 
+const prompt = [
+  "Read the composer helper in `src/browser/conversation.ts`",
+  "The predicate lives in `CODE_SPAN_AT_LINE_END`.",
+  "plain line with no code at all",
+  "a span `in the middle` of a sentence survives either way",
+].join("\n");
+
 beforeEach(() => {
   composed = "";
   firstResolved.mockReset();
@@ -70,33 +86,38 @@ beforeEach(() => {
   requireSelector.mockImplementation(async () => fakeLocator());
 });
 
-describe("typed-fallback guard against the inline-code input rule", () => {
-  it("delivers lines whose closing backtick is the last character", async () => {
-    const prompt = [
-      "Read the composer helper in `src/browser/conversation.ts`",
-      "The predicate lives in `CODE_SPAN_AT_LINE_END`.",
-      "plain line with no code at all",
-      "a span `in the middle` of a sentence survives either way",
-    ].join("\n");
-
-    const page = fakePage();
+describe("delivering lines the inline-code input rule destroys", () => {
+  it("hands a rule-fatal line to paste when the whole-prompt paste failed", async () => {
+    // The production case: the prompt is too large to paste in one go, so
+    // delivery falls to the line loop, and the lines that typing cannot carry
+    // are pasted one at a time.
+    const page = fakePage((body) => !body.includes("\n"));
     await sendPrompt(page, prompt);
 
-    // Every line arrived, so sendPrompt never refused and never had to clear.
     expect(composed).toBe(prompt);
-    // The guard is the trailing-space insert followed by a Backspace.
-    expect(page.keyboard.insertText).toHaveBeenCalledWith(
-      "Read the composer helper in `src/browser/conversation.ts` ",
+    // The rule-fatal line was never typed.
+    expect(page.keyboard.insertText).not.toHaveBeenCalledWith(
+      "Read the composer helper in `src/browser/conversation.ts`",
     );
-    expect(page.keyboard.press).toHaveBeenCalledWith("Backspace");
+    // The lines typing handles fine were still typed, so this is not a
+    // wholesale switch to pasting every line.
+    expect(page.keyboard.insertText).toHaveBeenCalledWith("plain line with no code at all");
   });
 
-  it("models a fake that really does destroy an unguarded line", async () => {
-    // Control: without the guard the same insertion is eaten, which is what
-    // makes the test above meaningful rather than vacuous.
-    const page = fakePage();
-    composed = "kept\n";
-    await page.keyboard.insertText("lost because it ends in `code`");
-    expect(composed).toBe("kept\n");
+  it("prefers one whole-prompt paste and never reaches the line loop", async () => {
+    const page = fakePage(() => true);
+    await sendPrompt(page, prompt);
+
+    expect(composed).toBe(prompt);
+    expect(page.keyboard.insertText).not.toHaveBeenCalled();
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Shift+Enter");
+  });
+
+  it("refuses to submit when neither path can carry the line", async () => {
+    // No paste at any size: the line loop types, the input rule eats the line,
+    // and the completeness check must refuse rather than spend a Pro turn on a
+    // prompt that arrived with a line missing.
+    const page = fakePage(() => false);
+    await expect(sendPrompt(page, prompt)).rejects.toThrow(/composer delivery incomplete/);
   });
 });
