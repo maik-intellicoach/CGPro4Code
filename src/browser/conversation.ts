@@ -1041,6 +1041,60 @@ async function pasteComposerText(page: Page, text: string): Promise<boolean> {
 /** React commits the pasted transaction asynchronously; give it one frame. */
 const COMPOSER_PASTE_SETTLE_MS = Math.max(0, Number(process.env.CGPRO_COMPOSER_PASTE_SETTLE_MS ?? 250));
 
+export interface PromptDeliveryProbe {
+  requestedChars: number;
+  /** -1 when the composer could not be read at all. */
+  arrivedChars: number;
+  complete: boolean;
+  divergence?: string;
+}
+
+/**
+ * Deliver a prompt, measure what arrived, then clear it WITHOUT submitting.
+ *
+ * P-035 2026-09-18. Proving a delivery repair used to cost a Pro turn: the
+ * `--traffic-class synthetic` flag is a telemetry label and stops nothing, so a
+ * replay was free only while delivery was still broken. That is backwards --
+ * the moment a fix works, testing it starts costing money. This runs the exact
+ * sequence `sendPrompt` runs, up to but never including the send click.
+ *
+ * The clear afterwards is not tidiness. ChatGPT persists composer drafts, so
+ * residue left here would be inherited by the next real turn on this lane;
+ * asserting the composer is empty is what makes the probe safe to point at
+ * production.
+ */
+export async function probePromptDelivery(page: Page, prompt: string): Promise<PromptDeliveryProbe> {
+  const composer = await requireSelector(page, SELECTORS.composer, "composer");
+  await composer.click();
+  await page.waitForTimeout(120);
+  await clearComposer(page);
+  await focusComposerEnd(page, composer);
+  await insertComposerText(page, prompt);
+
+  const want = normaliseComposerText(prompt);
+  const landed = await readComposer(page, composer);
+  const probe: PromptDeliveryProbe = {
+    requestedChars: want.length,
+    arrivedChars: landed?.length ?? -1,
+    complete: landed !== null && composerHoldsPrompt(landed, want),
+  };
+  if (!probe.complete) {
+    probe.divergence = landed === null
+      ? "composer unreadable"
+      : describeDivergence(landed, want);
+  }
+
+  await clearComposer(page);
+  const residue = await readComposer(page, composer);
+  if (residue === null || residue.trim().length > 0) {
+    throw new Error(
+      "prompt delivery probe could not clear the composer; the next turn on this lane would "
+      + `inherit it (residue=${JSON.stringify((residue ?? "<unreadable>").slice(0, 80))})`,
+    );
+  }
+  return probe;
+}
+
 /**
  * Focus the composer and collapse the caret to the end of its content.
  *
@@ -1484,13 +1538,29 @@ async function insertLines(page: Page, lines: string[]): Promise<void> {
   lastInsert = { lines: lines.length, requested: 0, chars: 0 };
   for (let i = 0; i < lines.length; i++) {
     if (i > 0) await page.keyboard.press("Shift+Enter");
-    if (lines[i].length > 0) {
-      await page.keyboard.insertText(lines[i]);
-      lastInsert.requested += 1;
-      lastInsert.chars += lines[i].length;
+    const line = lines[i];
+    if (line.length === 0) continue;
+    // A closing backtick at the END of an insertion is what triggers the
+    // composer's inline-code input rule, and that rule destroyed 18 of 18 such
+    // lines on 2026-09-18. Ending the insertion one character later and then
+    // deleting that character keeps the text identical while denying the rule
+    // its trigger, because ProseMirror runs input rules on text input and never
+    // on deletion. Paste is the default path; this is the fallback, and a
+    // fallback that loses exactly what the default was fixed to keep is not a
+    // fallback at all.
+    if (CODE_SPAN_AT_LINE_END.test(line)) {
+      await page.keyboard.insertText(`${line} `);
+      await page.keyboard.press("Backspace");
+    } else {
+      await page.keyboard.insertText(line);
     }
+    lastInsert.requested += 1;
+    lastInsert.chars += line.length;
   }
 }
+
+/** A line whose last inline-code span closes at its end, bar one punctuation mark. */
+const CODE_SPAN_AT_LINE_END = /`[^`]*`[.:,;)]?\s*$/;
 
 
 const SEND_CLICK_MAX_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_SEND_CLICK_ATTEMPTS ?? 3));

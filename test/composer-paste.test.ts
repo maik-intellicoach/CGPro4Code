@@ -21,6 +21,11 @@ const { sendPrompt } = await import("../src/browser/conversation.js");
 // does it still arrive when paste is the one thing that fails?
 describe("composer paste delivery", () => {
   let composed = "";
+  // Meta+A selects all; Backspace then deletes the selection. Without that
+  // state a plain Backspace looks like a clear, and the typed path's
+  // input-rule guard (insert a trailing space, delete it) would wipe the
+  // composer instead of removing one character.
+  let selectedAll = false;
 
   /** `delivers` models what the page does with the dispatched paste event. */
   function fakePage(delivers: "all" | "nothing" | "throws"): Page {
@@ -37,7 +42,11 @@ describe("composer paste delivery", () => {
       keyboard: {
         press: vi.fn(async (key: string) => {
           if (key === "Shift+Enter") composed += "\n";
-          if (key === "Backspace") composed = "";
+          if (key === "Meta+A") selectedAll = true;
+          if (key === "Backspace") {
+            composed = selectedAll ? "" : composed.slice(0, -1);
+            selectedAll = false;
+          }
         }),
         type: vi.fn(async (text: string) => { composed += text; }),
         insertText: vi.fn(async (text: string) => { composed += text; }),
@@ -49,6 +58,7 @@ describe("composer paste delivery", () => {
 
   beforeEach(() => {
     composed = "";
+    selectedAll = false;
     delete process.env.CGPRO_SKIP_COMPOSER_PASTE;
     firstResolved.mockReset();
     requireSelector.mockReset();

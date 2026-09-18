@@ -63,6 +63,8 @@ import {
 
 const log = makeLogger();
 
+/** The largest prompt /preflight will deliver-and-discard; real prompts run well under this. */
+const PROBE_PROMPT_MAX_CHARS = 200_000;
 const QUEUE_MAX = Math.max(1, Number(process.env.CGPRO_DAEMON_QUEUE_MAX) || 4);
 const QUEUE_MAX_WAIT_MS = Math.max(1, Number(process.env.CGPRO_DAEMON_QUEUE_MAX_WAIT_MS) || 7_200_000);
 
@@ -879,7 +881,9 @@ export async function handleRequest(
         typeof body.gizmoId !== "string" || !/^g-p-[A-Za-z0-9_-]+$/.test(body.gizmoId) ||
         (body.gizmoShortUrl !== undefined && !/^[A-Za-z0-9_-]+$/.test(body.gizmoShortUrl)) ||
         typeof body.expectedAccountEmail !== "string" || body.expectedAccountEmail.length > 320 ||
-        !body.expectedAccountEmail.includes("@")) {
+        !body.expectedAccountEmail.includes("@") ||
+        (body.probePrompt !== undefined
+          && (typeof body.probePrompt !== "string" || body.probePrompt.length > PROBE_PROMPT_MAX_CHARS))) {
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "invalid_preflight_identity" }));
       return;

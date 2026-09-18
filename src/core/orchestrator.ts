@@ -7,6 +7,8 @@ import {
   latestAssistantModelSlug,
   openConversation,
   ensureProSixMaximum,
+  probePromptDelivery,
+  type PromptDeliveryProbe,
   readLatestAssistantText,
   sendPrompt,
   setConnector,
@@ -78,6 +80,8 @@ export interface InteractionPreflightOptions {
   gizmoId: string;
   gizmoShortUrl?: string;
   expectedAccountEmail: string;
+  /** When present, deliver and measure this prompt WITHOUT submitting it. */
+  probePrompt?: string;
 }
 
 export interface InteractionPreflightResult {
@@ -86,6 +90,7 @@ export interface InteractionPreflightResult {
   connectorVerified: true;
   model: "gpt-6-pro";
   power: number;
+  promptDelivery?: PromptDeliveryProbe;
 }
 
 /** Verify current controls on an idle daemon lane without submitting a prompt. */
@@ -108,12 +113,18 @@ export async function runInteractionPreflight(
     await clearComposer(page);
     await setConnector(page, opts.connector);
     const selection = await ensureProSixMaximum(page);
+    // Last, so the probe runs against exactly the controls a real turn would
+    // use: same account, same Project, same connector, same model selection.
+    const promptDelivery = opts.probePrompt === undefined
+      ? undefined
+      : await probePromptDelivery(page, opts.probePrompt);
     return {
       accountVerified: true,
       projectVerified: true,
       connectorVerified: true,
       model: "gpt-6-pro",
       power: selection.power,
+      ...(promptDelivery === undefined ? {} : { promptDelivery }),
     };
   } catch (error) {
     verificationError = error;

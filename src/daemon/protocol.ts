@@ -172,6 +172,8 @@ export interface PreflightRequest {
   gizmoId: string;
   gizmoShortUrl?: string;
   expectedAccountEmail: string;
+  /** Deliver and measure this prompt without submitting it (P-035 2026-09-18). */
+  probePrompt?: string;
 }
 
 export interface ReloadResponse {

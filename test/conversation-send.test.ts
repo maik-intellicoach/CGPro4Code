@@ -37,6 +37,9 @@ let composed = "";
 // activeInComposer=true.
 let caretInComposer = true;
 
+// Does Meta+A currently hold the whole composer selected?
+let selectedAll = false;
+
 function fakeLocator(overrides: { click?: () => Promise<void>; innerText?: string } = {}) {
   return {
     click: overrides.click ?? (async () => {}),
@@ -69,7 +72,14 @@ function fakePage(dropAfter = Infinity, dropFirst = 0): Page {
     keyboard: {
       press: vi.fn(async (key: string) => {
         if (key === "Shift+Enter") write("\n");
-        if (key === "Backspace") composed = ""; // Meta+A then Backspace clears
+        if (key === "Meta+A") selectedAll = true;
+        if (key === "Backspace") {
+          // Meta+A then Backspace clears; a bare Backspace deletes one
+          // character, which is how the input-rule guard undoes its own
+          // trailing space.
+          composed = selectedAll ? "" : composed.slice(0, -1);
+          selectedAll = false;
+        }
       }),
       type: vi.fn(async (text: string) => write(text)),
       insertText: vi.fn(async (text: string) => write(text)),
@@ -85,6 +95,7 @@ function fakePage(dropAfter = Infinity, dropFirst = 0): Page {
 beforeEach(() => {
   composed = "";
   caretInComposer = true;
+  selectedAll = false;
   firstResolved.mockReset();
   requireSelector.mockReset();
   requireSelector.mockImplementation(async () => fakeLocator());
