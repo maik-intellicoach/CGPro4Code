@@ -1218,7 +1218,7 @@ export function describeDivergence(landedRaw: string, want: string): string {
  */
 async function composerDiagnostics(page: Page, selector: string): Promise<string> {
   return page
-    .evaluate((sel) => {
+    .evaluate(({ sel, sent }) => {
       const describe = (el: Element | null): string => {
         if (el === null) return "none";
         const id = el.id ? `#${el.id}` : "";
@@ -1287,9 +1287,21 @@ async function composerDiagnostics(page: Page, selector: string): Promise<string
         landedTail: composer === null
           ? null
           : ((composer as HTMLElement).innerText ?? "").replace(/\s+/g, " ").trim().slice(-80),
+        // The REQUESTED side of the insert, from the Node process. Without it,
+        // "109 requested, 109 arrived" and "128 requested, 109 arrived" look
+        // identical in the log and have opposite causes: the first means the
+        // editor dropped content it accepted, the second means insertLines
+        // never asked for those lines at all.
+        sentLines: sent.lines,
+        sentInserts: sent.requested,
+        sentChars: sent.chars,
+        // How many line nodes the composer ended up holding. ProseMirror gives
+        // each Shift+Enter line its own block node, so this is the DOM's own
+        // count of lines against `sentInserts`.
+        lineNodes: composer === null ? null : composer.childElementCount,
         html: composer === null ? null : composer.outerHTML.slice(0, 1200),
       });
-    }, selector)
+    }, { sel: selector, sent: lastInsert })
     .catch((error) => `capture failed: ${error instanceof Error ? error.message : String(error)}`);
 }
 
@@ -1371,10 +1383,30 @@ async function readComposer(page: Page, composer: Locator): Promise<string | nul
 
 const COMPOSER_READ_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_COMPOSER_READ_ATTEMPTS ?? 3));
 
+/**
+ * What the last insert run actually asked the page to do.
+ *
+ * P-035 2026-09-18: the composer diagnostics count events the composer
+ * RECEIVED (`inputEvents`) and mutations it COMMITTED (`inputCommitted`), both
+ * 109 on the refusal that lost 1451 characters in whole-line chunks. Neither
+ * says how many insertions were requested, so "109 sent, 109 arrived" and
+ * "128 sent, 109 arrived" are indistinguishable -- and they have opposite
+ * causes. This records the requested side.
+ *
+ * A module-level counter is safe because a lane serialises turns behind a
+ * single page lease; there is no second insert run to interleave with.
+ */
+let lastInsert = { lines: 0, requested: 0, chars: 0 };
+
 async function insertLines(page: Page, lines: string[]): Promise<void> {
+  lastInsert = { lines: lines.length, requested: 0, chars: 0 };
   for (let i = 0; i < lines.length; i++) {
     if (i > 0) await page.keyboard.press("Shift+Enter");
-    if (lines[i].length > 0) await page.keyboard.insertText(lines[i]);
+    if (lines[i].length > 0) {
+      await page.keyboard.insertText(lines[i]);
+      lastInsert.requested += 1;
+      lastInsert.chars += lines[i].length;
+    }
   }
 }
 
