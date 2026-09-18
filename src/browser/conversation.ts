@@ -1161,6 +1161,15 @@ async function verifyComposerHoldsPrompt(
  * Both sides are already whitespace-normalised, so a difference here is real
  * content rather than a rendering artefact.
  */
+/**
+ * P-035 2026-09-18. Five drops were enough to see that every one is a whole
+ * line, and not enough to say which lines: the five reported were simply the
+ * first five, and fitting a predicate to the 1383-character total instead of
+ * reading the list is how the tail-truncation theory survived two days. Report
+ * the whole list and let the pattern be read off it.
+ */
+const DIVERGENCE_MAX_DROPS = Math.max(1, Number(process.env.CGPRO_DIVERGENCE_MAX_DROPS ?? 40));
+
 export function describeDivergence(landedRaw: string, want: string): string {
   // On a connector turn the composer holds the connector mention BEFORE the
   // prompt, and `want` never contains it, so a comparison anchored at index 0
@@ -1182,7 +1191,7 @@ export function describeDivergence(landedRaw: string, want: string): string {
   const drops: string[] = [];
   let l = 0;
   let w = 0;
-  while (drops.length < 5 && l < landed.length && w < want.length) {
+  while (drops.length < DIVERGENCE_MAX_DROPS && l < landed.length && w < want.length) {
     if (landed[l] === want[w]) {
       l += 1;
       w += 1;
@@ -1196,7 +1205,7 @@ export function describeDivergence(landedRaw: string, want: string): string {
       drops.push(`at=${w} resume=not-found landed=${JSON.stringify(probe)}`);
       break;
     }
-    drops.push(`at=${w} dropped=${resume - w} text=${JSON.stringify(want.slice(w, resume))}`);
+    drops.push(`at=${w} dropped=${resume - w} text=${JSON.stringify(want.slice(w, Math.min(resume, w + 110)))}`);
     w = resume;
   }
   if (drops.length === 0) {
