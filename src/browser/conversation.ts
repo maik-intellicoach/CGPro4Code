@@ -70,8 +70,17 @@ export async function openConversation(
         row = rowLocator();
       }
     }
-    await page.waitForTimeout(5_000);
-    await row.getByText(project.name, { exact: true }).first().click({ timeout: 5_000 });
+    // The loop above waits for the ROW; the click below targets a text node
+    // INSIDE it, and that node had nothing waiting for it -- the 5s budget was
+    // the click's own actionability wait, which is why a saturated host turned
+    // this line into 21 timeouts in seven days across three different projects.
+    // Waiting for what we actually click is the fix; a longer blind timeout
+    // would only have moved the boundary. The fixed 5s settle this replaces was
+    // a hedge for the same thing, and click() re-resolves per retry anyway, so
+    // a row that re-renders mid-click is already covered.
+    const label = row.getByText(project.name, { exact: true }).first();
+    await label.waitFor({ state: "visible", timeout: 20_000 });
+    await label.click({ timeout: 10_000 });
     await page.waitForURL((url) => url.origin === "https://chatgpt.com" &&
       (url.pathname === `/g/${project.id}/project` ||
        (project.shortUrl !== undefined && url.pathname === `/g/${project.shortUrl}/project`)),
@@ -960,12 +969,14 @@ export async function sendPrompt(
 /**
  * Put `text` into the focused composer without emitting key events.
  *
- * `keyboard.insertText` dispatches only the `input` event — no keydown — so
- * chatgpt.com's inline `@` mention and `/` command menus cannot open, and no
- * menu entry (notably "Add photos & files") can be activated by the prompt's
- * own characters. Newlines still go through Shift+Enter because the composer
- * treats a bare "\n" as submit-adjacent; that is a handful of keypresses
- * instead of one per character.
+ * Paste first, type only if the paste delivered nothing. Both paths avoid key
+ * events, so chatgpt.com's inline `@` mention and `/` command menus cannot open
+ * and no menu entry (notably "Add photos & files") can be activated by the
+ * prompt's own characters. The typed path additionally sends newlines through
+ * Shift+Enter, because the composer treats a bare "\n" as submit-adjacent.
+ *
+ * Typing is the fallback rather than the default because it loses text: see
+ * pasteComposerText for the measurement.
  *
  * Falls back to per-character typing when the inserted text does not land
  * COMPLETE, so a build that rejects or drops inserted text degrades to the old
@@ -977,8 +988,58 @@ export async function sendPrompt(
  * Escape hatch: CGPRO_SKIP_COMPOSER_VERIFY=1 restores the unverified path.
  */
 async function insertComposerText(page: Page, text: string): Promise<void> {
+  if (await pasteComposerText(page, text)) return;
   await insertLines(page, text.split("\n"));
 }
+
+/**
+ * Deliver the whole prompt through the composer's PASTE path, in one operation.
+ *
+ * P-035 2026-09-18, measured cause. Typing the prompt line by line runs it
+ * through ProseMirror's markdown INPUT RULES, and the inline-code rule destroys
+ * any line whose closing backtick is the last character of the insertion: 18 of
+ * 18 such lines vanished in the reproduction, while 28 of 29 lines carrying
+ * inline code elsewhere survived. Clipboard input is parsed by a different code
+ * path that never consults input rules, so a paste cannot trigger the rule that
+ * eats these lines -- and it replaces 109 CDP round-trips with one.
+ *
+ * The event is constructed and dispatched INSIDE the page. That keeps this on
+ * in-tab JavaScript and away from the real clipboard, so it neither injects OS
+ * input nor disturbs whatever Maik has copied (C-037).
+ *
+ * Returns whether the composer actually grew, which is a measurement rather
+ * than an inference: `dispatchEvent` reports only whether something called
+ * preventDefault. A false return falls back to the typed path, and either way
+ * `verifyComposerHoldsPrompt` is still the thing that decides whether this turn
+ * may be submitted.
+ */
+async function pasteComposerText(page: Page, text: string): Promise<boolean> {
+  if (process.env.CGPRO_SKIP_COMPOSER_PASTE === "1") return false;
+  const composer = page.locator(joinSelectors(SELECTORS.composer)).first();
+  const read = async (): Promise<string> => composer.innerText().catch(() => "");
+  const before = await read();
+  const dispatched = await composer
+    .evaluate((element, body) => {
+      const data = new DataTransfer();
+      data.setData("text/plain", body);
+      return element.dispatchEvent(
+        new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }),
+      );
+    }, text)
+    .then(() => true)
+    .catch((error) => {
+      console.error(
+        `[cgpro:composer] paste delivery could not be dispatched (${error instanceof Error ? error.message : String(error)}); typing instead`,
+      );
+      return false;
+    });
+  if (!dispatched) return false;
+  await page.waitForTimeout(COMPOSER_PASTE_SETTLE_MS);
+  return (await read()).length > before.length;
+}
+
+/** React commits the pasted transaction asynchronously; give it one frame. */
+const COMPOSER_PASTE_SETTLE_MS = Math.max(0, Number(process.env.CGPRO_COMPOSER_PASTE_SETTLE_MS ?? 250));
 
 /**
  * Focus the composer and collapse the caret to the end of its content.

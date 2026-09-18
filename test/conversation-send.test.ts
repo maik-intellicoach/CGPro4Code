@@ -16,6 +16,12 @@ vi.mock("../src/browser/chatgpt.js", () => ({
 // out the real default.
 process.env.CGPRO_SEND_CLICK_ATTEMPTS = "2";
 
+// Every test in this file is about the TYPED delivery path and its partial
+// writes. Paste is now the default and is covered in composer-paste.test.ts;
+// disabling it here keeps these cases exercising the path they were written
+// for, which is also the fallback that still has to work (P-035 2026-09-18).
+process.env.CGPRO_SKIP_COMPOSER_PASTE = "1";
+
 const { sendPrompt, composerHoldsPrompt } = await import("../src/browser/conversation.js");
 
 // What the fake composer currently holds. sendPrompt reads the composer back to

@@ -19,9 +19,14 @@ function pageFor(
   sidebar: { matches: number; visible?: (index: number) => boolean; failFirstAttempts?: number } = { matches: 1 },
 ) {
   const rowClick = vi.fn(async () => {});
+  // The row's LABEL is what gets clicked, and it carries its own waitFor: the
+  // row being visible never made the text node inside it clickable, which is
+  // what turned this line into 21 timeouts in seven days (P-035 2026-09-18).
+  const labelWait = vi.fn(async () => {});
+  const label = { waitFor: labelWait, click: rowClick };
   const row = {
     waitFor: vi.fn(async () => {}),
-    getByText: vi.fn(() => ({ first: () => ({ click: rowClick }) })),
+    getByText: vi.fn(() => ({ first: () => label })),
   };
   // The sidebar link is resolved imperatively (count/nth/isVisible/click) so a
   // hidden duplicate can be skipped and a timeout can be retried, rather than
@@ -54,7 +59,7 @@ function pageFor(
     if (name === "composer") return {};
     return { click: vi.fn(async () => {}) };
   });
-  return { page, rowClick, row, sidebarMatch };
+  return { page, rowClick, row, label, labelWait, sidebarMatch };
 }
 
 beforeEach(() => { vi.clearAllMocks(); projects.mockResolvedValue([target]); });
@@ -118,6 +123,28 @@ describe("Project directory sidebar click", () => {
     await openConversation(page, { gizmoId: target.id });
     expect(sidebarMatch.click).toHaveBeenCalledTimes(2);
   });
+  // P-035 2026-09-18. The row was awaited and the LABEL inside it was not, so
+  // the click's own 5s actionability budget was the only thing waiting for the
+  // node we actually click: 21 timeouts in seven days across three different
+  // projects. A longer blind timeout would have moved the boundary; waiting for
+  // the click target removes it.
+  it("waits for the row's label before clicking it, not just for the row", async () => {
+    const { page, labelWait, rowClick } = pageFor();
+    const order: string[] = [];
+    labelWait.mockImplementation(async () => { order.push("wait"); });
+    rowClick.mockImplementation(async () => { order.push("click"); });
+    await openConversation(page, { gizmoId: target.id });
+    expect(order).toEqual(["wait", "click"]);
+    expect(labelWait).toHaveBeenCalledWith({ state: "visible", timeout: 20_000 });
+  });
+
+  it("does not click a label that never becomes visible", async () => {
+    const { page, labelWait, rowClick } = pageFor();
+    labelWait.mockRejectedValue(new Error("locator.waitFor: Timeout 20000ms exceeded."));
+    await expect(openConversation(page, { gizmoId: target.id })).rejects.toThrow(/Timeout 20000ms/);
+    expect(rowClick).not.toHaveBeenCalled();
+  });
+
   it("names the match count and URL when the sidebar never becomes clickable", async () => {
     const { page } = pageFor(undefined, { matches: 2, visible: () => false });
     await expect(openConversation(page, { gizmoId: target.id })).rejects.toThrow(
