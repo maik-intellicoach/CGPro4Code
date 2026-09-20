@@ -246,6 +246,43 @@ it("marks an idle lane interaction-ready after a no-submit preflight", async () 
   expect(runInteractionPreflight).toHaveBeenCalledOnce();
 });
 
+// inline-execution-exception: HTTP contract coverage only; no browser calls.
+it.each([
+  { probePrompt: 7 },
+  { probePrompt: null },
+  { probeDeliveryPath: "auto" },
+  { probeDeliveryPath: false },
+])("rejects malformed delivery-probe fields before browser work: %j", async (fields) => {
+  const state = fakeState();
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST", url: "/preflight", headers: { authorization: "Bearer test-token" } });
+  const pending = handleRequest(req, res, state);
+  sendBody(req, { model: "gpt-6-pro", connector: "c", gizmoId: "g-p-p", expectedAccountEmail: "a@b", ...fields });
+  await pending;
+  expect((res as unknown as FakeRes).statusCode).toBe(400);
+  expect(parseJsonBody(res as unknown as FakeRes)).toEqual({ error: "invalid_preflight_identity" });
+  expect(runInteractionPreflight).not.toHaveBeenCalled();
+  expect(state.queue.tryAcquire()).toBe(true);
+  state.queue.release();
+});
+
+it.each(["paste", "typed"])("forwards a forced %s delivery probe and its measurements", async (probeDeliveryPath) => {
+  const promptDelivery = { requestedChars: 3, arrivedChars: 3, complete: true, deliveredBy: probeDeliveryPath };
+  runInteractionPreflight.mockResolvedValue({ promptDelivery });
+  const state = fakeState();
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST", url: "/preflight", headers: { authorization: "Bearer test-token" } });
+  const body = { model: "gpt-6-pro", connector: "c", gizmoId: "g-p-p", expectedAccountEmail: "a@b", probePrompt: "a\nb", probeDeliveryPath };
+  const pending = handleRequest(req, res, state);
+  sendBody(req, body);
+  await pending;
+  expect((res as unknown as FakeRes).statusCode).toBe(200);
+  expect(runInteractionPreflight.mock.calls[0][0]).toEqual(body);
+  expect(parseJsonBody(res as unknown as FakeRes)).toEqual({ ok: true, promptDelivery });
+});
+
 it("refuses a preflight while the lane is busy", async () => {
   const queue = new AskQueue(1, 60_000);
   expect(queue.tryAcquire()).toBe(true);
