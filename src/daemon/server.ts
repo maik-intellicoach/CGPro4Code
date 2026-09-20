@@ -1504,16 +1504,13 @@ function readJsonBody<T>(
 /**
  * A bounded picture of the page at the moment a selector gate failed: what
  * resolves, what is visible, which surface is mounted, and -- since
- * 2026-09-21 -- the literal label on the one menu row whose text a gate
- * compares against. Counts and booleans elsewhere; never user content.
+ * 2026-09-21 -- the two chrome labels a model-control gate reads. Counts and
+ * booleans elsewhere; never user content.
  *
- * Why the label is captured at all: the gate below this one asserts
- * `^6\s*Pro$` against that row's text, deliberately text-exact, because a
- * looser match could let a paid turn run below maximum power. When it fails,
- * nothing recorded what the label actually held, so every repair attempt was a
- * guess. The row is the model menu's own item -- chrome, structurally incapable
- * of carrying prompt or answer text -- and the capture is whitespace-collapsed
- * and length-capped.
+ * Why the labels are captured at all: the gate below asserts `^6\s*Pro$` against
+ * the text of a menu row, deliberately text-exact, because a looser match could
+ * let a paid turn run below maximum power. When it fails, nothing recorded what
+ * the label actually held, so every repair attempt was a guess.
  */
 async function describeSelectorState(page: Page): Promise<string> {
   const groups: Array<[string, string[]]> = [
@@ -1549,31 +1546,42 @@ async function describeSelectorState(page: Page): Promise<string> {
     .catch(() => -1);
   const editables = await page.locator('[contenteditable="true"]').count().catch(() => -1);
   const rows = await page.locator('[role="row"]').count().catch(() => -1);
-  const modelRow = await describeModelRow(page);
-  return `${parts.join(" ")} checkedRadios=${checkedRadios} contenteditable=${editables} roleRow=${rows} modelRow(${modelRow})`
+  const chrome = await describeChromeLabels(page);
+  return `${parts.join(" ")} checkedRadios=${checkedRadios} contenteditable=${editables} roleRow=${rows} ${chrome}`
     .slice(0, 2000);
 }
 
 const LABEL_CAPTURE_MAX = 60;
 
 /**
- * P-035 2026-09-21. The exact label the `model-selected-text` assertion compares
- * against, so a failure names its own cause instead of costing another guess.
- * Whitespace-collapsed and capped; the node is the model menu's own row.
+ * P-035 2026-09-21. Two chrome labels, captured so a model-control failure names
+ * its own cause instead of costing another guess:
+ *
+ * - `pill` -- the composer's model pill, the element that DISPLAYS the selected
+ *   model to the user. Always mounted, so it is capturable whatever the failure.
+ * - `row` -- the menu row the `model-selected-text` assertion compares against.
+ *   Only exists while that menu is open, and the failing path closes the menu
+ *   before this diagnostic runs, so `absent` here is expected and means nothing.
+ *
+ * Both are whitespace-collapsed and length-capped, and both are UI chrome: a
+ * model name and an aria-label. Neither can carry prompt or answer text.
  */
-async function describeModelRow(page: Page): Promise<string> {
+async function describeChromeLabels(page: Page): Promise<string> {
   return page
     .evaluate(
-      ({ selector, max }) => {
-        const el = document.querySelector(selector);
-        if (!el) return "absent";
+      ({ pill, row, max }) => {
         const clean = (value: string | null): string =>
           (value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
-        return `text="${clean(el.textContent)}" inner="${clean((el as HTMLElement).innerText)}" aria="${clean(
-          el.getAttribute("aria-label"),
-        )}"`;
+        const describe = (selector: string): string => {
+          const el = document.querySelector(selector);
+          if (!el) return "absent";
+          return `text="${clean(el.textContent)}" inner="${clean((el as HTMLElement).innerText)}" aria="${clean(
+            el.getAttribute("aria-label"),
+          )}"`;
+        };
+        return `pill(${describe(pill)}) modelRow(${describe(row)})`;
       },
-      { selector: SELECTORS.selectedPowerModel[0], max: LABEL_CAPTURE_MAX },
+      { pill: SELECTORS.thinkingPowerButton[0], row: SELECTORS.selectedPowerModel[0], max: LABEL_CAPTURE_MAX },
     )
     .catch(() => "unavailable");
 }
