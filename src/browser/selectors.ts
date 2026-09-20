@@ -87,6 +87,15 @@ export const SELECTORS: SelectorSet = {
     // entry matching and the ones after it dead, so the daemon paid a failed
     // probe per turn. Kept as tail fallbacks in case the attributes return.
   thinkingPowerButton: [
+    // P-035 2026-09-21: the structural composer pill, FIRST. A no-submit
+    // preflight on a lane that failed here reported this selector resolving
+    // (1 attached, visible) while all three label candidates below matched
+    // ZERO elements, attached or visible -- the pill exists and its label is
+    // simply not one of the strings the next entries enumerate. Matching by
+    // structure is the same strategy `modelSwitcher` already relies on, and
+    // correctness is unchanged: the gate still refuses unless the menu opens,
+    // the slider reaches aria-valuemax, and the menu reads 6 Pro.
+    'button.__composer-pill[aria-haspopup="menu"]',
     'button:has(:text-matches("^(?:6\\\\s*Pro|High|Instant)$", "i"))',
     'button:has-text("Thinking effort")',
     'button:text-matches("^(?:6\\\\s*Pro|High|Instant)$", "i")',
@@ -192,13 +201,22 @@ export const SELECTORS: SelectorSet = {
  * deliberately counts what is attached, so it cannot tell a stale selector from
  * a surface that is simply not open: on a healthy lane 12 of 22 keys resolve to
  * nothing because the conversation, the tools popover or the Projects directory
- * is not mounted. Only absence of a key listed here is drift. Surface-scoped
- * keys (`projectRows`, `deepResearchToggle`, `assistantMessages`, ...) are
- * reported but never fail the audit.
+ * is not mounted. Only absence of a key listed here is UNRESOLVED -- a word
+ * chosen deliberately over "drift", because the audit counts attachment and
+ * cannot tell a stale selector from a state that is not mounted yet (P-035
+ * 2026-09-21). Surface-scoped keys (`projectRows`, `deepResearchToggle`,
+ * `assistantMessages`, ...) are reported but never fail the audit.
+ *
+ * `thinkingPowerButton` belongs here, and only because its primary candidate is
+ * now the structural composer pill: a text-exact key would resolve to nothing on
+ * a page whose label is merely off-list and would therefore have relabelled a
+ * state as drift -- the very defect this list exists to avoid. The sibling
+ * `thinkingPowerSlider` must NOT be listed: it mounts only once the menu is open.
  */
 export const TURN_CRITICAL_SELECTORS: Array<keyof SelectorSet> = [
   "composer",
   "modelSwitcher",
+  "thinkingPowerButton",
   "projectsNavigation",
 ];
 

@@ -942,10 +942,14 @@ export async function handleRequest(
     // A late newPage must also be closed; its lease cannot escape the deadline.
     let capture!: (page: Page | null) => void;
     const ownedPage = new Promise<Page | null>((resolve) => { capture = resolve; });
+    // Set when a real page exists, so the diagnostics below never wait on a
+    // promise that cannot settle: a stuck newPage is quarantined, not awaited.
+    let pageCaptured = false;
     const work = (async () => {
       try {
         const page = await slotPage(state, slot, (page) => {
           capture(page);
+          if (page) pageCaptured = true;
           if (cancelled) throw new Error(cancelled);
         });
         if (cancelled) throw new Error(cancelled);
@@ -992,9 +996,18 @@ export async function handleRequest(
       // paid turn. Emit the same bounded, content-free picture here, before the page
       // is closed below. Diagnostics never mask the failure.
       try {
-        const diagPage = await ownedPage;
+        // P-035 2026-09-21. Only when a page actually existed; a stuck newPage is
+        // quarantined rather than awaited, and waiting on it here hung the 409 --
+        // caught by the daemon-slots quarantine test, whose budget this must not
+        // eat into.
+        const diagPage = pageCaptured ? await ownedPage : null;
         if (diagPage && !diagPage.isClosed()) {
-          log.error(`selector diagnostic: ${await describeSelectorState(diagPage)}`);
+          await Promise.race([
+            describeSelectorState(diagPage)
+              .then((d) => log.error(`selector diagnostic: ${d}`))
+              .catch(() => undefined),
+            new Promise<void>((resolve) => setTimeout(resolve, 3_000)),
+          ]);
         }
       } catch {
         /* never let diagnostics mask the real failure */

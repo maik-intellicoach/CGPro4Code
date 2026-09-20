@@ -157,6 +157,21 @@ async function ensureChatTab(page: Page): Promise<void> {
       "[cgpro:model] WARNING: found the Chat/Work surface toggle but failed to switch to Chat. The conversation may run on the wrong ChatGPT surface (no Pro tier). Run `cgpro doctor` to audit selectors.",
     );
   }
+  // P-035 2026-09-21. This used to return regardless of the outcome, so every
+  // downstream model assumption ran against a surface it never verified -- and
+  // the Work surface's composer carries no Pro tier at all. That is a fail-open
+  // precondition in a system whose doctrine is fail-closed, and it is exactly
+  // how an off-list model label reaches the model-control gate with nothing
+  // having reported the surface. Prove the switch landed, or refuse before
+  // spending a turn.
+  const settled = (await chatTab.getAttribute("aria-checked", { timeout: 2_000 }).catch(() => null)) === "true";
+  if (!settled) {
+    throw new PreSubmitInteractionError(
+      "chat_surface_unconfirmed",
+      "model_verification",
+      "ChatGPT Chat surface could not be confirmed before submission",
+    );
+  }
 }
 
 export type ModelVerificationPhase =

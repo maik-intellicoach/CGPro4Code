@@ -792,14 +792,16 @@ describe("daemon-side selector audit", () => {
     expect(body.results.length).toBe(Object.keys(SELECTORS).length);
     expect(body.results.find((row) => row.key === "composer")?.firstWorking).toBe(0);
     expect(body.results.find((row) => row.key === "fileUpload")?.firstWorking).toBe(-1);
-    // Only a TURN_CRITICAL_SELECTORS miss is drift: the absent fileUpload and
-    // the other surface-scoped keys must not read as an audit failure, or every
-    // healthy lane exits 5 (P-035 2026-09-16). This fake page resolves the
-    // composer and nothing else, so exactly the two other critical keys are
-    // named -- no surface-scoped key leaks into the list.
+    // Only a TURN_CRITICAL_SELECTORS miss is unresolved: the absent fileUpload
+    // and the other surface-scoped keys must not read as an audit failure, or
+    // every healthy lane exits 5 (P-035 2026-09-16). This fake page resolves the
+    // composer and nothing else, so exactly the other three critical keys are
+    // named -- no surface-scoped key leaks into the list. thinkingPowerButton
+    // joined the set on 2026-09-21, once its primary candidate became the
+    // structural composer pill rather than a text-exact label.
     expect(body.missingCritical).not.toContain("composer");
     expect(body.missingCritical).not.toContain("fileUpload");
-    expect(body.missingCritical).toEqual(["modelSwitcher", "projectsNavigation"]);
+    expect(body.missingCritical).toEqual(["modelSwitcher", "thinkingPowerButton", "projectsNavigation"]);
   });
 
   it("names the drift when a turn-critical selector stops resolving", async () => {

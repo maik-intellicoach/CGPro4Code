@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { SELECTORS, joinSelectors } from "../src/browser/selectors.js";
+import { SELECTORS, TURN_CRITICAL_SELECTORS, joinSelectors } from "../src/browser/selectors.js";
 
 describe("selectors", () => {
   it("provides at least one candidate for every key", () => {
@@ -35,6 +35,22 @@ describe("selectors", () => {
     for (const sel of SELECTORS.chatTabRadio) {
       expect(sel).toContain("Chat");
     }
+  });
+
+  // P-035 2026-09-21. The Pro-6 gate failed on a lane where this key's three
+  // label candidates all matched zero elements while the structural pill was
+  // attached and visible. Structure must therefore lead, and the label
+  // candidates must survive as fallbacks -- losing either half reintroduces the
+  // incident in a different shape.
+  it("thinkingPowerButton leads with the structural composer pill, keeping the label fallbacks", () => {
+    expect(SELECTORS.thinkingPowerButton[0]).toBe('button.__composer-pill[aria-haspopup="menu"]');
+    expect(SELECTORS.thinkingPowerButton).toContain('button:has-text("Thinking effort")');
+    expect(SELECTORS.thinkingPowerButton.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("treats the Pro-6 control as turn-critical, and the slider as not", () => {
+    expect(TURN_CRITICAL_SELECTORS).toContain("thinkingPowerButton");
+    expect(TURN_CRITICAL_SELECTORS).not.toContain("thinkingPowerSlider");
   });
 
   it("exposes a native Deep Research composer selector", () => {
