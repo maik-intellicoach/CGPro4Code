@@ -294,7 +294,35 @@ export async function ensureProSixMaximum(
     mark("model-selected-lookup");
     const model = await requireSelector(page, SELECTORS.selectedPowerModel, "selected thinking model");
     mark("model-selected-text");
-    if (!/^6\s*Pro$/i.test((await model.textContent() ?? "").trim())) {
+    const selected = (await model.textContent() ?? "").trim();
+    if (!/^6\s*Pro$/i.test(selected)) {
+      // P-035 2026-09-21. Capture the menu WHILE IT IS STILL OPEN. The daemon's
+      // selector diagnostic runs after this path has called closeOpenMenus, so
+      // its row reading can only ever say `absent` -- it did, on a live failure,
+      // and that is why repairing this assertion has cost guess after guess.
+      // Bounded and chrome-only: the row the assertion reads, the menu's item
+      // labels, and the slider's values. No prompt or answer text can be here.
+      let detail = "unavailable";
+      try {
+        detail = await page.evaluate(
+          ({ selectedSelector, max }) => {
+            const clean = (value: string | null): string =>
+              (value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+            const row = document.querySelector(selectedSelector);
+            const items = Array.from(document.querySelectorAll('[role="menuitem"]'))
+              .slice(0, 8)
+              .map((el) => `"${clean(el.textContent)}"`);
+            const sliders = Array.from(document.querySelectorAll('[role="slider"]'))
+              .slice(0, 4)
+              .map((el) => `${el.getAttribute("aria-valuenow")}/${el.getAttribute("aria-valuemax")}`);
+            return `row="${clean(row ? row.textContent : null)}" menuItems=[${items.join(" ")}] sliders=[${sliders.join(" ")}]`;
+          },
+          { selectedSelector: SELECTORS.selectedPowerModel[0], max: 60 },
+        );
+      } catch {
+        // A diagnostic must never mask the failure it describes.
+      }
+      console.error(`[cgpro:model] 6 Pro check failed: selected="${selected.slice(0, 60)}" ${detail}`);
       throw new Error("6 Pro is not selected in the thinking menu");
     }
     return { model: "gpt-6-pro", power: max };
