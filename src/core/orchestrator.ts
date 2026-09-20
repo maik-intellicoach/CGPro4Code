@@ -291,8 +291,8 @@ function runAskInner(
       if (opts.deepResearch && !cancelled && !nativeMaximumVerified) {
         throw new Error("Native research maximum UI setting was not verified before submission");
       }
-      if (opts.connector !== undefined && !cancelled) {
-        emitter.push({ type: "tool", name: "prompt-submitted", meta: { connector: opts.connector } });
+      if (!cancelled) {
+        emitter.push({ type: "tool", name: "prompt-submitted", meta: opts.connector === undefined ? {} : { connector: opts.connector } });
       }
       log(`sendPrompt done (priorBubbles=${priorBubbles}), url=${page.url()}`);
 

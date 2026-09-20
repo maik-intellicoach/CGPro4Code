@@ -242,6 +242,19 @@ describe("runAskOnSession native Deep Research contract", () => {
 });
 
 describe("runAskOnSession connector contract", () => {
+  it("records a connector-free submission before a later response failure", async () => {
+    waitTurnComplete.mockRejectedValueOnce(new Error("response failed"));
+    const runner = runAskOnSession({ prompt: "test", web: false, timeoutSec: 1_200, headless: false }, session());
+    const result = expect(runner.result).rejects.toThrow("response failed");
+    const events = await collect(runner.events);
+    await result;
+    const submitted = events.findIndex((event) => event.type === "tool" && event.name === "prompt-submitted");
+    const failed = events.findIndex((event) => event.type === "error");
+    expect(submitted).toBeGreaterThanOrEqual(0);
+    expect(failed).toBeGreaterThan(submitted);
+    expect(events[submitted]).toEqual({ type: "tool", name: "prompt-submitted", meta: {} });
+  });
+
   it("emits exact connector selection and prompt submission evidence in lifecycle order", async () => {
     waitTurnComplete.mockResolvedValueOnce(undefined);
     readLatestAssistantText.mockResolvedValueOnce("grounded");
@@ -551,7 +564,7 @@ describe("runAskOnSession wait failure propagation", () => {
     const events = await collect(runner.events);
 
     expect(await result).toBe(closed);
-    expect(events).toEqual([{ type: "error", message: closed.message }]);
+    expect(events).toEqual([{ type: "tool", name: "prompt-submitted", meta: {} }, { type: "error", message: closed.message }]);
     expect(waitTurnComplete).toHaveBeenCalledWith(
       activeSession.page,
       1_200_000,
@@ -578,7 +591,7 @@ describe("runAskOnSession wait failure propagation", () => {
     rejectWait(closed);
 
     await expect(runner.result).resolves.toMatchObject({ finalText: "" });
-    expect(await collect(runner.events)).toEqual([{ type: "done", finalText: "" }]);
+    expect(await collect(runner.events)).toEqual([{ type: "tool", name: "prompt-submitted", meta: {} }, { type: "done", finalText: "" }]);
   });
 
   it("lets cancellation resolve the active waiter without a later browser error", async () => {
@@ -605,7 +618,7 @@ describe("runAskOnSession wait failure propagation", () => {
 
     await expect(runner.result).resolves.toMatchObject({ finalText: "" });
     expect(stopCurrentTurn).toHaveBeenCalledTimes(1);
-    expect(await collect(runner.events)).toEqual([{ type: "done", finalText: "" }]);
+    expect(await collect(runner.events)).toEqual([{ type: "tool", name: "prompt-submitted", meta: {} }, { type: "done", finalText: "" }]);
   });
 });
 

@@ -14,7 +14,9 @@ process.env.CGPRO_SEND_CLICK_ATTEMPTS = "1";
 process.env.CGPRO_COMPOSER_PASTE_POLL_MS = "1";
 process.env.CGPRO_COMPOSER_PASTE_SETTLE_MAX_MS = "1";
 
-const { sendPrompt } = await import("../src/browser/conversation.js");
+import { PreSubmitInteractionError } from "../src/errors.js";
+
+const { sendPrompt, probePromptDelivery } = await import("../src/browser/conversation.js");
 
 // P-035 2026-09-18, the measured cause of the delivery losses. Typing the
 // prompt line by line runs it through ProseMirror's markdown input rules, and
@@ -117,4 +119,178 @@ describe("composer paste delivery", () => {
     await sendPrompt(page, prompt);
     expect(page.keyboard.insertText).toHaveBeenCalledTimes(3);
   });
-});
+  describe("forced delivery and probe contracts", () => {
+      it("reports paste when forced paste succeeds and never types", async () => {
+        const page = fakePage("all");
+        const probe = await probePromptDelivery(page, prompt, "paste");
+        expect(probe.deliveredBy).toBe("paste");
+        expect(probe.complete).toBe(true);
+        expect(probe.arrivedChars).toBe(probe.requestedChars);
+        expect(page.keyboard.insertText).not.toHaveBeenCalled();
+        expect(page.keyboard.press).not.toHaveBeenCalledWith("Shift+Enter");
+        // Probe cleanup: composer cleared afterwards
+        expect(composed).toBe("");
+      });
+
+      it("throws prompt_delivery_incomplete with zero typed fallback when forced paste lands nothing", async () => {
+        const page = fakePage("nothing");
+        let captured: unknown;
+        try {
+          await probePromptDelivery(page, prompt, "paste");
+        } catch (err) {
+          captured = err;
+        }
+        expect(captured).toBeInstanceOf(PreSubmitInteractionError);
+        expect((captured as PreSubmitInteractionError).code).toBe("prompt_delivery_incomplete");
+        expect((captured as PreSubmitInteractionError).phase).toBe("prompt_delivery");
+        expect(page.keyboard.insertText).not.toHaveBeenCalled();
+        expect(page.keyboard.press).not.toHaveBeenCalledWith("Shift+Enter");
+        // Probe cleanup: composer cleared even after failure
+        expect(composed).toBe("");
+      });
+
+      it("throws prompt_delivery_incomplete with zero typed fallback when forced paste cannot be dispatched", async () => {
+        const page = fakePage("throws");
+        let captured: unknown;
+        try {
+          await probePromptDelivery(page, prompt, "paste");
+        } catch (err) {
+          captured = err;
+        }
+        expect(captured).toBeInstanceOf(PreSubmitInteractionError);
+        expect((captured as PreSubmitInteractionError).code).toBe("prompt_delivery_incomplete");
+        expect(page.keyboard.insertText).not.toHaveBeenCalled();
+        expect(page.keyboard.press).not.toHaveBeenCalledWith("Shift+Enter");
+        expect(composed).toBe("");
+      });
+
+      it("forced typed never enters paste and reports typed delivery", async () => {
+        const plainPrompt = "first line\nsecond plain line\nthird line";
+        const page = fakePage("all");
+        const probe = await probePromptDelivery(page, plainPrompt, "typed");
+        expect(probe.deliveredBy).toBe("typed");
+        expect(page.keyboard.insertText).toHaveBeenCalledTimes(3);
+        expect(probe.complete).toBe(true);
+        expect(composed).toBe("");
+      });
+
+      it("auto mode retains conservative paste success and typed fallback contracts", async () => {
+        // Auto with paste success
+        const pageSuccess = fakePage("all");
+        const probeSuccess = await probePromptDelivery(pageSuccess, prompt);
+        expect(probeSuccess.deliveredBy).toBe("paste");
+        expect(pageSuccess.keyboard.insertText).not.toHaveBeenCalled();
+        expect(composed).toBe("");
+
+        // Auto with paste failure -> falls back to typing all lines
+        const pageFail = fakePage("nothing");
+        const probeFail = await probePromptDelivery(pageFail, prompt);
+        expect(probeFail.deliveredBy).toBe("typed");
+        expect(pageFail.keyboard.insertText).toHaveBeenCalledTimes(3);
+        expect(composed).toBe("");
+      });
+
+      it("recognises late-arriving paste and avoids typing duplicate content", async () => {
+        let settled = false;
+        const composer = {
+          innerText: async () => composed,
+          evaluate: async (_fn: unknown, body?: string) => {
+            if (body === undefined) {
+              if (settled) composed = prompt;
+              return composed.length;
+            }
+            settled = true;
+            return true;
+          },
+        };
+        const page = {
+          locator: vi.fn(() => ({ count: async () => 1, first: () => composer })),
+          keyboard: {
+            press: vi.fn(async (key: string) => {
+              if (key === "Shift+Enter") composed += "\n";
+              if (key === "Meta+A") selectedAll = true;
+              if (key === "Backspace") {
+                composed = selectedAll ? "" : composed.slice(0, -1);
+                selectedAll = false;
+              }
+            }),
+            type: vi.fn(async (text: string) => { composed += text; }),
+            insertText: vi.fn(async (text: string) => { composed += text; }),
+          },
+          waitForTimeout: vi.fn(async () => {}),
+          evaluate: vi.fn(async () => '{"stub":true}'),
+        } as unknown as Page;
+
+        const probe = await probePromptDelivery(page, prompt, "paste");
+        expect(probe.deliveredBy).toBe("paste");
+        expect(page.keyboard.insertText).not.toHaveBeenCalled();
+        expect(composed).toBe("");
+      });
+
+      it("reports divergence and landed text when probe detects a shortfall", async () => {
+        const shortfallRaw = "first line\nsecond ends in\nthird line";
+        const composer = {
+          innerText: async () => composed,
+          evaluate: async (_fn: unknown, body?: string) => {
+            if (body === undefined) return composed.length;
+            composed = shortfallRaw;
+            return true;
+          },
+        };
+        const page = {
+          locator: vi.fn(() => ({ count: async () => 1, first: () => composer })),
+          keyboard: {
+            press: vi.fn(async (key: string) => {
+              if (key === "Shift+Enter") composed += "\n";
+              if (key === "Meta+A") selectedAll = true;
+              if (key === "Backspace") {
+                composed = selectedAll ? "" : composed.slice(0, -1);
+                selectedAll = false;
+              }
+            }),
+            type: vi.fn(async (text: string) => { composed += text; }),
+            insertText: vi.fn(async (text: string) => { composed += text; }),
+          },
+          waitForTimeout: vi.fn(async () => {}),
+          evaluate: vi.fn(async () => '{"stub":true}'),
+        } as unknown as Page;
+
+        const probe = await probePromptDelivery(page, prompt, "paste");
+        expect(probe.deliveredBy).toBe("paste");
+        expect(probe.arrivedChars).toBeLessThan(probe.requestedChars);
+        expect(probe.divergence).toBeDefined();
+        expect(probe.landed).toBe("first line second ends in third line");
+        expect(composed).toBe("");
+      });
+
+      it.each(["nothing", "all"] as const)("keeps errors content-free when %s delivery and cleanup fail", async (mode) => {
+        const page = fakePage(mode);
+        const press = vi.mocked(page.keyboard.press);
+        const original = press.getMockImplementation()!;
+        let clears = 0;
+        press.mockImplementation(async (key, options) => {
+          if (key === "Backspace" && ++clears === 2) throw new Error("SECRET_CLEANUP_SENTINEL");
+          return original(key, options);
+        });
+        const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          const result = probePromptDelivery(page, prompt, "paste");
+          if (mode === "nothing") {
+            await expect(result).rejects.toMatchObject({
+              code: "prompt_delivery_incomplete",
+              phase: "prompt_delivery",
+              message: "forced paste delivery failed or was unconfirmed",
+            });
+            expect(warning).toHaveBeenCalledWith("[cgpro:composer] probe cleanup unverified after delivery failure");
+          } else {
+            await expect(result).rejects.toThrow("prompt delivery probe could not clear the composer");
+          }
+          expect(page.keyboard.insertText).not.toHaveBeenCalled();
+          expect(page.evaluate).not.toHaveBeenCalled();
+          expect(JSON.stringify(warning.mock.calls)).not.toContain("SECRET_CLEANUP_SENTINEL");
+        } finally {
+          warning.mockRestore();
+        }
+      });
+    });
+  });

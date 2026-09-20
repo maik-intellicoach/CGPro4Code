@@ -1006,7 +1006,24 @@ async function insertComposerText(
   text: string,
   force?: DeliveryPath,
 ): Promise<DeliveryPath> {
-  if (force !== "typed" && await pasteComposerText(page, text)) return "paste";
+  if (force !== "typed") {
+    if (process.env.CGPRO_SKIP_COMPOSER_PASTE === "1" && force !== "paste") {
+      await insertLines(page, text.split("\n"));
+      return "typed";
+    }
+    const composer = page.locator(joinSelectors(SELECTORS.composer)).first();
+    const before = await composerTextLength(composer);
+    if ((await pasteComposerText(page, text)) || (await pasteLandedLate(page, before))) {
+      return "paste";
+    }
+    if (force === "paste") {
+      throw new PreSubmitInteractionError(
+        "prompt_delivery_incomplete",
+        "prompt_delivery",
+        "forced paste delivery failed or was unconfirmed",
+      );
+    }
+  }
   await insertLines(page, text.split("\n"));
   return "typed";
 }
@@ -1065,7 +1082,7 @@ async function pasteComposerText(page: Page, text: string): Promise<boolean> {
     .then(() => true)
     .catch((error) => {
       console.error(
-        `[cgpro:composer] paste delivery could not be dispatched (${error instanceof Error ? error.message : String(error)}); typing instead`,
+        `[cgpro:composer] paste delivery could not be dispatched (${error instanceof Error ? error.message : String(error)})`,
       );
       return false;
     });
@@ -1151,36 +1168,46 @@ export async function probePromptDelivery(
   await page.waitForTimeout(120);
   await clearComposer(page);
   await focusComposerEnd(page, composer);
-  const deliveredBy = await insertComposerText(page, prompt, force);
+  let failed = false;
+  try {
+    const deliveredBy = await insertComposerText(page, prompt, force);
 
-  const want = normaliseComposerText(prompt);
-  const landed = await readComposer(page, composer);
-  const probe: PromptDeliveryProbe = {
-    requestedChars: want.length,
-    arrivedChars: landed?.length ?? -1,
-    complete: landed !== null && composerHoldsPrompt(landed, want),
-    deliveredBy,
-  };
-  // Also on a shortfall that PASSES the floor: the 2026-09-18 replay delivered
-  // 30 of 30 prompts whole by the completeness rule, while the largest of them
-  // arrived 193 characters short on all three lanes. A probe that hides the one
-  // number it exists to expose is worth nothing.
-  if (!probe.complete || (landed !== null && landed.length < want.length)) {
-    probe.divergence = landed === null
-      ? "composer unreadable"
-      : describeDivergence(landed, want);
-    if (landed !== null) probe.landed = landed;
+    const want = normaliseComposerText(prompt);
+    const landed = await readComposer(page, composer);
+    const probe: PromptDeliveryProbe = {
+      requestedChars: want.length,
+      arrivedChars: landed?.length ?? -1,
+      complete: landed !== null && composerHoldsPrompt(landed, want),
+      deliveredBy,
+    };
+    // Also on a shortfall that PASSES the floor: the 2026-09-18 replay delivered
+    // 30 of 30 prompts whole by the completeness rule, while the largest of them
+    // arrived 193 characters short on all three lanes. A probe that hides the one
+    // number it exists to expose is worth nothing.
+    if (!probe.complete || (landed !== null && landed.length < want.length)) {
+      probe.divergence = landed === null
+        ? "composer unreadable"
+        : describeDivergence(landed, want);
+      if (landed !== null) probe.landed = landed;
+    }
+    return probe;
+  } catch (error) {
+    failed = true;
+    throw error;
+  } finally {
+    try {
+      await clearComposer(page);
+      const residue = await readComposer(page, composer);
+      if (residue === null || residue.trim().length > 0) {
+        throw new Error("probe cleanup unverified");
+      }
+    } catch {
+      // Keep the typed delivery failure and never put composer contents into
+      // an error. The orchestrator's existing cleanup still guards this lane.
+      if (failed) console.warn("[cgpro:composer] probe cleanup unverified after delivery failure");
+      else throw new Error("prompt delivery probe could not clear the composer");
+    }
   }
-
-  await clearComposer(page);
-  const residue = await readComposer(page, composer);
-  if (residue === null || residue.trim().length > 0) {
-    throw new Error(
-      "prompt delivery probe could not clear the composer; the next turn on this lane would "
-      + `inherit it (residue=${JSON.stringify((residue ?? "<unreadable>").slice(0, 80))})`,
-    );
-  }
-  return probe;
 }
 
 /**
@@ -1620,10 +1647,10 @@ const COMPOSER_READ_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_COMPOSER_REA
  * A module-level counter is safe because a lane serialises turns behind a
  * single page lease; there is no second insert run to interleave with.
  */
-let lastInsert = { lines: 0, requested: 0, chars: 0, pasted: 0 };
+let lastInsert = { lines: 0, requested: 0, chars: 0 };
 
 async function insertLines(page: Page, lines: string[]): Promise<void> {
-  lastInsert = { lines: lines.length, requested: 0, chars: 0, pasted: 0 };
+  lastInsert = { lines: lines.length, requested: 0, chars: 0 };
   for (let i = 0; i < lines.length; i++) {
     if (i > 0) await page.keyboard.press("Shift+Enter");
     const line = lines[i];
@@ -1640,9 +1667,7 @@ async function insertLines(page: Page, lines: string[]): Promise<void> {
       const before = await composerTextLength(
         page.locator(joinSelectors(SELECTORS.composer)).first(),
       );
-      if (await pasteComposerText(page, line) || await pasteLandedLate(page, before)) {
-        lastInsert.pasted += 1;
-      } else {
+      if (!(await pasteComposerText(page, line) || await pasteLandedLate(page, before))) {
         await page.keyboard.insertText(line);
       }
     } else {
