@@ -986,6 +986,19 @@ export async function handleRequest(
       res.end(JSON.stringify({ ok: true, ...result }));
     } catch (error) {
       freezeTiming();
+      // P-035 2026-09-21. This diagnostic used to be emitted on the ask path only,
+      // so the one sanctioned NO-SUBMIT probe -- this preflight -- could fail at a
+      // selector gate and still leave the decisive evidence to be bought with a real
+      // paid turn. Emit the same bounded, content-free picture here, before the page
+      // is closed below. Diagnostics never mask the failure.
+      try {
+        const diagPage = await ownedPage;
+        if (diagPage && !diagPage.isClosed()) {
+          log.error(`selector diagnostic: ${await describeSelectorState(diagPage)}`);
+        }
+      } catch {
+        /* never let diagnostics mask the real failure */
+      }
       if (!cancelled) failure ??= classifyInteractionFailure(error);
       if (cancelled) {
         slot.interaction = { state: "degraded", checkedAt: new Date().toISOString(), failureCode: cancelled };
@@ -1483,6 +1496,9 @@ function readJsonBody<T>(
 async function describeSelectorState(page: Page): Promise<string> {
   const groups: Array<[string, string[]]> = [
     ["composer", SELECTORS.composer],
+    ["thinkingPowerButton", SELECTORS.thinkingPowerButton],
+    ["modelSwitcher", SELECTORS.modelSwitcher],
+    ["thinkingPowerSlider", SELECTORS.thinkingPowerSlider],
     ["projectsNavigation", SELECTORS.projectsNavigation],
     ["projectRows", SELECTORS.projectRows],
     ["chatTabRadio", SELECTORS.chatTabRadio],
@@ -1490,15 +1506,28 @@ async function describeSelectorState(page: Page): Promise<string> {
   const parts: string[] = [];
   for (const [name, candidates] of groups) {
     const counts: string[] = [];
-    for (const candidate of candidates.slice(0, 6)) {
-      const count = await page.locator(candidate).count().catch(() => -1);
-      counts.push(`${candidate}=${count}`);
+    for (const candidate of candidates.slice(0, 5)) {
+      // P-035 2026-09-21. The model-control gate matches a VISIBLE first element
+      // (`firstResolved` -> chatgpt.ts:257), but this diagnostic reported attached
+      // count alone, so "attached but invisible" and "absent" read identically --
+      // the one distinction that matters when that gate fails. Report both:
+      // `<attached>/<v|->`. Counts and booleans only; never page text.
+      const loc = page.locator(candidate);
+      const count = await loc.count().catch(() => -1);
+      const visible = count > 0 ? await loc.first().isVisible().catch(() => false) : false;
+      counts.push(`${candidate}=${count}/${visible ? "v" : "-"}`);
     }
     parts.push(`${name}[${counts.join(" ")}]`);
   }
+  // The Chat/Work surface decides whether the composer has a Pro tier at all, so
+  // record how many radios are actually checked, not just that one is mounted.
+  const checkedRadios = await page
+    .locator('[role="radio"][aria-checked="true"]')
+    .count()
+    .catch(() => -1);
   const editables = await page.locator('[contenteditable="true"]').count().catch(() => -1);
   const rows = await page.locator('[role="row"]').count().catch(() => -1);
-  return `${parts.join(" ")} contenteditable=${editables} roleRow=${rows}`
+  return `${parts.join(" ")} checkedRadios=${checkedRadios} contenteditable=${editables} roleRow=${rows}`
     .slice(0, 2000);
 }
 

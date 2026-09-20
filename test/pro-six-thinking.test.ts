@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "patchright";
+import { SelectorBrokenError } from "../src/errors.js";
 
 const requireSelector = vi.fn();
 const firstResolved = vi.fn();
@@ -99,6 +100,37 @@ describe("6 Pro maximum thinking admission", () => {
     requireSelector.mockReset().mockRejectedValue(new Error("6 Pro model missing"));
     await expect(ensureProSixMaximum(s.page)).rejects.toThrow("6 Pro model missing");
     expect(s.slider.focus).not.toHaveBeenCalled();
+  });
+
+  // P-035 2026-09-21. The real failure mode is a SelectorBrokenError from the
+  // resolver, and it used to propagate verbatim as "ChatGPT UI changed: selector
+  // ... no longer resolves" -- asserting a cause the code cannot know (the pill can
+  // be absent, present with an off-list label, or on a surface with no Pro tier)
+  // and leaving the daemon unable to mark the slot degraded, because
+  // server.ts:1343 needs a typed `ev.code`. It must now surface as a proven
+  // pre-submit refusal instead.
+  it("reports an unresolved 6 Pro control as a typed pre-submit failure, not a UI-change claim", async () => {
+    const s = setup();
+    requireSelector.mockReset().mockRejectedValue(new SelectorBrokenError("thinking control"));
+    await expect(ensureProSixMaximum(s.page)).rejects.toMatchObject({
+      code: "model_control_unresolved",
+      phase: "model_verification",
+      promptSubmitted: false,
+    });
+    // The lookup precedes the surrounding try/finally, so this path must still
+    // prove the menu closed rather than leaving a focus trap behind.
+    expect(s.page.evaluate).toHaveBeenCalled();
+    expect(s.slider.focus).not.toHaveBeenCalled();
+  });
+
+  // The conversion must not swallow anything it does not own.
+  it("propagates a non-selector failure from the model-control lookup unchanged", async () => {
+    const s = setup();
+    requireSelector.mockReset().mockRejectedValue(new Error("browser exploded"));
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow("browser exploded");
+    await expect(ensureProSixMaximum(s.page)).rejects.not.toMatchObject({
+      code: "model_control_unresolved",
+    });
   });
 
   it("accepts a timed-out activation when the live menu postcondition is already open", async () => {

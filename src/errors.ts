@@ -75,6 +75,7 @@ export class BotChallengeError extends CgproError {
 
 export type PreSubmitInteractionCode =
   | "model_control_activation_timeout"
+  | "model_control_unresolved"
   | "connector_control_activation_timeout"
   | "prompt_delivery_incomplete";
 

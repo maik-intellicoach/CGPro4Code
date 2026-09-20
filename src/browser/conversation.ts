@@ -2,7 +2,7 @@ import type { Page, Locator } from "patchright";
 import { SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
 import { listProjects } from "../api/projects.js";
-import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, TurnTimeoutError } from "../errors.js";
+import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, SelectorBrokenError, TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation } from "../core/stream.js";
 
 /**
@@ -180,7 +180,38 @@ export async function ensureProSixMaximum(
     onPhase?.(phase, failedPhase, failure);
   };
   mark("model-control-lookup");
-  const button = await requireSelector(page, SELECTORS.thinkingPowerButton, "thinking control");
+  let button: Locator;
+  try {
+    button = await requireSelector(page, SELECTORS.thinkingPowerButton, "thinking control");
+  } catch (error) {
+    if (!(error instanceof SelectorBrokenError)) throw error;
+    // P-035 2026-09-21. A miss here is NOT proof that ChatGPT's UI changed, and
+    // reporting it that way cost this project five turns. The pill can be absent,
+    // or present with a label outside the three text-exact candidates, or the page
+    // can be on a surface whose composer carries no Pro tier -- the code cannot
+    // tell those apart, so it must not assert the strongest one. What it CAN do is
+    // fail the turn as a proven pre-submit refusal with a closed code, which is
+    // what makes the daemon mark the slot degraded (server.ts:1343 needs ev.code)
+    // instead of leaving every consumer reading the lane as healthy.
+    // The surrounding `finally` cannot cover this path (the lookup precedes the
+    // try), so close any menu the earlier steps left open here, to the same
+    // prove-it-closed standard.
+    const unresolved = new PreSubmitInteractionError(
+      "model_control_unresolved",
+      "model_verification",
+      "ChatGPT 6 Pro model control did not resolve before submission",
+      { cause: error },
+    );
+    // Classify the TYPED error, not the raw one. The phase callback publishes
+    // `failure` upward and the preflight's outer catch uses `failure ??= ...`, so
+    // pre-classifying the raw SelectorBrokenError here would pin the reported code
+    // to `selector_unresolved` and the typed code would never be seen -- which is
+    // exactly what the first acceptance run after this change showed.
+    failedPhase = phase;
+    failure = classifyInteractionFailure(unresolved);
+    await closeOpenMenus(page, mark);
+    throw unresolved;
+  }
   mark("model-control-wait");
   await page.waitForTimeout(5_000);
   try {
