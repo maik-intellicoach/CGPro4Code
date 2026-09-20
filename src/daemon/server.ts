@@ -44,6 +44,7 @@ import { fetchModels, findProSlug, type ChatgptModel } from "../api/models.js";
 import {
   runAskOnSession,
   runInteractionPreflight,
+  type InteractionPreflightPhase,
   type AskOptions,
   type AskRunner,
 } from "../core/orchestrator.js";
@@ -693,10 +694,10 @@ export async function handleRequest(
   // in-flight count is returned so a caller knows what it audited.
   if (method === "GET" && url.pathname === "/selectors") {
     const slots = slotsOf(state);
-    const page = slots.map((slot) => slot.page).find((candidate): candidate is Page => candidate !== null);
+    const page = slots.map((slot) => slot.page).find((candidate): candidate is Page => candidate != null && !candidate.isClosed());
     if (!page) {
       res.writeHead(409, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "no_page", detail: "no slot holds a page yet" }));
+      res.end(JSON.stringify({ error: "no_page", detail: "no slot holds an open page" }));
       return;
     }
     const results: Array<{ key: string; candidates: string[]; firstWorking: number }> = [];
@@ -910,6 +911,8 @@ export async function handleRequest(
       return;
     }
     const slot = leaseSlot(state, "preflight");
+    let phase: InteractionPreflightPhase | "slot-page" = "slot-page";
+    let failedPhase: InteractionPreflightPhase | undefined;
     let cancelled: "interaction_preflight_timeout" | "interaction_preflight_disconnected" | undefined;
     let signalCancel!: () => void;
     const cancellation = new Promise<void>((resolve) => { signalCancel = resolve; });
@@ -932,7 +935,13 @@ export async function handleRequest(
           if (cancelled) throw new Error(cancelled);
         });
         if (cancelled) throw new Error(cancelled);
-        return await runInteractionPreflight(body, slotSession(state, slot, page));
+        return await runInteractionPreflight(body, slotSession(state, slot, page), (next, failed) => {
+          // Freeze evidence at cancellation; closing the page can trigger later cleanup.
+          if (!cancelled) {
+            phase = next;
+            failedPhase = failed;
+          }
+        });
       } finally {
         capture(null); // Only used if page creation failed before capturing a page.
       }
@@ -990,7 +999,8 @@ export async function handleRequest(
         res.end(JSON.stringify({
           error: "interaction_preflight_failed",
           ...(failureCode ? { code: failureCode } : {}),
-          ...(error instanceof PreSubmitInteractionError ? { phase: error.phase } : {}),
+          phase: cancelled ? phase : error instanceof PreSubmitInteractionError ? error.phase : phase,
+          ...(failedPhase ? { failedPhase } : {}),
         }));
       }
     } finally {

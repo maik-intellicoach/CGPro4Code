@@ -36,6 +36,7 @@ const {
   fetchDaemonAccountCapabilities,
   handleAsk,
   handleRequest,
+  slotsOf,
 } = await import("../src/daemon/server.js");
 import type { ServerState } from "../src/daemon/server.js";
 import type { Session } from "../src/browser/session.js";
@@ -763,6 +764,7 @@ describe("daemon-side selector audit", () => {
     const { SELECTORS } = await import("../src/browser/selectors.js");
     const working = SELECTORS.composer[0];
     const page = {
+      isClosed: () => false,
       locator: (selector: string) => ({
         first: () => ({ count: async () => (selector === working ? 1 : 0) }),
       }),
@@ -802,6 +804,7 @@ describe("daemon-side selector audit", () => {
   it("names the drift when a turn-critical selector stops resolving", async () => {
     const { SELECTORS, TURN_CRITICAL_SELECTORS } = await import("../src/browser/selectors.js");
     const page = {
+      isClosed: () => false,
       locator: () => ({ first: () => ({ count: async () => 0 }) }),
     };
     const state = fakeState({ session: { page } as unknown as Session });
@@ -828,6 +831,7 @@ describe("daemon-side selector audit", () => {
     const { SELECTORS } = await import("../src/browser/selectors.js");
     const working = SELECTORS.thinkingPowerButton[1];
     const page = {
+      isClosed: () => false,
       locator: (selector: string) => ({
         first: () => ({ count: async () => (selector === working ? 1 : 0) }),
       }),
@@ -848,6 +852,24 @@ describe("daemon-side selector audit", () => {
     };
     expect(body.results.find((row) => row.key === "thinkingPowerButton")?.firstWorking).toBe(1);
     expect(body.missingCritical).not.toContain("thinkingPowerButton");
+  });
+
+  it.each([false, true])("ignores closed pages, open sibling available: %s", async (hasOpenSibling) => {
+    const closed = { isClosed: () => true, locator: vi.fn() };
+    const open = {
+      isClosed: () => false,
+      locator: vi.fn(() => ({ first: () => ({ count: async () => 1 }) })),
+    };
+    const state = fakeState({ maxSlots: 2, session: { page: closed } as unknown as Session });
+    if (hasOpenSibling) slotsOf(state)[1].page = open as unknown as import("patchright").Page;
+    const req = new FakeReq();
+    Object.assign(req, { method: "GET", url: "/selectors", headers: { authorization: "Bearer test-token" } });
+    const res = new FakeRes();
+    await handleRequest(req as unknown as IncomingMessage, res as unknown as ServerResponse, state);
+    expect(closed.locator).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(hasOpenSibling ? 200 : 409);
+    if (hasOpenSibling) expect(open.locator).toHaveBeenCalled();
+    else expect(parseJsonBody(res)).toEqual({ error: "no_page", detail: "no slot holds an open page" });
   });
 
   it("refuses when no slot holds a page yet", async () => {

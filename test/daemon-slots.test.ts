@@ -323,6 +323,17 @@ describe("bounded preflight lease lifecycle", () => {
     await next.pending;
     expect(session.context.newPage).toHaveBeenCalledOnce();
     expect(runInteractionPreflight.mock.calls[1][1].page).not.toBe(page);
+    const recreated = await vi.mocked(session.context.newPage).mock.results[0].value;
+    expect(state.session.page).toBe(recreated);
+    expect(state.slots![0].page).toBe(recreated);
+    expect(runInteractionPreflight.mock.calls[1][1].page).toBe(recreated);
+    const paid = pendingRunner("recreated-slot-zero");
+    runAskOnSession.mockReturnValue(paid.runner);
+    const paidRequest = ask(state, "recreated-invocation");
+    await flush();
+    expect(runAskOnSession.mock.calls[0][1].page).toBe(recreated);
+    paid.finish();
+    await paidRequest.pending;
   });
 
   it.each(["throws", "hangs", "returns without closure"])("quarantines when page close %s, even if work later settles", async (mode) => {
@@ -444,6 +455,38 @@ describe("bounded preflight lease lifecycle", () => {
     expect(runInteractionPreflight).not.toHaveBeenCalled();
     expect(state.queue.busy).toBe(true);
     expect(state.interaction.failureCode).toBe("interaction_preflight_recovery_required");
+  });
+
+
+  it.each(["prompt-delivery", "cleanup-home", "cleanup-composer"])("freezes content-free timeout evidence at %s", async (phase) => {
+    const { state, page } = fixture();
+    const work = deferred();
+    let observer!: (phase: string, failed?: string) => void;
+    const failed = phase.startsWith("cleanup-") ? "connector" : undefined;
+    runInteractionPreflight.mockImplementation((_opts, _session, report) => {
+      observer = report;
+      report(phase, failed);
+      return work.promise;
+    });
+    const originalClose = page.close.getMockImplementation()!;
+    page.close.mockImplementation(async () => {
+      await originalClose();
+      // Browser closure can advance finally; it must not overwrite deadline evidence.
+      observer("cleanup-composer", failed);
+      work.reject(new Error("private prompt/account/https://private.example/"));
+    });
+    const request = call(state, "POST", "/preflight", {
+      ...body, probePrompt: "private prompt", expectedAccountEmail: "private@private.example",
+    });
+    await flush();
+    await vi.advanceTimersByTimeAsync(290_000);
+    await request.pending;
+    expect(JSON.parse(request.res.writes.join(""))).toEqual({
+      error: "interaction_preflight_failed", code: "interaction_preflight_timeout",
+      phase, ...(failed ? { failedPhase: failed } : {}),
+    });
+    expect(request.res.writes.join("")).not.toContain("private");
+    expect(state.queue.busy).toBe(false);
   });
 
 });

@@ -7,7 +7,7 @@ import { archiveSavedConversation } from "../src/api/conversation-filing.js";
 import { AskQueue, PreAdmissionReaderBudget, handleRequest, type ServerState } from "../src/daemon/server.js";
 const identity = { conversationId: "6aa51e0c-0688-83ec-a868-8dffde427046", projectId: "g-p-fixture", expectedEmail: "fixture@example.com", fingerprint: "a".repeat(64) };
 function state(): ServerState {
-  return { session: { page: {} } as Session, token: "fixture", startedAt: new Date(), background: true, queue: new AskQueue(8, 60_000), readerBudget: new PreAdmissionReaderBudget(8), askInFlight: false, currentInvocation: null, currentRunner: null, currentConversation: null, lastConversation: null, reloadConversation: null };
+  return { session: { page: { isClosed: () => false } } as Session, token: "fixture", startedAt: new Date(), background: true, queue: new AskQueue(8, 60_000), readerBudget: new PreAdmissionReaderBudget(8), askInFlight: false, currentInvocation: null, currentRunner: null, currentConversation: null, lastConversation: null, reloadConversation: null };
 }
 async function request(s: ServerState, body: unknown = identity, token = "fixture") {
   const req = Object.assign(new EventEmitter(), { method: "POST", url: "/archive-saved", headers: { authorization: `Bearer ${token}` }, setEncoding() {} });

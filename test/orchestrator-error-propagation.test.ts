@@ -122,12 +122,28 @@ describe("runInteractionPreflight cleanup", () => {
     );
   });
 
-  it("preserves the verification failure when cleanup also fails", async () => {
-    setConnector.mockRejectedValueOnce(new Error("connector verification failed"));
+  it("preserves the original error while reporting cleanup and the failed verification phase", async () => {
+    const original = new Error("private connector/account detail");
+    const onPhase = vi.fn();
+    setConnector.mockRejectedValueOnce(original);
     goHome.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("cleanup navigation failed"));
-    await expect(runInteractionPreflight(options, preflightSession())).rejects.toThrow(
-      "connector verification failed",
+    await expect(runInteractionPreflight(options, preflightSession(), onPhase)).rejects.toBe(original);
+    expect(onPhase.mock.calls).toEqual([
+      ["home", undefined], ["login", undefined], ["account-home", undefined],
+      ["project", undefined], ["account-project", undefined], ["composer", undefined],
+      ["connector", undefined], ["cleanup-escape", "connector"],
+      ["cleanup-home", "connector"], ["cleanup-composer", "connector"],
+    ]);
+    expect(JSON.stringify(onPhase.mock.calls)).not.toContain("private");
+  });
+
+  it("reports the first cleanup failure separately from the following cleanup step", async () => {
+    const onPhase = vi.fn();
+    goHome.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("cleanup failed"));
+    await expect(runInteractionPreflight(options, preflightSession(), onPhase)).rejects.toThrow(
+      "interaction preflight cleanup failed",
     );
+    expect(onPhase).toHaveBeenLastCalledWith("cleanup-composer", "cleanup-home");
   });
 });
 

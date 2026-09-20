@@ -96,28 +96,50 @@ export interface InteractionPreflightResult {
   promptDelivery?: PromptDeliveryProbe;
 }
 
+/** Fixed labels only: no prompt, account, connector or URL enters phase evidence. */
+export type InteractionPreflightPhase =
+  | "home" | "login" | "account-home" | "project" | "account-project"
+  | "composer" | "connector" | "model" | "prompt-delivery"
+  | "cleanup-escape" | "cleanup-home" | "cleanup-composer";
+
 /** Verify current controls on an idle daemon lane without submitting a prompt. */
 export async function runInteractionPreflight(
   opts: InteractionPreflightOptions,
   session: Session,
+  onPhase?: (phase: InteractionPreflightPhase, failedPhase?: InteractionPreflightPhase) => void,
 ): Promise<InteractionPreflightResult> {
   const page = session.page;
   let verificationError: unknown;
+  let phase: InteractionPreflightPhase = "home";
+  let failedPhase: InteractionPreflightPhase | undefined;
+  const mark = (next: InteractionPreflightPhase): void => {
+    phase = next;
+    onPhase?.(phase, failedPhase);
+  };
   try {
+    mark("home");
     await goHome(page);
+    mark("login");
     if (!(await isLoggedIn(page, 10_000))) throw new NotLoggedInError();
+    mark("account-home");
     await requireAccount(page, opts.expectedAccountEmail);
+    mark("project");
     await openConversation(page, {
       model: opts.model,
       gizmoId: opts.gizmoId,
       gizmoShortUrl: opts.gizmoShortUrl,
     });
+    mark("account-project");
     await requireAccount(page, opts.expectedAccountEmail);
+    mark("composer");
     await clearComposer(page);
+    mark("connector");
     await setConnector(page, opts.connector);
+    mark("model");
     const selection = await ensureProSixMaximum(page);
     // Last, so the probe runs against exactly the controls a real turn would
     // use: same account, same Project, same connector, same model selection.
+    if (opts.probePrompt !== undefined) mark("prompt-delivery");
     const promptDelivery = opts.probePrompt === undefined
       ? undefined
       : await probePromptDelivery(page, opts.probePrompt, opts.probeDeliveryPath);
@@ -130,21 +152,27 @@ export async function runInteractionPreflight(
       ...(promptDelivery === undefined ? {} : { promptDelivery }),
     };
   } catch (error) {
+    failedPhase = phase;
     verificationError = error;
     throw error;
   } finally {
+    mark("cleanup-escape");
     await page.keyboard.press("Escape").catch(() => undefined);
     // A fresh home composer prevents connector state from leaking into a
     // later connector-off route on this persistent browser session.
     let cleanupError: unknown;
     try {
+      mark("cleanup-home");
       await goHome(page, { model: opts.model });
     } catch (error) {
+      failedPhase ??= phase;
       cleanupError = error;
     }
     try {
+      mark("cleanup-composer");
       await clearComposer(page);
     } catch (error) {
+      failedPhase ??= phase;
       cleanupError ??= error;
     }
     if (verificationError === undefined && cleanupError !== undefined) {
