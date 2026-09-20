@@ -128,11 +128,11 @@ describe("runInteractionPreflight cleanup", () => {
     setConnector.mockRejectedValueOnce(original);
     goHome.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("cleanup navigation failed"));
     await expect(runInteractionPreflight(options, preflightSession(), onPhase)).rejects.toBe(original);
-    expect(onPhase.mock.calls).toEqual([
+    expect(onPhase.mock.calls.map(([phase, failed]) => [phase, failed])).toEqual([
       ["home", undefined], ["login", undefined], ["account-home", undefined],
       ["project", undefined], ["account-project", undefined], ["composer", undefined],
-      ["connector", undefined], ["cleanup-escape", "connector"],
-      ["cleanup-home", "connector"], ["cleanup-composer", "connector"],
+      ["connector", undefined], ["connector", "connector"], ["cleanup-escape", "connector"],
+      ["cleanup-home", "connector"], ["cleanup-home", "connector"], ["cleanup-composer", "connector"],
     ]);
     expect(JSON.stringify(onPhase.mock.calls)).not.toContain("private");
   });
@@ -140,13 +140,13 @@ describe("runInteractionPreflight cleanup", () => {
   it("threads model subphases and retains the original failure through outer cleanup", async () => {
     const original = new Error("model failed");
     ensureProSixMaximum.mockImplementationOnce(async (_page, report) => {
-      report("model-cleanup-menu-count", "model-slider-focus");
+      report("model-cleanup-menu-count", "model-slider-focus", { code: "browser_operation_timeout" });
       throw original;
     });
     const onPhase = vi.fn();
     await expect(runInteractionPreflight(options, preflightSession(), onPhase)).rejects.toBe(original);
-    expect(onPhase).toHaveBeenCalledWith("model-cleanup-menu-count", "model-slider-focus");
-    expect(onPhase).toHaveBeenLastCalledWith("cleanup-composer", "model-slider-focus");
+    expect(onPhase).toHaveBeenCalledWith("model-cleanup-menu-count", "model-slider-focus", { code: "browser_operation_timeout" });
+    expect(onPhase).toHaveBeenLastCalledWith("cleanup-composer", "model-slider-focus", { code: "browser_operation_timeout" });
   });
 
   it("reports the first cleanup failure separately from the following cleanup step", async () => {
@@ -155,7 +155,7 @@ describe("runInteractionPreflight cleanup", () => {
     await expect(runInteractionPreflight(options, preflightSession(), onPhase)).rejects.toThrow(
       "interaction preflight cleanup failed",
     );
-    expect(onPhase).toHaveBeenLastCalledWith("cleanup-composer", "cleanup-home");
+    expect(onPhase).toHaveBeenLastCalledWith("cleanup-composer", "cleanup-home", { code: "unclassified_error" });
   });
 });
 

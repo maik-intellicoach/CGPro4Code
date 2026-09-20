@@ -1,3 +1,5 @@
+import { errors as browserErrors } from "patchright";
+
 export class CgproError extends Error {
   readonly exitCode: number;
   readonly hint?: string;
@@ -94,4 +96,28 @@ export class PreSubmitInteractionError extends Error {
     super(message, options);
     this.name = "PreSubmitInteractionError";
   }
+}
+
+
+export interface InteractionFailure {
+  code: PreSubmitInteractionCode | "selector_unresolved" | "not_logged_in"
+    | "browser_operation_timeout" | "project_list_unavailable"
+    | "project_identity_unverified" | "unclassified_error";
+  httpStatus?: number;
+}
+
+/** Closed classification boundary: never return message, name, URL, stack or cause. */
+export function classifyInteractionFailure(error: unknown): InteractionFailure {
+  if (error instanceof PreSubmitInteractionError) return { code: error.code };
+  if (error instanceof SelectorBrokenError) return { code: "selector_unresolved" };
+  if (error instanceof NotLoggedInError) return { code: "not_logged_in" };
+  if (error instanceof browserErrors.TimeoutError) return { code: "browser_operation_timeout" };
+  if (error instanceof Error) {
+    const status = /^ChatGPT project list unavailable \(HTTP ([1-5][0-9]{2})\)$/.exec(error.message);
+    if (status) return { code: "project_list_unavailable", httpStatus: Number(status[1]) };
+    if (error.message === "Requested ChatGPT Project could not be uniquely identified") {
+      return { code: "project_identity_unverified" };
+    }
+  }
+  return { code: "unclassified_error" };
 }

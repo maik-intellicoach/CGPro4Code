@@ -48,7 +48,7 @@ import {
   type AskOptions,
   type AskRunner,
 } from "../core/orchestrator.js";
-import { NotLoggedInError, PreSubmitInteractionError, SelectorBrokenError } from "../errors.js";
+import { classifyInteractionFailure, type InteractionFailure, NotLoggedInError, PreSubmitInteractionError, SelectorBrokenError } from "../errors.js";
 import { SELECTORS, TURN_CRITICAL_SELECTORS, type SelectorSet } from "../browser/selectors.js";
 import {
   clearDaemonInfo,
@@ -913,10 +913,24 @@ export async function handleRequest(
     const slot = leaseSlot(state, "preflight");
     let phase: InteractionPreflightPhase | "slot-page" = "slot-page";
     let failedPhase: InteractionPreflightPhase | undefined;
+    let failure: InteractionFailure | undefined;
+    const startedAt = performance.now();
+    let phaseStartedAt = startedAt;
+    let stoppedAt: number | undefined;
+    const timeline: Array<{ phase: InteractionPreflightPhase | "slot-page"; startedMs: number; durationMs: number }> = [
+      { phase, startedMs: 0, durationMs: 0 },
+    ];
+    let activeTiming: typeof timeline[number] | undefined = timeline[0];
+    let timelineTruncated = false;
+    const freezeTiming = (): void => {
+      stoppedAt ??= performance.now();
+      if (activeTiming) activeTiming.durationMs = Math.round(stoppedAt - phaseStartedAt);
+    };
     let cancelled: "interaction_preflight_timeout" | "interaction_preflight_disconnected" | undefined;
     let signalCancel!: () => void;
     const cancellation = new Promise<void>((resolve) => { signalCancel = resolve; });
     const cancel = (reason: typeof cancelled): void => {
+      freezeTiming();
       cancelled ??= reason;
       signalCancel();
     };
@@ -935,11 +949,24 @@ export async function handleRequest(
           if (cancelled) throw new Error(cancelled);
         });
         if (cancelled) throw new Error(cancelled);
-        return await runInteractionPreflight(body, slotSession(state, slot, page), (next, failed) => {
+        return await runInteractionPreflight(body, slotSession(state, slot, page), (next, failed, originalFailure) => {
           // Freeze evidence at cancellation; closing the page can trigger later cleanup.
           if (!cancelled) {
-            phase = next;
+            if (next !== phase) {
+              const now = performance.now();
+              if (activeTiming) activeTiming.durationMs = Math.round(now - phaseStartedAt);
+              phaseStartedAt = now;
+              activeTiming = undefined;
+              if (timeline.length < 64) {
+                activeTiming = { phase: next, startedMs: Math.round(now - startedAt), durationMs: 0 };
+                timeline.push(activeTiming);
+              } else {
+                timelineTruncated = true;
+              }
+              phase = next;
+            }
             failedPhase = failed;
+            failure ??= originalFailure;
           }
         });
       } finally {
@@ -958,6 +985,8 @@ export async function handleRequest(
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, ...result }));
     } catch (error) {
+      freezeTiming();
+      if (!cancelled) failure ??= classifyInteractionFailure(error);
       if (cancelled) {
         slot.interaction = { state: "degraded", checkedAt: new Date().toISOString(), failureCode: cancelled };
         // A timed-out promise is still running. Never release its page to a new
@@ -988,7 +1017,7 @@ export async function handleRequest(
         if (!release) slot.leasedBy = "preflight-quarantined";
       }
       const failureCode = !release ? "interaction_preflight_recovery_required"
-        : cancelled ?? (error instanceof PreSubmitInteractionError ? error.code : undefined);
+        : cancelled ?? failure?.code;
       slot.interaction = {
         state: "degraded",
         checkedAt: new Date().toISOString(),
@@ -1001,6 +1030,11 @@ export async function handleRequest(
           ...(failureCode ? { code: failureCode } : {}),
           phase: cancelled ? phase : error instanceof PreSubmitInteractionError ? error.phase : phase,
           ...(failedPhase ? { failedPhase } : {}),
+          ...(failure ? { failure } : {}),
+          elapsedMs: Math.round(stoppedAt! - startedAt),
+          phaseElapsedMs: Math.round(stoppedAt! - phaseStartedAt),
+          timeline,
+          timelineTruncated,
         }));
       }
     } finally {

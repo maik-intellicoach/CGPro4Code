@@ -8,6 +8,7 @@ import {
   openConversation,
   ensureProSixMaximum,
   type ModelVerificationPhase,
+  type ProjectNavigationPhase,
   probePromptDelivery,
   type DeliveryPath,
   type PromptDeliveryProbe,
@@ -24,7 +25,7 @@ import {
   StreamEmitter,
   type StreamEvent,
 } from "./stream.js";
-import { NotLoggedInError, PreSubmitInteractionError } from "../errors.js";
+import { classifyInteractionFailure, type InteractionFailure, NotLoggedInError, PreSubmitInteractionError } from "../errors.js";
 import { requireAccount, verifyFiling, type FilingProof } from "../api/conversation-filing.js";
 import { joinSelectors, SELECTORS as SELECTORS_DUMP } from "../browser/selectors.js";
 import { fetchLatestTurnConnectorState, type LatestTurnConnectorState, fetchLatestNativeResearchReport, fetchNativeResearchUserNodes, type NativeResearchReport } from "../api/conversations.js";
@@ -99,7 +100,7 @@ export interface InteractionPreflightResult {
 
 /** Fixed labels only: no prompt, account, connector or URL enters phase evidence. */
 export type InteractionPreflightPhase =
-  | ModelVerificationPhase
+  | ModelVerificationPhase | ProjectNavigationPhase
   | "home" | "login" | "account-home" | "project" | "account-project"
   | "composer" | "connector" | "model" | "prompt-delivery"
   | "cleanup-escape" | "cleanup-home" | "cleanup-composer";
@@ -108,15 +109,16 @@ export type InteractionPreflightPhase =
 export async function runInteractionPreflight(
   opts: InteractionPreflightOptions,
   session: Session,
-  onPhase?: (phase: InteractionPreflightPhase, failedPhase?: InteractionPreflightPhase) => void,
+  onPhase?: (phase: InteractionPreflightPhase, failedPhase?: InteractionPreflightPhase, failure?: InteractionFailure) => void,
 ): Promise<InteractionPreflightResult> {
   const page = session.page;
   let verificationError: unknown;
   let phase: InteractionPreflightPhase = "home";
   let failedPhase: InteractionPreflightPhase | undefined;
+  let failure: InteractionFailure | undefined;
   const mark = (next: InteractionPreflightPhase): void => {
     phase = next;
-    onPhase?.(phase, failedPhase);
+    onPhase?.(phase, failedPhase, failure);
   };
   try {
     mark("home");
@@ -130,7 +132,7 @@ export async function runInteractionPreflight(
       model: opts.model,
       gizmoId: opts.gizmoId,
       gizmoShortUrl: opts.gizmoShortUrl,
-    });
+    }, mark);
     mark("account-project");
     await requireAccount(page, opts.expectedAccountEmail);
     mark("composer");
@@ -138,8 +140,9 @@ export async function runInteractionPreflight(
     mark("connector");
     await setConnector(page, opts.connector);
     mark("model");
-    const selection = await ensureProSixMaximum(page, (next, failed) => {
+    const selection = await ensureProSixMaximum(page, (next, failed, originalFailure) => {
       failedPhase ??= failed;
+      failure ??= originalFailure;
       mark(next);
     });
     // Last, so the probe runs against exactly the controls a real turn would
@@ -158,6 +161,8 @@ export async function runInteractionPreflight(
     };
   } catch (error) {
     failedPhase ??= phase;
+    failure ??= classifyInteractionFailure(error);
+    onPhase?.(phase, failedPhase, failure);
     verificationError = error;
     throw error;
   } finally {
@@ -171,6 +176,8 @@ export async function runInteractionPreflight(
       await goHome(page, { model: opts.model });
     } catch (error) {
       failedPhase ??= phase;
+      failure ??= classifyInteractionFailure(error);
+      onPhase?.(phase, failedPhase, failure);
       cleanupError = error;
     }
     try {
@@ -178,6 +185,8 @@ export async function runInteractionPreflight(
       await clearComposer(page);
     } catch (error) {
       failedPhase ??= phase;
+      failure ??= classifyInteractionFailure(error);
+      onPhase?.(phase, failedPhase, failure);
       cleanupError ??= error;
     }
     if (verificationError === undefined && cleanupError !== undefined) {

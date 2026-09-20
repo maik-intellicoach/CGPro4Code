@@ -79,7 +79,15 @@ beforeEach(() => { vi.clearAllMocks(); projects.mockResolvedValue([target]); });
 describe("Project directory navigation", () => {
   it("opens a uniquely identified Project through its row without a cold Project navigation", async () => {
     const { page, rowClick } = pageFor();
-    await openConversation(page, { gizmoId: target.id });
+    const onPhase = vi.fn();
+    await openConversation(page, { gizmoId: target.id }, onPhase);
+    expect(onPhase.mock.calls.map(([phase]) => phase)).toEqual([
+      "project-home", "project-chat-surface", "project-list-wait", "project-list",
+      "project-identity", "project-navigation-lookup", "project-navigation-wait",
+      "project-navigation-click", "project-row-wait", "project-label-wait",
+      "project-label-click", "project-destination-wait", "project-composer", "project-chat-surface",
+    ]);
+    expect(JSON.stringify(onPhase.mock.calls)).not.toContain(target.id);
     expect(rowClick).toHaveBeenCalledOnce();
     expect(page.goto).not.toHaveBeenCalled();
     expect(requireSelector.mock.calls.some(c => c[2] === "composer")).toBe(true);
@@ -189,4 +197,15 @@ describe("Project directory sidebar click", () => {
       /Projects navigation could not be clicked after 3 attempts \(matches=2, visible=0/,
     );
   });
+
+  it("identifies the actual failing Project step without exposing its error text", async () => {
+    const { page, labelWait } = pageFor();
+    const original = new Error("private project name and URL");
+    labelWait.mockRejectedValueOnce(original);
+    const onPhase = vi.fn();
+    await expect(openConversation(page, { gizmoId: target.id }, onPhase)).rejects.toBe(original);
+    expect(onPhase).toHaveBeenLastCalledWith("project-label-wait");
+    expect(JSON.stringify(onPhase.mock.calls)).not.toContain("private");
+  });
+
 });

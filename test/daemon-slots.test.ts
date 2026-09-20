@@ -484,9 +484,74 @@ describe("bounded preflight lease lifecycle", () => {
     expect(JSON.parse(request.res.writes.join(""))).toEqual({
       error: "interaction_preflight_failed", code: "interaction_preflight_timeout",
       phase, ...(failed ? { failedPhase: failed } : {}),
+      elapsedMs: expect.any(Number), phaseElapsedMs: expect.any(Number),
+      timeline: expect.any(Array), timelineTruncated: false,
     });
     expect(request.res.writes.join("")).not.toContain("private");
     expect(state.queue.busy).toBe(false);
+  });
+
+
+  it("distinguishes a late model stage from the whole budget and freezes before close", async () => {
+    let now = 0;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+    try {
+      const { state, page } = fixture();
+      const work = deferred();
+      let report!: (phase: string, failed?: string, failure?: { code: string }) => void;
+      runInteractionPreflight.mockImplementation((_opts, _session, observer) => { report = observer; return work.promise; });
+      const originalClose = page.close.getMockImplementation()!;
+      page.close.mockImplementation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+        await originalClose();
+        report("cleanup-composer", "model-slider-focus", { code: "unclassified_error" });
+        work.reject(new Error("closed"));
+      });
+      const request = call(state, "POST", "/preflight", body);
+      await flush();
+      now = 1_000;
+      report("project-row-wait");
+      await vi.advanceTimersByTimeAsync(138_000);
+      now = 138_000;
+      report("model-slider-focus");
+      now = 140_000;
+      await vi.advanceTimersByTimeAsync(2_000);
+      now = 145_000;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await request.pending;
+      expect(JSON.parse(request.res.writes.join(""))).toEqual({
+        error: "interaction_preflight_failed", code: "interaction_preflight_timeout",
+        phase: "model-slider-focus", elapsedMs: 140_000, phaseElapsedMs: 2_000,
+        timeline: [
+          { phase: "slot-page", startedMs: 0, durationMs: 1_000 },
+          { phase: "project-row-wait", startedMs: 1_000, durationMs: 137_000 },
+          { phase: "model-slider-focus", startedMs: 138_000, durationMs: 2_000 },
+        ], timelineTruncated: false,
+      });
+    } finally { clock.mockRestore(); }
+  });
+
+  it("caps the timeline and retains original classified failure through cancellation", async () => {
+    const { state, page } = fixture();
+    const work = deferred();
+    runInteractionPreflight.mockImplementation((_opts, _session, report) => {
+      for (let i = 0; i < 70; i++) report(i % 2 ? "project-row-wait" : "project-row-retry-wait");
+      report("cleanup-home", "project-row-wait", { code: "browser_operation_timeout" });
+      return work.promise;
+    });
+    const originalClose = page.close.getMockImplementation()!;
+    page.close.mockImplementation(async () => { await originalClose(); work.reject(new Error("private")); });
+    const request = call(state, "POST", "/preflight", body);
+    await flush();
+    await vi.advanceTimersByTimeAsync(140_000);
+    await request.pending;
+    const result = JSON.parse(request.res.writes.join(""));
+    expect(result.timeline).toHaveLength(64);
+    expect(result.timelineTruncated).toBe(true);
+    expect(result.phase).toBe("cleanup-home");
+    expect(result.failedPhase).toBe("project-row-wait");
+    expect(result.failure).toEqual({ code: "browser_operation_timeout" });
+    expect(request.res.writes.join("")).not.toContain("private");
   });
 
 });

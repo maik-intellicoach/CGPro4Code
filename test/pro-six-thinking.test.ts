@@ -160,7 +160,7 @@ describe("6 Pro maximum thinking admission", () => {
     s.slider.focus.mockImplementationOnce(() => new Promise<void>((resolve) => { resume = resolve; }));
     const pending = ensureProSixMaximum(s.page, onPhase);
     for (let i = 0; i < 30; i++) await Promise.resolve();
-    expect(onPhase).toHaveBeenLastCalledWith("model-slider-focus", undefined);
+    expect(onPhase).toHaveBeenLastCalledWith("model-slider-focus", undefined, undefined);
     resume();
     await pending;
     expect(onPhase.mock.calls.map(([phase]) => phase)).toEqual([
@@ -182,7 +182,7 @@ describe("6 Pro maximum thinking admission", () => {
     const pending = ensureProSixMaximum(s.page, onPhase);
     const rejected = expect(pending).rejects.toBe(original);
     for (let i = 0; i < 30; i++) await Promise.resolve();
-    expect(onPhase).toHaveBeenLastCalledWith("model-cleanup-menu-count", "model-slider-focus");
+    expect(onPhase).toHaveBeenLastCalledWith("model-cleanup-menu-count", "model-slider-focus", { code: "unclassified_error" });
     expect(JSON.stringify(onPhase.mock.calls)).not.toContain("private");
     resume(0);
     await rejected;

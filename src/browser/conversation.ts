@@ -2,7 +2,7 @@ import type { Page, Locator } from "patchright";
 import { SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
 import { listProjects } from "../api/projects.js";
-import { PreSubmitInteractionError, TurnTimeoutError } from "../errors.js";
+import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation } from "../core/stream.js";
 
 /**
@@ -18,17 +18,27 @@ import { setExpectedReloadNavigation } from "../core/stream.js";
  * resulting conversation is not addressable by URL, which makes
  * multi-turn auto-resume impossible.
  */
+export type ProjectNavigationPhase =
+  | "project-home" | "project-chat-surface" | "project-list-wait" | "project-list"
+  | "project-identity" | "project-navigation-lookup" | "project-navigation-wait"
+  | "project-navigation-click" | "project-row-wait" | "project-row-retry-wait"
+  | "project-label-wait" | "project-label-click" | "project-destination-wait"
+  | "project-composer" | "project-model";
+
 export async function openConversation(
   page: Page,
   opts: { model?: string; conversationId?: string; gizmoId?: string; gizmoShortUrl?: string } = {},
+  onPhase?: (phase: ProjectNavigationPhase) => void,
 ): Promise<void> {
   if (opts.conversationId) {
+    onPhase?.("project-home");
     await page.goto(`https://chatgpt.com/c/${opts.conversationId}`, {
       waitUntil: "domcontentloaded",
       timeout: 60_000,
     });
   } else if (opts.gizmoId || opts.gizmoShortUrl) {
     const slug = opts.gizmoShortUrl ?? opts.gizmoId!;
+    onPhase?.("project-home");
     await goHome(page, { model: opts.model });
     // The Project directory row below is this branch's real readiness gate;
     // the home composer was a surface-dependent proxy for the same thing, and
@@ -37,9 +47,13 @@ export async function openConversation(
     // never types into) failed a check that exists to enable the switch
     // (P-035 planning-lane incident 2026-09-16: five of eight dispatches).
     // ensureChatTab is idempotent; it no-ops on a single-surface UI.
+    onPhase?.("project-chat-surface");
     await ensureChatTab(page);
+    onPhase?.("project-list-wait");
     await page.waitForTimeout(5_000);
+    onPhase?.("project-list");
     const projects = await listProjects(page);
+    onPhase?.("project-identity");
     const project = projects.find((p) =>
       (!opts.gizmoId || p.id === opts.gizmoId) &&
       (p.id === slug || p.shortUrl === slug));
@@ -59,8 +73,11 @@ export async function openConversation(
       }
     };
     if (!onProjectsDirectory()) {
+      onPhase?.("project-navigation-lookup");
       await requireSelectorPatient(page, SELECTORS.projectsNavigation, "Projects navigation");
+      onPhase?.("project-navigation-wait");
       await page.waitForTimeout(5_000);
+      onPhase?.("project-navigation-click");
       await clickFirstActionable(
         page, SELECTORS.projectsNavigation, "Projects navigation", 3, onProjectsDirectory,
       );
@@ -76,10 +93,12 @@ export async function openConversation(
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         row = rowLocator();
+        onPhase?.("project-row-wait");
         await row.waitFor({ state: "visible", timeout: 20_000 });
         break;
       } catch (error) {
         if (attempt === 2 || page.isClosed()) throw error;
+        onPhase?.("project-row-retry-wait");
         await page.waitForTimeout(5_000);
         row = rowLocator();
       }
@@ -93,8 +112,11 @@ export async function openConversation(
     // a hedge for the same thing, and click() re-resolves per retry anyway, so
     // a row that re-renders mid-click is already covered.
     const label = row.getByText(project.name, { exact: true }).first();
+    onPhase?.("project-label-wait");
     await label.waitFor({ state: "visible", timeout: 20_000 });
+    onPhase?.("project-label-click");
     await label.click({ timeout: 10_000 });
+    onPhase?.("project-destination-wait");
     await page.waitForURL((url) => url.origin === "https://chatgpt.com" &&
       (url.pathname === `/g/${project.id}/project` ||
        (project.shortUrl !== undefined && url.pathname === `/g/${project.shortUrl}/project`)),
@@ -102,18 +124,22 @@ export async function openConversation(
   } else {
     const url = new URL("https://chatgpt.com/");
     if (opts.model) url.searchParams.set("model", opts.model);
+    onPhase?.("project-home");
     await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
   }
 
+  onPhase?.("project-composer");
   await requireSelectorPatient(page, SELECTORS.composer, "composer", 20_000);
 
   // C-092: chatgpt.com's Work-area rollout can land (or leave a
   // persisted profile) on the "Work" surface, whose composer has its
   // own model set with no Pro tier. cgpro only ever drives classic
   // chat, so force the Chat surface before touching the model picker.
+  onPhase?.("project-chat-surface");
   await ensureChatTab(page);
 
   if (opts.model) {
+    onPhase?.("project-model");
     await tryEnsureModel(page, opts.model);
   }
 }
@@ -144,13 +170,14 @@ export type ModelVerificationPhase =
 /** Verify the current 6 Pro power control before any prompt is submitted. */
 export async function ensureProSixMaximum(
   page: Page,
-  onPhase?: (phase: ModelVerificationPhase, failedPhase?: ModelVerificationPhase) => void,
+  onPhase?: (phase: ModelVerificationPhase, failedPhase?: ModelVerificationPhase, failure?: InteractionFailure) => void,
 ): Promise<{ model: string; power: number }> {
   let phase: ModelVerificationPhase = "model-control-lookup";
   let failedPhase: ModelVerificationPhase | undefined;
+  let failure: InteractionFailure | undefined;
   const mark = (next: ModelVerificationPhase): void => {
     phase = next;
-    onPhase?.(phase, failedPhase);
+    onPhase?.(phase, failedPhase, failure);
   };
   mark("model-control-lookup");
   const button = await requireSelector(page, SELECTORS.thinkingPowerButton, "thinking control");
@@ -227,6 +254,7 @@ export async function ensureProSixMaximum(
     return { model: "gpt-6-pro", power: max };
   } catch (error) {
     failedPhase = phase;
+    failure = classifyInteractionFailure(error);
     throw error;
   } finally {
     await closeOpenMenus(page, mark);

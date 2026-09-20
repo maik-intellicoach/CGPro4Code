@@ -1,3 +1,4 @@
+import { errors as browserErrors } from "patchright";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -41,7 +42,7 @@ const {
 import type { ServerState } from "../src/daemon/server.js";
 import type { Session } from "../src/browser/session.js";
 import { StreamEmitter } from "../src/core/stream.js";
-import { PreSubmitInteractionError } from "../src/errors.js";
+import { PreSubmitInteractionError, SelectorBrokenError, NotLoggedInError } from "../src/errors.js";
 
 function fakeState(overrides: Partial<ServerState> = {}): ServerState {
   return {
@@ -1050,4 +1051,29 @@ describe("stop-request attribution", () => {
     const logged = await post({});
     expect(logged).toContain("caller=-");
   });
+});
+
+
+it.each([
+  [new SelectorBrokenError("private project"), { code: "selector_unresolved" }],
+  [new NotLoggedInError(), { code: "not_logged_in" }],
+  [new browserErrors.TimeoutError("private URL/account/prompt"), { code: "browser_operation_timeout" }],
+  [new Error("ChatGPT project list unavailable (HTTP 429)"), { code: "project_list_unavailable", httpStatus: 429 }],
+  [new Error("Requested ChatGPT Project could not be uniquely identified"), { code: "project_identity_unverified" }],
+  [new Error("ChatGPT project list unavailable (HTTP 429) private"), { code: "unclassified_error" }],
+  [new Error("private https://private.example/"), { code: "unclassified_error" }],
+  [Object.assign(new Error("private"), { name: "TimeoutError" }), { code: "unclassified_error" }],
+])("classifies actual preflight failures without private exception fields: %j", async (failure, expected) => {
+  runInteractionPreflight.mockRejectedValue(failure);
+  const state = fakeState();
+  const req = new FakeReq() as unknown as IncomingMessage;
+  Object.assign(req, { method: "POST", url: "/preflight", headers: { authorization: "Bearer test-token" } });
+  const res = new FakeRes() as unknown as ServerResponse;
+  const pending = handleRequest(req, res, state);
+  sendBody(req, { model: "gpt-6-pro", connector: "c", gizmoId: "g-p-p", expectedAccountEmail: "a@b" });
+  await pending;
+  const result = parseJsonBody(res as unknown as FakeRes) as Record<string, unknown>;
+  expect(result.code).toBe(expected.code);
+  expect(result.failure).toEqual(expected);
+  expect(JSON.stringify(result)).not.toContain("private");
 });
