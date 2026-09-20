@@ -91,8 +91,24 @@ describe("6 Pro maximum thinking admission", () => {
 
   it("refuses an older Pro model even when its power is at maximum", async () => {
     const s = setup({ modelLabel: "5.6Pro" });
-    await expect(ensureProSixMaximum(s.page)).rejects.toThrow("6 Pro is not selected");
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow("maximum power state is not selected");
     expect(s.slider.focus).toHaveBeenCalledOnce();
+  });
+
+  // P-035 2026-09-21. This is the label a live intelli preflight read off the
+  // row while the slider sat at 3/3, and the lane failed every turn on it. The
+  // top power state's label moved from `6 Pro` to `Extra High`; the menu no
+  // longer renders a model name at all.
+  it("accepts the label the current UI gives the top power state", async () => {
+    const s = setup({ modelLabel: "Extra High" });
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 4 });
+  });
+
+  // The accepted set is closed, not a prefix match: a label that merely starts
+  // like a known top state must not admit a paid turn below maximum power.
+  it("refuses a label that is only a prefix of a known top state", async () => {
+    const s = setup({ modelLabel: "Extra" });
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow("maximum power state is not selected");
   });
 
   it("refuses a missing 6 Pro control before changing any thinking setting", async () => {

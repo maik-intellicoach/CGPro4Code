@@ -154,12 +154,12 @@ describe("native Deep Research selection", () => {
 
   it("rejects High even when the native chip is selected and the slider reports maximum", async () => {
     const test = scenario({ initiallySelected: true, effortLabel: "High" });
-    await expect(setDeepResearch(test.page, true)).rejects.toThrow("6 Pro is not selected");
+    await expect(setDeepResearch(test.page, true)).rejects.toThrow("maximum power state is not selected");
   });
 
   it("also verifies 6 Pro when only the picker reports native mode already selected", async () => {
     const test = scenario({ initiallySelected: true, chipExposed: false, effortLabel: "High" });
-    await expect(setDeepResearch(test.page, true)).rejects.toThrow("6 Pro is not selected");
+    await expect(setDeepResearch(test.page, true)).rejects.toThrow("maximum power state is not selected");
     expect(test.toggle.click).not.toHaveBeenCalled();
   });
 });

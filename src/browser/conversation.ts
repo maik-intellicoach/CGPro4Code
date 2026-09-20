@@ -182,6 +182,29 @@ export type ModelVerificationPhase =
   | "model-slider-current" | "model-selected-lookup" | "model-selected-text"
   | "model-cleanup-escape" | "model-cleanup-menu-count" | "model-cleanup-wait";
 
+/**
+ * The labels that denote the TOP power state in the thinking menu, and nothing
+ * else. The row `selectedPowerModel` resolves carries a power-state label whose
+ * vocabulary belongs to ChatGPT, not to us, and it moved.
+ *
+ * P-035 2026-09-21, observed live on the intelli lane with the slider at 3/3:
+ * the row's text is `Extra High` -- the top state's label under the current UI
+ * -- where the code previously required `6 Pro`. The menu now holds one item
+ * (`Extra High`) and the slider; it no longer renders a model name at all.
+ *
+ * This set is deliberately CLOSED. `High`, `5.6Pro` and `Instant` are lower or
+ * older states and must keep failing, and an unrecognised label fails closed,
+ * because the thing on the other side of this gate is a paid turn that may run
+ * below maximum power. A future rename breaks the lane loudly rather than
+ * silently admitting it -- that is the intended direction.
+ *
+ * KNOWN ASSURANCE GAP, recorded rather than papered over: this gate can no
+ * longer corroborate the model NAME, only that the power control sits at its
+ * proven maximum and displays a known top-state label. Per-turn model-name
+ * verification now has to come from somewhere other than the composer.
+ */
+const MAXIMUM_POWER_LABEL = /^(?:6\s*Pro|Extra\s*High)$/i;
+
 /** Verify the current 6 Pro power control before any prompt is submitted. */
 export async function ensureProSixMaximum(
   page: Page,
@@ -295,7 +318,7 @@ export async function ensureProSixMaximum(
     const model = await requireSelector(page, SELECTORS.selectedPowerModel, "selected thinking model");
     mark("model-selected-text");
     const selected = (await model.textContent() ?? "").trim();
-    if (!/^6\s*Pro$/i.test(selected)) {
+    if (!MAXIMUM_POWER_LABEL.test(selected)) {
       // P-035 2026-09-21. Capture the menu WHILE IT IS STILL OPEN. The daemon's
       // selector diagnostic runs after this path has called closeOpenMenus, so
       // its row reading can only ever say `absent` -- it did, on a live failure,
@@ -322,8 +345,8 @@ export async function ensureProSixMaximum(
       } catch {
         // A diagnostic must never mask the failure it describes.
       }
-      console.error(`[cgpro:model] 6 Pro check failed: selected="${selected.slice(0, 60)}" ${detail}`);
-      throw new Error("6 Pro is not selected in the thinking menu");
+      console.error(`[cgpro:model] maximum power check failed: selected="${selected.slice(0, 60)}" ${detail}`);
+      throw new Error("the maximum power state is not selected in the thinking menu");
     }
     return { model: "gpt-6-pro", power: max };
   } catch (error) {
