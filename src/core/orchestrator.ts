@@ -7,6 +7,7 @@ import {
   latestAssistantModelSlug,
   openConversation,
   ensureProSixMaximum,
+  type ModelVerificationPhase,
   probePromptDelivery,
   type DeliveryPath,
   type PromptDeliveryProbe,
@@ -98,6 +99,7 @@ export interface InteractionPreflightResult {
 
 /** Fixed labels only: no prompt, account, connector or URL enters phase evidence. */
 export type InteractionPreflightPhase =
+  | ModelVerificationPhase
   | "home" | "login" | "account-home" | "project" | "account-project"
   | "composer" | "connector" | "model" | "prompt-delivery"
   | "cleanup-escape" | "cleanup-home" | "cleanup-composer";
@@ -136,7 +138,10 @@ export async function runInteractionPreflight(
     mark("connector");
     await setConnector(page, opts.connector);
     mark("model");
-    const selection = await ensureProSixMaximum(page);
+    const selection = await ensureProSixMaximum(page, (next, failed) => {
+      failedPhase ??= failed;
+      mark(next);
+    });
     // Last, so the probe runs against exactly the controls a real turn would
     // use: same account, same Project, same connector, same model selection.
     if (opts.probePrompt !== undefined) mark("prompt-delivery");
@@ -152,7 +157,7 @@ export async function runInteractionPreflight(
       ...(promptDelivery === undefined ? {} : { promptDelivery }),
     };
   } catch (error) {
-    failedPhase = phase;
+    failedPhase ??= phase;
     verificationError = error;
     throw error;
   } finally {

@@ -133,19 +133,41 @@ async function ensureChatTab(page: Page): Promise<void> {
   }
 }
 
+export type ModelVerificationPhase =
+  | "model-control-lookup" | "model-control-wait" | "model-control-click"
+  | "model-open-slider" | "model-button-state" | "model-slider-wait"
+  | "model-slider-lookup" | "model-slider-maximum" | "model-slider-minimum"
+  | "model-slider-focus" | "model-slider-end" | "model-value-wait"
+  | "model-slider-current" | "model-selected-lookup" | "model-selected-text"
+  | "model-cleanup-escape" | "model-cleanup-menu-count" | "model-cleanup-wait";
+
 /** Verify the current 6 Pro power control before any prompt is submitted. */
-export async function ensureProSixMaximum(page: Page): Promise<{ model: string; power: number }> {
+export async function ensureProSixMaximum(
+  page: Page,
+  onPhase?: (phase: ModelVerificationPhase, failedPhase?: ModelVerificationPhase) => void,
+): Promise<{ model: string; power: number }> {
+  let phase: ModelVerificationPhase = "model-control-lookup";
+  let failedPhase: ModelVerificationPhase | undefined;
+  const mark = (next: ModelVerificationPhase): void => {
+    phase = next;
+    onPhase?.(phase, failedPhase);
+  };
+  mark("model-control-lookup");
   const button = await requireSelector(page, SELECTORS.thinkingPowerButton, "thinking control");
+  mark("model-control-wait");
   await page.waitForTimeout(5_000);
   try {
+    mark("model-control-click");
     await button.click({ timeout: 5_000 });
   } catch (error) {
     if (!(error instanceof Error) || !error.message.includes("Timeout")) throw error;
     // Playwright can time out while React has already opened the Radix menu.
     // Inspect the honest UI postcondition before treating the click as failed.
+    mark("model-open-slider");
     const slider = await firstResolved(page, SELECTORS.thinkingPowerSlider);
     let opened = slider !== null;
     if (!opened) {
+      mark("model-button-state");
       const [expanded, state] = await Promise.all([
         button.getAttribute("aria-expanded", { timeout: 1_000 }).catch(() => null),
         button.getAttribute("data-state", { timeout: 1_000 }).catch(() => null),
@@ -162,9 +184,13 @@ export async function ensureProSixMaximum(page: Page): Promise<{ model: string; 
     }
   }
   try {
+    mark("model-slider-wait");
     await page.waitForTimeout(5_000);
+    mark("model-slider-lookup");
     const slider = await requireSelector(page, SELECTORS.thinkingPowerSlider, "thinking power");
+    mark("model-slider-maximum");
     const maximum = await slider.getAttribute("aria-valuemax");
+    mark("model-slider-minimum");
     const minimum = await slider.getAttribute("aria-valuemin");
     const max = maximum === null ? NaN : Number(maximum);
     const min = minimum === null ? NaN : Number(minimum);
@@ -179,22 +205,31 @@ export async function ensureProSixMaximum(page: Page): Promise<{ model: string; 
     // Focus only requires the element to be attached, and the keyboard event
     // reaches it either way; the aria-valuenow postcondition below still
     // rejects a press that did not land, so this cannot fail silently.
+    mark("model-slider-focus");
     await slider.focus({ timeout: 5_000 });
+    mark("model-slider-end");
     await page.keyboard.press("End");
+    mark("model-value-wait");
     await page.waitForTimeout(5_000);
+    mark("model-slider-current");
     const current = await slider.getAttribute("aria-valuenow");
     if (current === null || Number(current) !== max) {
       throw new Error("6 Pro thinking power did not reach its maximum");
     }
     // On the current UI, moving the power slider upgrades High to 6 Pro.
     // Verify the resulting model, rather than rejecting the lower initial level.
+    mark("model-selected-lookup");
     const model = await requireSelector(page, SELECTORS.selectedPowerModel, "selected thinking model");
+    mark("model-selected-text");
     if (!/^6\s*Pro$/i.test((await model.textContent() ?? "").trim())) {
       throw new Error("6 Pro is not selected in the thinking menu");
     }
     return { model: "gpt-6-pro", power: max };
+  } catch (error) {
+    failedPhase = phase;
+    throw error;
   } finally {
-    await closeOpenMenus(page);
+    await closeOpenMenus(page, mark);
   }
 }
 
@@ -228,16 +263,19 @@ const OPEN_MENU_SELECTOR = '[role="menu"],[role="listbox"],[role="dialog"],[aria
  * a short prompt, so the expensive failure is prevented either way. Treat this
  * as hygiene, not as the repair.
  */
-async function closeOpenMenus(page: Page): Promise<void> {
+async function closeOpenMenus(page: Page, onPhase?: (phase: ModelVerificationPhase) => void): Promise<void> {
   // This runs from a `finally`, so it must never throw: an exception here would
   // replace whatever real error the caller was already reporting.
   try {
     for (let attempt = 0; attempt < MENU_CLOSE_ATTEMPTS; attempt++) {
+      onPhase?.("model-cleanup-escape");
       await page.keyboard.press("Escape").catch(() => undefined);
+      onPhase?.("model-cleanup-menu-count");
       const open = await page
         .evaluate((selector) => document.querySelectorAll(selector).length, OPEN_MENU_SELECTOR)
         .catch(() => -1);
       if (open === 0) return;
+      onPhase?.("model-cleanup-wait");
       await page.waitForTimeout(250);
     }
     console.error(

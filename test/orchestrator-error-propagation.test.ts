@@ -137,6 +137,18 @@ describe("runInteractionPreflight cleanup", () => {
     expect(JSON.stringify(onPhase.mock.calls)).not.toContain("private");
   });
 
+  it("threads model subphases and retains the original failure through outer cleanup", async () => {
+    const original = new Error("model failed");
+    ensureProSixMaximum.mockImplementationOnce(async (_page, report) => {
+      report("model-cleanup-menu-count", "model-slider-focus");
+      throw original;
+    });
+    const onPhase = vi.fn();
+    await expect(runInteractionPreflight(options, preflightSession(), onPhase)).rejects.toBe(original);
+    expect(onPhase).toHaveBeenCalledWith("model-cleanup-menu-count", "model-slider-focus");
+    expect(onPhase).toHaveBeenLastCalledWith("cleanup-composer", "model-slider-focus");
+  });
+
   it("reports the first cleanup failure separately from the following cleanup step", async () => {
     const onPhase = vi.fn();
     goHome.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("cleanup failed"));

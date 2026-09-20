@@ -152,4 +152,40 @@ describe("6 Pro maximum thinking admission", () => {
     (s.page as unknown as { evaluate: unknown }).evaluate = undefined;
     await expect(ensureProSixMaximum(s.page)).rejects.toThrow("range could not be verified");
   });
+
+  it("reports the exact pending await using fixed labels", async () => {
+    const s = setup();
+    const onPhase = vi.fn();
+    let resume!: () => void;
+    s.slider.focus.mockImplementationOnce(() => new Promise<void>((resolve) => { resume = resolve; }));
+    const pending = ensureProSixMaximum(s.page, onPhase);
+    for (let i = 0; i < 30; i++) await Promise.resolve();
+    expect(onPhase).toHaveBeenLastCalledWith("model-slider-focus", undefined);
+    resume();
+    await pending;
+    expect(onPhase.mock.calls.map(([phase]) => phase)).toEqual([
+      "model-control-lookup", "model-control-wait", "model-control-click",
+      "model-slider-wait", "model-slider-lookup", "model-slider-maximum",
+      "model-slider-minimum", "model-slider-focus", "model-slider-end",
+      "model-value-wait", "model-slider-current", "model-selected-lookup",
+      "model-selected-text", "model-cleanup-escape", "model-cleanup-menu-count",
+    ]);
+  });
+
+  it("retains the original failed subphase while menu cleanup is pending", async () => {
+    const s = setup();
+    const original = new Error("private account/prompt detail");
+    s.slider.focus.mockRejectedValueOnce(original);
+    let resume!: (value: number) => void;
+    vi.mocked(s.page.evaluate).mockImplementationOnce(() => new Promise<number>((resolve) => { resume = resolve; }));
+    const onPhase = vi.fn();
+    const pending = ensureProSixMaximum(s.page, onPhase);
+    const rejected = expect(pending).rejects.toBe(original);
+    for (let i = 0; i < 30; i++) await Promise.resolve();
+    expect(onPhase).toHaveBeenLastCalledWith("model-cleanup-menu-count", "model-slider-focus");
+    expect(JSON.stringify(onPhase.mock.calls)).not.toContain("private");
+    resume(0);
+    await rejected;
+  });
+
 });
