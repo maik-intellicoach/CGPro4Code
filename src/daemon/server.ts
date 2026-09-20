@@ -1502,9 +1502,18 @@ function readJsonBody<T>(
 }
 
 /**
- * A bounded, content-free picture of the page at the moment a selector gate
- * failed: what resolves, what is visible, and which surface is mounted. It
- * names selectors and counts only -- never page text.
+ * A bounded picture of the page at the moment a selector gate failed: what
+ * resolves, what is visible, which surface is mounted, and -- since
+ * 2026-09-21 -- the literal label on the one menu row whose text a gate
+ * compares against. Counts and booleans elsewhere; never user content.
+ *
+ * Why the label is captured at all: the gate below this one asserts
+ * `^6\s*Pro$` against that row's text, deliberately text-exact, because a
+ * looser match could let a paid turn run below maximum power. When it fails,
+ * nothing recorded what the label actually held, so every repair attempt was a
+ * guess. The row is the model menu's own item -- chrome, structurally incapable
+ * of carrying prompt or answer text -- and the capture is whitespace-collapsed
+ * and length-capped.
  */
 async function describeSelectorState(page: Page): Promise<string> {
   const groups: Array<[string, string[]]> = [
@@ -1540,8 +1549,33 @@ async function describeSelectorState(page: Page): Promise<string> {
     .catch(() => -1);
   const editables = await page.locator('[contenteditable="true"]').count().catch(() => -1);
   const rows = await page.locator('[role="row"]').count().catch(() => -1);
-  return `${parts.join(" ")} checkedRadios=${checkedRadios} contenteditable=${editables} roleRow=${rows}`
+  const modelRow = await describeModelRow(page);
+  return `${parts.join(" ")} checkedRadios=${checkedRadios} contenteditable=${editables} roleRow=${rows} modelRow(${modelRow})`
     .slice(0, 2000);
+}
+
+const LABEL_CAPTURE_MAX = 60;
+
+/**
+ * P-035 2026-09-21. The exact label the `model-selected-text` assertion compares
+ * against, so a failure names its own cause instead of costing another guess.
+ * Whitespace-collapsed and capped; the node is the model menu's own row.
+ */
+async function describeModelRow(page: Page): Promise<string> {
+  return page
+    .evaluate(
+      ({ selector, max }) => {
+        const el = document.querySelector(selector);
+        if (!el) return "absent";
+        const clean = (value: string | null): string =>
+          (value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+        return `text="${clean(el.textContent)}" inner="${clean((el as HTMLElement).innerText)}" aria="${clean(
+          el.getAttribute("aria-label"),
+        )}"`;
+      },
+      { selector: SELECTORS.selectedPowerModel[0], max: LABEL_CAPTURE_MAX },
+    )
+    .catch(() => "unavailable");
 }
 
 function makeLogger(): { info: (m: string) => void; error: (m: string) => void } {
