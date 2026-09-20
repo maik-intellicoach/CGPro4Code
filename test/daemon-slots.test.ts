@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
@@ -6,9 +6,10 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 // Chromium, so it is mocked; the slot-opening checks (goHome/isLoggedIn) are
 // mocked too so a second tab can be "opened" without a browser (P-035 D23.0).
 const runAskOnSession = vi.fn();
+const runInteractionPreflight = vi.fn();
 vi.mock("../src/core/orchestrator.js", () => ({
   runAskOnSession: (...args: unknown[]) => runAskOnSession(...args),
-  runInteractionPreflight: vi.fn(),
+  runInteractionPreflight: (...args: unknown[]) => runInteractionPreflight(...args),
 }));
 
 const chatgpt = vi.hoisted(() => ({
@@ -120,6 +121,7 @@ function pendingRunner(conversationId: string): {
 
 beforeEach(() => {
   runAskOnSession.mockReset();
+  runInteractionPreflight.mockReset();
   chatgpt.goHome.mockClear();
   chatgpt.isLoggedIn.mockClear();
   delete process.env.CGPRO_DAEMON_SLOTS;
@@ -265,4 +267,183 @@ describe("per-slot daemon instancing", () => {
     await ask2.pending;
     expect(await status(state)).toMatchObject({ busy: false, lastConversation: "conv-2", slots: { total: 1, busy: 0, free: 1 } });
   });
+});
+
+
+describe("bounded preflight lease lifecycle", () => {
+  const body = { model: "gpt-6-pro", connector: "fixture", gizmoId: "g-p-fixture", expectedAccountEmail: "a@b.test" };
+  const flush = async (): Promise<void> => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
+  function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason: Error) => void } {
+    let resolve!: (value: T) => void;
+    let reject!: (reason: Error) => void;
+    const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+    return { promise, resolve, reject };
+  }
+  function fixture() {
+    const session = fakeSession();
+    let closed = false;
+    const page = Object.assign(session.page, {
+      isClosed: () => closed,
+      close: vi.fn(async () => { closed = true; }),
+    });
+    const state = createServerState(session, { background: true });
+    return { state, page, session };
+  }
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("normal success releases once without closing its page", async () => {
+    const { state, page } = fixture();
+    runInteractionPreflight.mockResolvedValue({ model: "gpt-6-pro" });
+    const request = call(state, "POST", "/preflight", body);
+    await request.pending;
+    expect(request.res.statusCode).toBe(200);
+    expect(state.queue.busy).toBe(false);
+    expect(page.close).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("closes the exact page when verification/cleanup hangs, fencing until work settles", async () => {
+    const { state, page, session } = fixture();
+    const work = deferred();
+    runInteractionPreflight.mockReturnValue(work.promise);
+    const request = call(state, "POST", "/preflight", body);
+    await flush();
+    await vi.advanceTimersByTimeAsync(140_000);
+    expect(page.close).toHaveBeenCalledWith({ runBeforeUnload: false });
+    expect(state.queue.busy).toBe(true); // closed page alone is insufficient
+    work.resolve();
+    await request.pending;
+    expect(request.res.statusCode).toBe(409);
+    expect(state.interaction.failureCode).toBe("interaction_preflight_timeout");
+    expect(state.queue.busy).toBe(false);
+    // Slot zero must recreate a closed page before the next operation.
+    runInteractionPreflight.mockResolvedValue({});
+    const next = call(state, "POST", "/preflight", body);
+    await next.pending;
+    expect(session.context.newPage).toHaveBeenCalledOnce();
+    expect(runInteractionPreflight.mock.calls[1][1].page).not.toBe(page);
+  });
+
+  it.each(["throws", "hangs", "returns without closure"])("quarantines when page close %s, even if work later settles", async (mode) => {
+    const { state, page } = fixture();
+    const work = deferred();
+    runInteractionPreflight.mockReturnValue(work.promise);
+    page.close.mockImplementation(async () => {
+      if (mode === "throws") throw new Error("private detail");
+      if (mode === "hangs") await new Promise(() => {});
+    });
+    const request = call(state, "POST", "/preflight", body);
+    await flush();
+    await vi.advanceTimersByTimeAsync(150_000);
+    await request.pending;
+    expect(state.slots![0].leasedBy).toBe("preflight-quarantined");
+    expect(state.queue.busy).toBe(true);
+    expect(state.interaction.failureCode).toBe("interaction_preflight_recovery_required");
+    expect(request.res.writes.join("")).not.toContain("private detail");
+    work.resolve();
+    await flush();
+    expect(state.queue.tryAcquire()).toBe(false);
+    expect(state.interaction.state).toBe("degraded");
+  });
+
+  it("keeps the fence when the page closes but original work never settles", async () => {
+    const { state } = fixture();
+    runInteractionPreflight.mockReturnValue(new Promise(() => {}));
+    const request = call(state, "POST", "/preflight", body);
+    await flush();
+    await vi.advanceTimersByTimeAsync(150_000);
+    await request.pending;
+    expect(state.slots![0].leasedBy).toBe("preflight-quarantined");
+    expect(state.queue.busy).toBe(true);
+  });
+
+  it("disconnect closes only the preflight page and preserves a sibling paid ask", async () => {
+    process.env.CGPRO_DAEMON_SLOTS = "2";
+    const { state, page, session } = fixture();
+    const paid = pendingRunner("paid-conversation");
+    runAskOnSession.mockReturnValue(paid.runner);
+    const paidRequest = ask(state, "paid-invocation");
+    await flush();
+    const work = deferred();
+    let probeClosed = false;
+    const probe = Object.assign(fakePage("probe"), {
+      isClosed: () => probeClosed,
+      close: vi.fn(async () => { probeClosed = true; work.reject(new Error("page closed")); }),
+    });
+    vi.mocked(session.context.newPage).mockResolvedValue(probe as any);
+    runInteractionPreflight.mockReturnValue(work.promise);
+    const request = call(state, "POST", "/preflight", body);
+    await flush();
+    request.res.emit("close");
+    await request.pending;
+    expect(probe.close).toHaveBeenCalledOnce();
+    expect(page.close).not.toHaveBeenCalled();
+    expect(paid.runner.cancel).not.toHaveBeenCalled();
+    expect(state.slots![0].currentInvocation).toBe("paid-invocation");
+    expect(state.slots![0].busy).toBe(true);
+    expect(state.slots![1].busy).toBe(false);
+    expect(request.res.end).not.toHaveBeenCalled();
+    paid.finish();
+    await paidRequest.pending;
+  });
+
+  it("captures a new page before a hanging initialization and never starts preflight after cancellation", async () => {
+    const { state, page, session } = fixture();
+    await page.close();
+    const opening = deferred<any>();
+    vi.mocked(session.context.newPage).mockReturnValue(opening.promise);
+    const request = call(state, "POST", "/preflight", body);
+    await flush();
+    await vi.advanceTimersByTimeAsync(140_000);
+    const created = Object.assign(fakePage("late"), { close: vi.fn(async () => {}), isClosed: () => true });
+    opening.resolve(created);
+    await request.pending;
+    expect(created.close).toHaveBeenCalled();
+    expect(runInteractionPreflight).not.toHaveBeenCalled();
+    expect(state.queue.busy).toBe(false);
+  });
+
+  it("closes a captured page while its initialization is hung", async () => {
+    const { state, page, session } = fixture();
+    await page.close();
+    const navigation = deferred();
+    chatgpt.goHome.mockImplementationOnce(() => navigation.promise);
+    let closed = false;
+    const created = Object.assign(fakePage("initializing"), {
+      isClosed: () => closed,
+      close: vi.fn(async () => { closed = true; navigation.reject(new Error("closed")); }),
+    });
+    vi.mocked(session.context.newPage).mockResolvedValue(created as any);
+    const request = call(state, "POST", "/preflight", body);
+    await flush();
+    await vi.advanceTimersByTimeAsync(140_000);
+    await request.pending;
+    expect(created.close).toHaveBeenCalled();
+    expect(runInteractionPreflight).not.toHaveBeenCalled();
+    expect(state.queue.busy).toBe(false);
+  });
+
+  it("quarantines a stuck newPage and closes it if it arrives after the cleanup budget", async () => {
+    const { state, page, session } = fixture();
+    await page.close();
+    const opening = deferred<any>();
+    vi.mocked(session.context.newPage).mockReturnValue(opening.promise);
+    const request = call(state, "POST", "/preflight", body);
+    await flush();
+    await vi.advanceTimersByTimeAsync(150_000);
+    await request.pending;
+    expect(state.slots![0].leasedBy).toBe("preflight-quarantined");
+    let closed = false;
+    const created = Object.assign(fakePage("very-late"), {
+      close: vi.fn(async () => { closed = true; }), isClosed: () => closed,
+    });
+    opening.resolve(created);
+    await flush();
+    expect(created.close).toHaveBeenCalledOnce();
+    expect(runInteractionPreflight).not.toHaveBeenCalled();
+    expect(state.queue.busy).toBe(true);
+    expect(state.interaction.failureCode).toBe("interaction_preflight_recovery_required");
+  });
+
 });

@@ -44,7 +44,7 @@ import { PreSubmitInteractionError } from "../src/errors.js";
 
 function fakeState(overrides: Partial<ServerState> = {}): ServerState {
   return {
-    session: {} as unknown as Session,
+    session: { page: { isClosed: () => false, url: () => "https://chatgpt.com/" } } as unknown as Session,
     token: "test-token",
     startedAt: new Date(),
     background: true,
@@ -359,7 +359,7 @@ it("derives the active conversation from the page URL before the first stream ev
   const state = fakeState({
     queue,
     askInFlight: true,
-    session: { page: { url: () => `https://chatgpt.com/c/${conversationId}` } } as unknown as Session,
+    session: { page: { isClosed: () => false, url: () => `https://chatgpt.com/c/${conversationId}` } } as unknown as Session,
   });
   const req = new FakeReq() as unknown as IncomingMessage;
   const res = new FakeRes() as unknown as ServerResponse;
@@ -377,7 +377,7 @@ it("reserves the browser lane while reopening an idle conversation", async () =>
   const conversationId = "33333333-3333-3333-3333-333333333333";
   const state = fakeState({
     lastConversation: conversationId,
-    session: { page: { url: () => `https://chatgpt.com/c/${conversationId}` } } as unknown as Session,
+    session: { page: { isClosed: () => false, url: () => `https://chatgpt.com/c/${conversationId}` } } as unknown as Session,
   });
   browserConversation.openConversation.mockImplementation(async () => {
     expect(state.queue.busy).toBe(true);
@@ -406,7 +406,7 @@ it("rejects a second idle reload without leaving stale active state", async () =
   const entered = new Promise<void>((resolve) => { markEntered = resolve; });
   const state = fakeState({
     lastConversation: conversationId,
-    session: { page: { url: () => `https://chatgpt.com/c/${conversationId}` } } as unknown as Session,
+    session: { page: { isClosed: () => false, url: () => `https://chatgpt.com/c/${conversationId}` } } as unknown as Session,
   });
   browserConversation.openConversation.mockImplementation(async () => {
     markEntered();

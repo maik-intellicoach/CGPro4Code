@@ -65,6 +65,10 @@ const log = makeLogger();
 
 /** The largest prompt /preflight will deliver-and-discard; real prompts run well under this. */
 const PROBE_PROMPT_MAX_CHARS = 200_000;
+// Reserve ten seconds inside the callers' existing 150s / 300s ceilings.
+const PREFLIGHT_TIMEOUT_MS = 140_000;
+const PROBE_PREFLIGHT_TIMEOUT_MS = 290_000;
+const PREFLIGHT_CLOSE_TIMEOUT_MS = 10_000;
 const QUEUE_MAX = Math.max(1, Number(process.env.CGPRO_DAEMON_QUEUE_MAX) || 4);
 const QUEUE_MAX_WAIT_MS = Math.max(1, Number(process.env.CGPRO_DAEMON_QUEUE_MAX_WAIT_MS) || 7_200_000);
 
@@ -343,6 +347,7 @@ function slotZero(state: ServerState): SlotState {
     busy: false,
     leasedBy: null,
     get page() { return state.session.page; },
+    set page(page: Page | null) { if (page) state.session.page = page; },
     get askInFlight() { return state.askInFlight; },
     set askInFlight(v) { state.askInFlight = v; },
     get currentInvocation() { return state.currentInvocation; },
@@ -402,10 +407,19 @@ function releaseSlot(slot: SlotState, reason: string): void {
 }
 
 /** The slot's page; slots 1..N-1 are opened on first use with the daemon start checks. */
-async function slotPage(state: ServerState, slot: SlotState): Promise<Page> {
-  if (slot.id === 0) return state.session.page;
-  if (slot.page && !slot.page.isClosed()) return slot.page;
+async function slotPage(
+  state: ServerState,
+  slot: SlotState,
+  capture?: (page: Page) => void,
+): Promise<Page> {
+  if (slot.page && !slot.page.isClosed()) {
+    capture?.(slot.page);
+    return slot.page;
+  }
   const page = await state.session.context.newPage();
+  // Publish ownership before navigation/authentication, which may themselves hang.
+  slot.page = page;
+  capture?.(page);
   try {
     await goHome(page);
     if (!(await isLoggedIn(page, 8_000))) throw new NotLoggedInError();
@@ -896,25 +910,96 @@ export async function handleRequest(
       return;
     }
     const slot = leaseSlot(state, "preflight");
+    let cancelled: "interaction_preflight_timeout" | "interaction_preflight_disconnected" | undefined;
+    let signalCancel!: () => void;
+    const cancellation = new Promise<void>((resolve) => { signalCancel = resolve; });
+    const cancel = (reason: typeof cancelled): void => {
+      cancelled ??= reason;
+      signalCancel();
+    };
+    const onDisconnect = (): void => cancel("interaction_preflight_disconnected");
+    res.once("close", onDisconnect);
+    if (res.destroyed) onDisconnect();
+    const timer = setTimeout(() => cancel("interaction_preflight_timeout"),
+      body.probePrompt === undefined ? PREFLIGHT_TIMEOUT_MS : PROBE_PREFLIGHT_TIMEOUT_MS);
+    // A late newPage must also be closed; its lease cannot escape the deadline.
+    let capture!: (page: Page | null) => void;
+    const ownedPage = new Promise<Page | null>((resolve) => { capture = resolve; });
+    const work = (async () => {
+      try {
+        const page = await slotPage(state, slot, (page) => {
+          capture(page);
+          if (cancelled) throw new Error(cancelled);
+        });
+        if (cancelled) throw new Error(cancelled);
+        return await runInteractionPreflight(body, slotSession(state, slot, page));
+      } finally {
+        capture(null); // Only used if page creation failed before capturing a page.
+      }
+    })();
+    const settled = work.then(() => undefined, () => undefined);
+    let release = true;
     try {
-      const result = await runInteractionPreflight(body, slotSession(state, slot, await slotPage(state, slot)));
+      const result = await Promise.race([
+        work,
+        cancellation.then(() => { throw new Error(cancelled); }),
+      ]);
+      if (cancelled) throw new Error(cancelled);
       slot.interaction = { state: "ready", checkedAt: new Date().toISOString() };
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, ...result }));
     } catch (error) {
+      if (cancelled) {
+        slot.interaction = { state: "degraded", checkedAt: new Date().toISOString(), failureCode: cancelled };
+        // A timed-out promise is still running. Never release its page to a new
+        // turn until exact-page closure AND original work settlement are proven.
+        release = false;
+        let closeTimer: ReturnType<typeof setTimeout> | undefined;
+        const quiesced = (async () => {
+          const page = await ownedPage;
+          if (page) {
+            await page.close({ runBeforeUnload: false });
+            if (!page.isClosed()) throw new Error("preflight page closure unverified");
+          }
+          await settled;
+          return true;
+        })();
+        try {
+          release = await Promise.race([
+            quiesced.catch(() => false),
+            new Promise<false>((resolve) => {
+              closeTimer = setTimeout(() => resolve(false), PREFLIGHT_CLOSE_TIMEOUT_MS);
+            }),
+          ]);
+        } finally {
+          clearTimeout(closeTimer);
+        }
+        // ponytail: an unproven close stays quarantined; governed recovery owns
+        // escalation instead of risking other paid turns in this browser.
+        if (!release) slot.leasedBy = "preflight-quarantined";
+      }
+      const failureCode = !release ? "interaction_preflight_recovery_required"
+        : cancelled ?? (error instanceof PreSubmitInteractionError ? error.code : undefined);
       slot.interaction = {
         state: "degraded",
         checkedAt: new Date().toISOString(),
-        ...(error instanceof PreSubmitInteractionError ? { failureCode: error.code } : {}),
+        ...(failureCode ? { failureCode } : {}),
       };
-      res.writeHead(409, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        error: "interaction_preflight_failed",
-        ...(error instanceof PreSubmitInteractionError ? { code: error.code, phase: error.phase } : {}),
-      }));
+      if (!res.destroyed && cancelled !== "interaction_preflight_disconnected") {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: "interaction_preflight_failed",
+          ...(failureCode ? { code: failureCode } : {}),
+          ...(error instanceof PreSubmitInteractionError ? { phase: error.phase } : {}),
+        }));
+      }
     } finally {
-      releaseSlot(slot, "preflight");
-      state.queue.release();
+      clearTimeout(timer);
+      res.off("close", onDisconnect);
+      if (release) {
+        releaseSlot(slot, "preflight");
+        state.queue.release();
+      }
     }
     return;
   }
