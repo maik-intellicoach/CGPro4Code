@@ -67,29 +67,89 @@ export interface AuthSessionFull {
   sessionToken?: string;
 }
 
-export async function fetchAuthSessionInPage(page: Page, timeoutMs?: number): Promise<AuthSessionFull | null> {
+export type AuthSessionFailureCode =
+  | "timeout"
+  | "network"
+  | "http_failure"
+  | "invalid_json"
+  | "evaluation_failure";
+
+export type AuthSessionOutcome =
+  | { ok: true; session: AuthSessionFull }
+  | { ok: false; code: AuthSessionFailureCode; httpStatus?: number };
+
+interface InPageSessionEvaluation {
+  ok: boolean;
+  code?: "timeout" | "network" | "http_failure" | "invalid_json";
+  httpStatus?: number;
+  payload?: unknown;
+}
+
+export async function fetchAuthSessionOutcome(
+  page: Page,
+  timeoutMs?: number,
+): Promise<AuthSessionOutcome> {
+  let result: InPageSessionEvaluation;
   try {
-    const result = await page.evaluate(async (requestTimeoutMs) => {
+    result = await page.evaluate(async (requestTimeoutMs): Promise<InPageSessionEvaluation> => {
       const controller = typeof requestTimeoutMs === "number" ? new AbortController() : null;
       const timer = controller ? setTimeout(() => controller.abort(), requestTimeoutMs) : null;
       try {
-        const r = await fetch("/api/auth/session", {
-          headers: { Accept: "application/json" },
-          credentials: "include",
-          signal: controller?.signal,
-        });
-        if (!r.ok) return null;
-        return (await r.json()) as Record<string, unknown>;
-      } catch {
-        return null;
+        let r: Response;
+        try {
+          r = await fetch("/api/auth/session", {
+            headers: { Accept: "application/json" },
+            credentials: "include",
+            signal: controller?.signal,
+          });
+        } catch (fetchErr: any) {
+          if (fetchErr?.name === "AbortError" || controller?.signal.aborted) {
+            return { ok: false, code: "timeout" };
+          }
+          return { ok: false, code: "network" };
+        }
+
+        if (!r.ok) {
+          return { ok: false, code: "http_failure", httpStatus: r.status };
+        }
+
+        try {
+          const json = await r.json();
+          return { ok: true, payload: json };
+        } catch (jsonErr: any) {
+          if (jsonErr?.name === "AbortError" || controller?.signal.aborted) {
+            return { ok: false, code: "timeout" };
+          }
+          return { ok: false, code: "invalid_json" };
+        }
       } finally {
         if (timer) clearTimeout(timer);
       }
     }, timeoutMs);
-    return (result ?? null) as AuthSessionFull | null;
   } catch {
-    return null;
+    return { ok: false, code: "evaluation_failure" };
   }
+
+  if (!result || !result.ok) {
+    return {
+      ok: false,
+      code: result?.code ?? "evaluation_failure",
+      ...(typeof result?.httpStatus === "number" ? { httpStatus: result.httpStatus } : {}),
+    };
+  }
+
+  const payload = result.payload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, code: "invalid_json" };
+  }
+
+  const session = payload as AuthSessionFull;
+  return { ok: true, session };
+}
+
+export async function fetchAuthSessionInPage(page: Page, timeoutMs?: number): Promise<AuthSessionFull | null> {
+  const outcome = await fetchAuthSessionOutcome(page, timeoutMs);
+  return outcome.ok ? outcome.session : null;
 }
 
 /**

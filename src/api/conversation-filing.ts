@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Page } from "patchright";
-import { backendApiFetch, fetchAuthSessionInPage } from "../browser/chatgpt.js";
+import { backendApiFetch, fetchAuthSessionOutcome } from "../browser/chatgpt.js";
+import { AccountRequirementError } from "../errors.js";
 
 export interface FilingProof {
   status: "verified" | "mismatch" | "unavailable";
@@ -32,9 +33,35 @@ export function conversationFingerprint(body: Record<string, any>): string {
 }
 
 export async function requireAccount(page: Page, expectedEmail: string): Promise<void> {
-  const auth = await fetchAuthSessionInPage(page, 10_000);
-  if (!expectedEmail || auth?.user?.email?.toLowerCase() !== expectedEmail.toLowerCase()) {
-    throw new Error("ChatGPT account identity mismatch");
+  if (!expectedEmail || typeof expectedEmail !== "string" || !expectedEmail.trim()) {
+    throw new AccountRequirementError("account_expected_identity_missing");
+  }
+
+  const outcome = await fetchAuthSessionOutcome(page, 10_000);
+
+  if (!outcome.ok) {
+    switch (outcome.code) {
+      case "http_failure":
+        throw new AccountRequirementError("account_http_failure", { httpStatus: outcome.httpStatus });
+      case "timeout":
+        throw new AccountRequirementError("account_abort_timeout");
+      case "network":
+        throw new AccountRequirementError("account_network_failure");
+      case "invalid_json":
+        throw new AccountRequirementError("account_parse_error");
+      case "evaluation_failure":
+      default:
+        throw new AccountRequirementError("account_evaluation_rejection");
+    }
+  }
+
+  const actualEmail = outcome.session.user?.email;
+  if (!actualEmail || typeof actualEmail !== "string" || !actualEmail.trim()) {
+    throw new AccountRequirementError("account_identity_absent");
+  }
+
+  if (actualEmail.toLowerCase() !== expectedEmail.toLowerCase()) {
+    throw new AccountRequirementError("account_identity_mismatch");
   }
 }
 
