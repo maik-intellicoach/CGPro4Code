@@ -129,6 +129,19 @@ describe("6 Pro maximum thinking admission", () => {
     await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 4 });
   });
 
+  // P-035 2026-09-21. The composer pill opens TWO popovers, and when the effort
+  // one is open the row this gate reads carries the effort label. That is not a
+  // model name and must not be compared as one: the live refusal on intelli read
+  // `The composer shows "Extra High" where the account's catalogue says the Pro
+  // model is "GPT-5.5 Pro"`, which refused a lane whose composer was fine. An
+  // effort label leaves the model to the catalogue, which is what it is for;
+  // maximum effort is proven by the slider's own arithmetic.
+  it("reads the row's effort label as no model opinion and takes the model from the catalogue", async () => {
+    fetchModels.mockResolvedValue([{ slug: "gpt-5-5-pro", title: "GPT-5.5 Pro" }]);
+    const s = setup({ modelLabel: "Extra High" });
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-5-5-pro", power: 4 });
+  });
+
   // A catalogue title of `GPT-6 Pro` and a composer label of `6 Pro` name the
   // same model, so the comparison drops a leading `gpt` and normalises spacing.
   it("matches a catalogue title that carries a gpt prefix", async () => {

@@ -219,6 +219,24 @@ export type ModelVerificationPhase =
  * catalogue carries no Pro model", which sends the reader to the account when the
  * fault is in the read.
  */
+/**
+ * The one composer-row label that means "maximum thinking effort" rather than a
+ * model name.
+ *
+ * The pill carries `aria-haspopup="menu"` and drives both the model picker and
+ * the thinking-effort control, so the row the model gate reads holds either a
+ * model name or an effort label. `Extra High` is what the top of the effort
+ * slider reads, and this codebase has carried it as the alternative to the model
+ * name since before this gate existed -- which is the evidence that it means
+ * "6 Pro at maximum", not "some other model".
+ *
+ * Deliberately NOT a general effort vocabulary. `High`, `Medium` and `Instant`
+ * stay refusals, because those are genuinely lower states: the Deep Research gate
+ * refuses `High` even when its own chip is selected and the slider reports
+ * maximum, and that must keep refusing (P-035 2026-09-21).
+ */
+const MAX_EFFORT_ROW_LABELS = new Set(["extrahigh"]);
+
 async function readCatalogueForModelCheck(
   page: Page,
 ): Promise<{ models: ChatgptModel[]; reason: string }> {
@@ -371,8 +389,30 @@ export async function ensureProSixMaximum(
       failure = classifyInteractionFailure(unresolved);
       throw unresolved;
     }
+    // P-035 2026-09-21. The composer pill opens TWO popovers -- the model picker
+    // and the thinking-effort control -- and when the effort one is open, the row
+    // this gate reads carries the EFFORT label ("Extra High") rather than a model
+    // name. Comparing that to the catalogue's title refused a perfectly good lane:
+    // the live refusal read
+    //   The composer shows "Extra High" where the account's catalogue says the
+    //   Pro model is "GPT-5.5 Pro"
+    // An effort label is no opinion about the model at all, so it must not be read
+    // as one. The model then comes from the catalogue, which is what a catalogue
+    // is for, and maximum effort is already proven above by the slider's own
+    // aria-valuenow -- arithmetic, which needs no label.
+    //
+    // The strict comparison below is unchanged for a row that DOES name a model,
+    // including the deliberate refusal of an older Pro model.
+    const observed = normaliseModelLabel(selected);
+    if (MAX_EFFORT_ROW_LABELS.has(observed)) {
+      console.error(
+        `[cgpro:model] composer row reads the effort label "${selected}" (the effort popover was open); ` +
+          `model taken from the catalogue: "${proModel.title ?? proModel.slug}" at maximum power`,
+      );
+      return { model: proModel.slug, power: max };
+    }
     const expectedLabel = normaliseModelLabel(proModel.title ?? proModel.slug);
-    if (normaliseModelLabel(selected) !== expectedLabel) {
+    if (observed !== expectedLabel) {
       // P-035 2026-09-21. Capture the menu WHILE IT IS STILL OPEN. The daemon's
       // selector diagnostic runs after this path has called closeOpenMenus, so
       // its row reading can only ever say `absent` -- it did, on a live failure,
