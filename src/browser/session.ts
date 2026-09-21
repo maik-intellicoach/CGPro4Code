@@ -69,6 +69,19 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
     // user browsing session to restore, so Chrome's crash bubble only blocks
     // selectors after an abnormal adapter exit.
     "--hide-crash-restore-bubble",
+    // P-035 2026-09-21. Chromium throttles a window it cannot see: timers are
+    // clamped and the renderer is backgrounded. A parked lane is both hidden and
+    // minimised, so every page query cost it 10-100x what it should. Measured on
+    // the personal lane, ONE preflight run parked and once in front, nothing else
+    // changed: project-chat-surface 26175ms -> 63ms, login 13670ms -> 354ms,
+    // project-list 9210ms -> 1564ms, and a readiness ladder that never finished
+    // inside its 140s budget finished in 47ms. The ladder was starving, not
+    // failing. These are Chromium's own switches for that, and they let the
+    // parked posture stand -- four lanes must not steal focus (C-037) -- instead
+    // of trading the outage for four windows on the screen.
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
   ];
   // Background mode: keep the headed Chromium fingerprint (Cloudflare
   // challenges headless), but park every window out of the user's way
