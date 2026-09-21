@@ -15,14 +15,40 @@ export interface ModelsResponse {
   categories?: unknown[];
 }
 
-export async function fetchModels(page: Page, _accessToken?: string): Promise<ChatgptModel[]> {
+export interface ModelsFetch {
+  models: ChatgptModel[];
+  /** The HTTP status the read actually got; -1 when the read never reached the API. */
+  status: number;
+  /** Why `models` is what it is, in words a log line can carry. */
+  reason: string;
+}
+
+/**
+ * P-035 2026-09-21. The same read, saying WHY it came back empty.
+ *
+ * The swallow this replaces cost real diagnosis: `if (!r.ok) return []` made a
+ * failed token read (a real 401) and a healthy catalogue that simply lists no
+ * Pro model indistinguishable, and the caller then reported the second when what
+ * had happened was the first. A gate that fails closed is only honest if its
+ * failure names its own cause.
+ */
+export async function fetchModelsWithReason(page: Page, _accessToken?: string): Promise<ModelsFetch> {
   const r = await backendApiFetch(
     page,
     "/backend-api/models?history_and_training_disabled=false",
   );
-  if (!r.ok) return [];
+  if (!r.ok) return { models: [], status: r.status, reason: `http ${r.status}` };
   const json = r.body as ModelsResponse | null;
-  return json?.models ?? [];
+  const models = json?.models ?? [];
+  return {
+    models,
+    status: r.status,
+    reason: models.length === 0 ? `http ${r.status} answered without a models array` : `http ${r.status}`,
+  };
+}
+
+export async function fetchModels(page: Page, accessToken?: string): Promise<ChatgptModel[]> {
+  return (await fetchModelsWithReason(page, accessToken)).models;
 }
 
 /**

@@ -15,7 +15,17 @@ vi.mock("../src/browser/chatgpt.js", () => ({
 // fetch is stubbed; the matching helpers stay real.
 vi.mock("../src/api/models.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/api/models.js")>();
-  return { ...actual, fetchModels: (...args: unknown[]) => fetchModels(...args) };
+  return {
+    ...actual,
+    fetchModels: (...args: unknown[]) => fetchModels(...args),
+    // P-035 2026-09-21. The pre-submit check now reads the catalogue through the
+    // reason-carrying form, so the same stub has to feed both entry points.
+    fetchModelsWithReason: async (...args: unknown[]) => ({
+      models: (await fetchModels(...args)) as unknown[],
+      status: 200,
+      reason: "http 200",
+    }),
+  };
 });
 
 const { setDeepResearch } = await import("../src/browser/conversation.js");

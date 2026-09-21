@@ -2,7 +2,7 @@ import type { Page, Locator } from "patchright";
 import { SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
 import { listProjects } from "../api/projects.js";
-import { fetchModels, findProModel, normaliseModelLabel, type ChatgptModel } from "../api/models.js";
+import { fetchModelsWithReason, findProModel, normaliseModelLabel, type ChatgptModel } from "../api/models.js";
 import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, SelectorBrokenError, TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation } from "../core/stream.js";
 
@@ -210,14 +210,30 @@ export type ModelVerificationPhase =
  * catalogued Pro model's title.
  */
 
-/** The catalogue read, with one retry, for the pre-submit model check. */
-async function readCatalogueForModelCheck(page: Page): Promise<ChatgptModel[]> {
+/**
+ * The catalogue read, with one retry, for the pre-submit model check.
+ *
+ * P-035 2026-09-21. It returns WHY it found nothing, because the two ways to find
+ * nothing are different facts and the gate used to state the wrong one: a failed
+ * read (a real 401, a raced execution context) was reported as "the account's
+ * catalogue carries no Pro model", which sends the reader to the account when the
+ * fault is in the read.
+ */
+async function readCatalogueForModelCheck(
+  page: Page,
+): Promise<{ models: ChatgptModel[]; reason: string }> {
+  let reason = "the read was never attempted";
   for (let attempt = 0; attempt < 2; attempt++) {
-    const models = await fetchModels(page).catch(() => [] as ChatgptModel[]);
-    if (models.length > 0) return models;
+    const result = await fetchModelsWithReason(page).catch((error: Error) => ({
+      models: [] as ChatgptModel[],
+      status: -1,
+      reason: error.message.slice(0, 80),
+    }));
+    if (result.models.length > 0) return { models: result.models, reason: result.reason };
+    reason = `attempt ${attempt + 1}: ${result.reason}`;
     if (attempt === 0) await page.waitForTimeout(1_000);
   }
-  return [];
+  return { models: [], reason };
 }
 
 /** Verify the current 6 Pro power control before any prompt is submitted. */
@@ -337,12 +353,19 @@ export async function ensureProSixMaximum(
     // account's OWN catalogue, never written here. Hardcoding the label is what
     // made a rename read as a broken UI and cost this project a week.
     mark("model-catalogue-read");
-    const proModel = findProModel(await readCatalogueForModelCheck(page));
+    const catalogue = await readCatalogueForModelCheck(page);
+    const proModel = findProModel(catalogue.models);
     if (!proModel) {
+      // Two different facts, two different sentences. Only the second sends the
+      // reader to the account; the first is the read failing, and saying
+      // "carries no Pro model" for it was wrong on every occasion it fired.
+      const why = catalogue.models.length === 0
+        ? `the catalogue read returned nothing (${catalogue.reason})`
+        : `the catalogue returned ${catalogue.models.length} models and none is a Pro model`;
       const unresolved = new PreSubmitInteractionError(
         "model_control_unresolved",
         "model_verification",
-        "The account's model catalogue carries no Pro model, so a paid turn could not be proven to run on 6 Pro",
+        `The account's model catalogue could not be resolved, so a paid turn could not be proven to run on 6 Pro: ${why}`,
       );
       failedPhase = phase;
       failure = classifyInteractionFailure(unresolved);

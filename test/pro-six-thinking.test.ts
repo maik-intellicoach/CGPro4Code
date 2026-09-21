@@ -14,7 +14,17 @@ vi.mock("../src/browser/chatgpt.js", () => ({
 // stay the real implementations under test.
 vi.mock("../src/api/models.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/api/models.js")>();
-  return { ...actual, fetchModels: (...args: unknown[]) => fetchModels(...args) };
+  return {
+    ...actual,
+    fetchModels: (...args: unknown[]) => fetchModels(...args),
+    // P-035 2026-09-21. The pre-submit check now reads the catalogue through the
+    // reason-carrying form, so the same stub has to feed both entry points.
+    fetchModelsWithReason: async (...args: unknown[]) => ({
+      models: (await fetchModels(...args)) as unknown[],
+      status: 200,
+      reason: "http 200",
+    }),
+  };
 });
 const { ensureProSixMaximum, menuIsThinkingEffort } = await import("../src/browser/conversation.js");
 
@@ -139,7 +149,7 @@ describe("6 Pro maximum thinking admission", () => {
   it("refuses the turn when the account's catalogue carries no Pro model", async () => {
     fetchModels.mockResolvedValue([{ slug: "gpt-5-5", title: "GPT-5.5" }]);
     const s = setup();
-    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/no Pro model/);
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/none is a Pro model/);
     expect(s.slider.focus).toHaveBeenCalledOnce();
   });
 
@@ -149,7 +159,10 @@ describe("6 Pro maximum thinking admission", () => {
   it("retries a catalogue read that comes back empty, then refuses", async () => {
     fetchModels.mockResolvedValue([]);
     const s = setup();
-    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/no Pro model/);
+    // P-035 2026-09-21. The refusal must say the READ returned nothing, not that
+    // the account has no Pro model: those are different facts, and the second was
+    // being stated for the first.
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/returned nothing/);
     expect(fetchModels).toHaveBeenCalledTimes(2);
   });
 

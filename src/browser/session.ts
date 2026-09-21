@@ -212,6 +212,45 @@ export async function parkWindow(context: BrowserContext, page: Page): Promise<v
 }
 
 /**
+ * Put one parked window back on the desktop without asking for focus.
+ *
+ * P-035 2026-09-21. The inverse of `parkWindow`, and the reason it exists: a
+ * minimised window is not drawn, so the page inside it crawls and sometimes never
+ * renders at all -- measured at 415x on one step and 1600x on another against the
+ * same page un-minimised. The two ways to hide a window are both unusable here
+ * (minimising starves the page, headless is Cloudflare-challenged), so the posture
+ * follows the work instead: a lane's window is up while it holds a slot and
+ * minimised the moment it lets go.
+ *
+ * `windowState: "normal"` only. Bounds are deliberately omitted -- CDP rejects a
+ * state change that carries left/top/width/height -- and `focus` is deliberately
+ * not requested anywhere here: restoring a window must not pull focus away from
+ * whatever Maik is doing (C-037).
+ *
+ * Never throws, for the same reason `parkWindow` never does: a window that stayed
+ * hidden is strictly better than a dead daemon.
+ */
+export async function showWindow(context: BrowserContext, page: Page): Promise<void> {
+  try {
+    const cdp = await context.newCDPSession(page);
+    try {
+      const { windowId } = (await cdp.send("Browser.getWindowForTarget")) as { windowId: number };
+      await cdp.send("Browser.setWindowBounds", {
+        windowId,
+        bounds: { windowState: "normal" },
+      });
+    } finally {
+      await cdp.detach().catch(() => undefined);
+    }
+  } catch (err: unknown) {
+    console.error(
+      `[cgpro:background] could not restore a browser window: ${(err as Error).message}. ` +
+        "It stays hidden and the session continues.",
+    );
+  }
+}
+
+/**
  * Never let a native OS file-open dialog reach the user's screen.
  *
  * We drive a REAL Chrome via patchright. Nothing here registered a

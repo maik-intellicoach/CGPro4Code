@@ -30,7 +30,7 @@ import { randomBytes } from "node:crypto";
 import { appendFileSync, openSync, writeSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Page } from "patchright";
-import { openSession, type Session } from "../browser/session.js";
+import { openSession, parkWindow, showWindow, type Session } from "../browser/session.js";
 import { fetchAuthSessionInPage, goHome, isLoggedIn } from "../browser/chatgpt.js";
 import {
   currentConversationId,
@@ -453,12 +453,46 @@ export function slotsOf(state: ServerState): SlotState[] {
   return state.slots;
 }
 
+/**
+ * P-035 2026-09-21. The window posture follows the work.
+ *
+ * A lane's window must be minimised while the lane is idle -- four of them at once
+ * must never appear in front of Maik -- but a minimised window is not drawn, and
+ * the page inside it then crawls and sometimes never renders: measured on one lane
+ * at 415x on `project-chat-surface` and 1600x on `project-navigation-lookup`
+ * against the same page un-minimised. Hiding and rendering are disjoint on this
+ * stack (minimising starves the page; headless is Cloudflare-challenged), so the
+ * window is shown while its slot is leased and parked the moment it is released.
+ *
+ * Best-effort by construction. A posture that failed is strictly better than a
+ * daemon that refused a turn, so this never throws and never blocks: it is fired
+ * without await, on the same rule the diagnostics follow -- telemetry and posture
+ * never gate capacity. Lanes started in front (`--no-background`, CGPRO_VISIBLE=1)
+ * are already visible and are left alone; one of those being parked on release
+ * would hide the very window Maik asked to see.
+ */
+function applyWorkPosture(state: ServerState, slot: SlotState, show: boolean): void {
+  if (!state.background) return;
+  const page = slot.page;
+  if (!page || page.isClosed()) return;
+  let work: Promise<void>;
+  try {
+    const context = page.context();
+    work = show ? showWindow(context, page) : parkWindow(context, page);
+  } catch {
+    // A lease must never fail because its window could not be touched.
+    return;
+  }
+  void work.catch(() => undefined);
+}
+
 /** Leases the lowest free slot. Callers hold queue capacity first, so one is always free. */
 function leaseSlot(state: ServerState, reason: string): SlotState {
   const slot = slotsOf(state).find((s) => !s.busy);
   if (!slot) throw new Error("no free slot despite free capacity");
   slot.busy = true;
   slot.leasedBy = reason;
+  applyWorkPosture(state, slot, true);
   log.info(`slot leased slot=${slot.id} by=${reason}`);
   return slot;
 }
@@ -468,9 +502,10 @@ function leaseSlot(state: ServerState, reason: string): SlotState {
  * instead of leaving an absence to interpret (P-035 2026-09-16). Additive: the
  * flag is cleared exactly as before.
  */
-function releaseSlot(slot: SlotState, reason: string): void {
+function releaseSlot(state: ServerState, slot: SlotState, reason: string): void {
   slot.busy = false;
   slot.leasedBy = null;
+  applyWorkPosture(state, slot, false);
   log.info(`slot released slot=${slot.id} by=${reason}`);
 }
 
@@ -1158,7 +1193,7 @@ export async function handleRequest(
       clearTimeout(timer);
       res.off("close", onDisconnect);
       if (release) {
-        releaseSlot(slot, "preflight");
+        releaseSlot(state, slot, "preflight");
         state.queue.release();
       }
     }
@@ -1195,7 +1230,7 @@ export async function handleRequest(
     } catch (error) {
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: (error as Error).message }));
-    } finally { releaseSlot(slot, "archive"); state.queue.release(); }
+    } finally { releaseSlot(state, slot, "archive"); state.queue.release(); }
     return;
   }
 
@@ -1277,7 +1312,7 @@ export async function handleRequest(
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, conversationId: target, queued: false, working, finalText }));
     } finally {
-      releaseSlot(slot, "reload-inner");
+      releaseSlot(state, slot, "reload-inner");
       state.queue.release();
     }
     return;
@@ -1518,7 +1553,7 @@ export async function handleAsk(
     }
   } finally {
     slot.askInFlight = false;
-    releaseSlot(slot, "ask");
+    releaseSlot(state, slot, "ask");
     state.queue.release();
   }
 }
