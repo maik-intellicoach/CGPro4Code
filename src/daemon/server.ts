@@ -784,13 +784,20 @@ export async function handleRequest(
       .filter((key) => TURN_CRITICAL_SELECTORS.some((critical) => critical.toString() === key));
     const fallback = results.filter((result) => result.firstWorking > 0).length;
     const resolved = results.filter((result) => result.firstWorking === 0).length;
+    // P-035 2026-09-21. Every unresolved key on a live page has two readings --
+    // "the page is not the app" and "the audit ran before the app rendered" --
+    // and they are indistinguishable from the counts alone. The identity read
+    // says which, so a reading taken mid-load cannot be mistaken for a finding.
+    const pageIdentity = await withTimeout(describePageIdentity(page), IDENTITY_TIMEOUT_MS, "page identity timed out");
     log.info(
       `selector audit served file=${DAEMON_FILE} in_flight=${inFlight} ` +
         `resolved=${resolved}/${results.length} absent=${results.length - resolved - fallback} ` +
-        `fallback=${fallback} critical_missing=${missingCritical.length}`,
+        `fallback=${fallback} critical_missing=${missingCritical.length} ${pageIdentity}`,
     );
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, inFlight, results, critical: TURN_CRITICAL_SELECTORS, missingCritical }));
+    res.end(JSON.stringify({
+      ok: true, inFlight, results, critical: TURN_CRITICAL_SELECTORS, missingCritical, pageIdentity,
+    }));
     return;
   }
 
@@ -1091,7 +1098,7 @@ export async function handleRequest(
         // eat into.
         const diagPage = pageCaptured ? await ownedPage : null;
         if (diagPage && !diagPage.isClosed()) {
-          log.error(`selector diagnostic: ${await describeSelectorStateBounded(diagPage, PREFLIGHT_DIAGNOSTIC_TIMEOUT_MS)}`);
+          log.error(`selector diagnostic: ${await describeFailure(diagPage, PREFLIGHT_DIAGNOSTIC_TIMEOUT_MS)}`);
         }
       } catch {
         /* never let diagnostics mask the real failure */
@@ -1489,7 +1496,7 @@ export async function handleAsk(
         // "cancellation unconfirmed", and `STOP refused ... in_flight=1` was
         // CORRECT throughout, because a handler really was still running. One leak,
         // three symptoms. Telemetry never gates capacity.
-        const diagnostic = await describeSelectorStateBounded(slot.page);
+        const diagnostic = await describeFailure(slot.page);
         log.error(`selector diagnostic: ${diagnostic}`);
       }
       if (!clientGone) {
@@ -1615,22 +1622,95 @@ function selectorDiagnosticTimeoutMs(): number {
   return Number.isFinite(raw) && raw >= 50 ? raw : 8_000;
 }
 
-async function describeSelectorStateBounded(
-  page: Page,
-  timeoutMs = selectorDiagnosticTimeoutMs(),
-): Promise<string> {
+async function withTimeout<T>(work: Promise<T>, timeoutMs: number, onTimeout: T): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      // The losing promise keeps running read-only; it is already error-handled,
+      // The losing promise keeps running read-only; callers wrap it in a catch,
       // so abandoning it cannot surface as an unhandled rejection.
-      describeSelectorState(page).catch(() => "unavailable"),
-      new Promise<string>((resolve) => {
-        timer = setTimeout(() => resolve(`timed out after ${timeoutMs}ms`), timeoutMs);
+      work,
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(onTimeout), timeoutMs);
       }),
     ]);
   } finally {
     if (timer) clearTimeout(timer);
+  }
+}
+
+function describeSelectorStateBounded(
+  page: Page,
+  timeoutMs = selectorDiagnosticTimeoutMs(),
+): Promise<string> {
+  return withTimeout(
+    describeSelectorState(page).catch(() => "unavailable"),
+    timeoutMs,
+    `timed out after ${timeoutMs}ms`,
+  );
+}
+
+// P-035 2026-09-21. The identity read is one CDP round-trip against a shell that
+// may already be broken, so it gets its own small slice and goes FIRST. The
+// selector dump below is ~70 round-trips and is what starves: asking for the
+// page's name after it meant the name never arrived, and both diagnostics on the
+// running daemons read `timed out after 3000ms` and nothing else. The slices
+// share one budget, so the composite cannot outlast the caller's own bound.
+const IDENTITY_TIMEOUT_MS = 1_200;
+
+async function describeFailure(page: Page, timeoutMs = selectorDiagnosticTimeoutMs()): Promise<string> {
+  const startedAt = Date.now();
+  const identity = await withTimeout(
+    describePageIdentity(page),
+    Math.min(IDENTITY_TIMEOUT_MS, timeoutMs),
+    "page identity timed out",
+  );
+  const remaining = Math.max(200, timeoutMs - (Date.now() - startedAt));
+  return `${identity} ${await describeSelectorStateBounded(page, remaining)}`;
+}
+
+const IDENTITY_CAPTURE_MAX = 120;
+
+/**
+ * P-035 2026-09-21. Names the page a failure happened on: its address, title,
+ * heading and a few structural markers.
+ *
+ * Why this exists: when every turn-critical selector came back unresolved on a
+ * page the preflight was holding, three explanations fit equally -- a page that
+ * is not the app (logged out, or an interstitial), a shell whose app never
+ * mounted, and a renamed control -- and nothing recorded which. One cheap read
+ * separates them. `appRoot` is the decisive one: a root element with no children
+ * means the script ran and rendered nothing, which no rename can explain, while
+ * `challenge` and `login` identify the other two pages by name.
+ *
+ * Content-free by construction: address, title and heading text only, all
+ * length-capped. A heading is chrome ("ChatGPT", "Log in or sign up", "Just a
+ * moment..."), never conversation or composer text, so this stays safe to log on
+ * an authenticated profile. `hidden` is recorded because a backgrounded or
+ * minimised window can suppress rendering, which is a live candidate here.
+ */
+async function describePageIdentity(page: Page): Promise<string> {
+  try {
+    return await page.evaluate(
+      ({ max }: { max: number }) => {
+        const clean = (value: string | null | undefined): string =>
+          (value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+        const has = (selector: string): boolean => document.querySelector(selector) !== null;
+        const root = document.querySelector("#__next, #root, #app");
+        const appRoot = !root ? "absent" : root.children.length === 0 ? "empty" : "rendered";
+        return (
+          `url="${clean(location.href)}" title="${clean(document.title)}" ` +
+          `ready=${document.readyState} hidden=${document.visibilityState} ` +
+          `heading="${clean(document.querySelector("h1, h2")?.textContent)}" appRoot=${appRoot} ` +
+          `composer=${has("#prompt-textarea") || has('[data-testid="prompt-textarea"]')} ` +
+          `login=${has('[data-testid="login-button"]') || has('a[href*="/auth/login"]')} ` +
+          `challenge=${has("#challenge-form") || has("#cf-wrapper") || has("#challenge-stage")} ` +
+          `scripts=${document.scripts.length}`
+        );
+      },
+      { max: IDENTITY_CAPTURE_MAX },
+    );
+  } catch {
+    return "page identity unavailable";
   }
 }
 

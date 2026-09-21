@@ -899,6 +899,36 @@ describe("daemon-side selector audit", () => {
     expect(body.missingCritical).not.toContain("thinkingPowerButton");
   });
 
+  it("names the page the audit ran against, and survives a page it cannot read", async () => {
+    // P-035 2026-09-21. Counts alone cannot tell "this is not the app" from "the
+    // audit ran before the app rendered", so the audit reports the page's own
+    // identity. A page that cannot be read must still produce a 200: the audit is
+    // a diagnostic, and a diagnostic that throws is worse than an unnamed one.
+    const readable = {
+      isClosed: () => false,
+      locator: () => ({ first: () => ({ count: async () => 0 }) }),
+      evaluate: async () => 'url="https://chatgpt.com/" title="ChatGPT" appRoot=empty',
+    };
+    const unreadable = {
+      isClosed: () => false,
+      locator: () => ({ first: () => ({ count: async () => 0 }) }),
+      evaluate: async () => { throw new Error("Execution context was destroyed"); },
+    };
+    for (const [label, page] of [["readable", readable], ["unreadable", unreadable]] as const) {
+      const req = new FakeReq();
+      Object.assign(req, { method: "GET", url: "/selectors", headers: { authorization: "Bearer test-token" } });
+      const res = new FakeRes();
+      await handleRequest(
+        req as unknown as IncomingMessage,
+        res as unknown as ServerResponse,
+        fakeState({ session: { page } as unknown as Session }),
+      );
+      const body = parseJsonBody(res) as { pageIdentity: string };
+      expect(res.statusCode, label).toBe(200);
+      expect(body.pageIdentity, label).toContain(label === "readable" ? "appRoot=empty" : "unavailable");
+    }
+  });
+
   it.each([false, true])("ignores closed pages, open sibling available: %s", async (hasOpenSibling) => {
     const closed = { isClosed: () => true, locator: vi.fn() };
     const open = {
