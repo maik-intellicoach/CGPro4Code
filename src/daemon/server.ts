@@ -28,7 +28,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
 import { appendFileSync, openSync, writeSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import type { Page } from "patchright";
 import { openSession, type Session } from "../browser/session.js";
 import { fetchAuthSessionInPage, goHome, isLoggedIn } from "../browser/chatgpt.js";
@@ -1664,8 +1664,40 @@ async function describeFailure(page: Page, timeoutMs = selectorDiagnosticTimeout
     Math.min(IDENTITY_TIMEOUT_MS, timeoutMs),
     "page identity timed out",
   );
-  const remaining = Math.max(200, timeoutMs - (Date.now() - startedAt));
-  return `${identity} ${await describeSelectorStateBounded(page, remaining)}`;
+  // `remaining()` after every slice, so the composite still cannot outlast the
+  // caller's own bound however many slices are added.
+  const remaining = (): number => Math.max(200, timeoutMs - (Date.now() - startedAt));
+  const shot = await withTimeout(
+    captureFailureShot(page),
+    Math.min(SCREENSHOT_TIMEOUT_MS, remaining()),
+    "screenshot timed out",
+  );
+  return `${identity} shot=${shot} ${await describeSelectorStateBounded(page, remaining())}`;
+}
+
+const SCREENSHOT_TIMEOUT_MS = 3_000;
+
+/**
+ * P-035 2026-09-21. A picture beside the identity. The identity says which page
+ * this is in words; the picture says what it looked like, which is what a human
+ * can read at a glance and what no amount of counting replaces.
+ *
+ * Written to `<log dir>/failures/`, NOT to the temp dir the older failure
+ * screenshots use: those evaporate on the next reboot, and this one is the
+ * artifact someone is asked to look at later. Best-effort in both directions --
+ * a screenshot never masks the failure it illustrates, and it is bounded so a
+ * throttled renderer cannot hold the slot for it.
+ */
+async function captureFailureShot(page: Page): Promise<string> {
+  const dir = join(dirname(DAEMON_LOG), "failures");
+  const path = join(dir, `${Date.now()}-pid${process.pid}.png`);
+  try {
+    mkdirSync(dir, { recursive: true });
+    await page.screenshot({ path, fullPage: false });
+    return path;
+  } catch (error) {
+    return `unavailable (${(error as Error).message.slice(0, 60)})`;
+  }
 }
 
 const IDENTITY_CAPTURE_MAX = 120;
