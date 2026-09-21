@@ -112,7 +112,7 @@ describe("conversation corroboration retry", () => {
     expect(elapsed).toBeLessThan(15_000);
   });
 
-  it("does not retry a 4xx other than 429", async () => {
+  it("does not retry a 4xx other than 429 and 404", async () => {
     backendApiFetch.mockResolvedValue(response(403));
 
     const calls = fetchLatestTurnToolCalls(page, CONVERSATION_ID, "connector");
@@ -123,6 +123,45 @@ describe("conversation corroboration retry", () => {
     await assertion;
 
     expect(backendApiFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a 404 and accepts the evidence the retried read returns", async () => {
+    // P-035 2026-09-21. A connector-required planning turn retrieved connector
+    // evidence (35 tool calls, counted live from the turn stream) and was then
+    // discarded because this read of its OWN conversation answered 404. A 404
+    // here is transient far more often than it is permanent -- an edge miss, or
+    // a conversation not yet readable server-side as the read races the end of
+    // the turn -- and retrying it costs seconds when it IS permanent, with an
+    // identical refusal. The gate itself is unchanged: the read must still
+    // succeed and must still show the required connector was used.
+    backendApiFetch
+      .mockResolvedValueOnce(response(404))
+      .mockResolvedValueOnce(response(200));
+
+    const calls = await (async () => {
+      const pending = fetchLatestTurnToolCalls(page, CONVERSATION_ID, "connector");
+      await vi.runAllTimersAsync();
+      return pending;
+    })();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.name).toBe("search_context");
+    expect(backendApiFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("still refuses a 404 that never clears, after the same bounded budget", async () => {
+    // The inverse guard. Retrying must not turn a genuinely absent conversation
+    // into an accepted turn: the refusal is unchanged, only later.
+    backendApiFetch.mockResolvedValue(response(404));
+
+    const state = fetchLatestTurnConnectorState(page, CONVERSATION_ID, "connector");
+    const assertion = expect(state).rejects.toThrow(
+      "conversation connector state fetch failed with HTTP 404",
+    );
+    await vi.runAllTimersAsync();
+    await assertion;
+
+    expect(backendApiFetch).toHaveBeenCalledTimes(4);
   });
 
   it("does not retry the 401 that means no access token", async () => {

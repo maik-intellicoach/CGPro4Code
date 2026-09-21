@@ -235,9 +235,28 @@ function corroborationRetryDelayMs(attempt: number, retryAfter: string | null | 
 }
 
 /**
- * Single place both corroboration fetches route through. Retries HTTP 429
- * and 5xx up to `CORROBORATION_MAX_ATTEMPTS`; every other status (including
+ * Single place both corroboration fetches route through. Retries HTTP 429,
+ * 404 and 5xx up to `CORROBORATION_MAX_ATTEMPTS`; every other status (including
  * the 401 that means "no access token") is returned on the first response.
+ *
+ * P-035 2026-09-21. 404 joined the retryable set after a connector-required
+ * planning turn on `intelli` retrieved connector evidence -- 35 tool calls,
+ * counted live from the turn stream -- and was then discarded because THIS read
+ * of its own conversation answered 404 (daemon.log 02:15:10.857Z, invocation
+ * e92a718d). The old policy treated 404 as terminal on the reasoning that "a
+ * genuinely absent conversation 404s forever", which is true of an absent
+ * conversation but not of this read: it is an idempotent GET of a conversation
+ * the turn is demonstrably inside, and the failure is transient far more often
+ * than it is permanent -- an edge/CDN miss, or a conversation not yet readable
+ * server-side when the read races the end of the turn. Retrying costs a few
+ * seconds when the 404 IS permanent, and the refusal is then identical.
+ *
+ * This deliberately does NOT weaken the gate. The read must still eventually
+ * succeed and must still show the required connector was used; what changes is
+ * only how many times a transient answer is believed. Accepting the turn on its
+ * own self-report instead -- "the stream showed connector calls, so skip the
+ * read" -- is the change that would hollow the gate out, because independence
+ * from the turn's self-report is the entire reason this read exists.
  */
 async function fetchConversationForCorroboration(
   page: Page,
@@ -249,7 +268,7 @@ async function fetchConversationForCorroboration(
   let result = await backendApiFetch(page, url, { timeoutMs });
   const attempts = retryTransient ? CORROBORATION_MAX_ATTEMPTS : 1;
   for (let attempt = 1; attempt < attempts; attempt++) {
-    if (result.ok || (result.status !== 429 && result.status < 500)) break;
+    if (result.ok || (result.status !== 429 && result.status !== 404 && result.status < 500)) break;
     const delayMs = corroborationRetryDelayMs(attempt, result.retryAfter);
     // A bounded read may give up, but must never retry before Retry-After.
     if (delayMs > CORROBORATION_MAX_DELAY_MS + CORROBORATION_JITTER_MS) break;
