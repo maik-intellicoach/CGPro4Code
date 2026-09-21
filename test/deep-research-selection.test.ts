@@ -3,11 +3,20 @@ import type { Page } from "patchright";
 
 const firstResolved = vi.fn();
 const requireSelector = vi.fn();
+const fetchModels = vi.fn();
 
 vi.mock("../src/browser/chatgpt.js", () => ({
   firstResolved: (...args: unknown[]) => firstResolved(...args),
   requireSelector: (...args: unknown[]) => requireSelector(...args),
 }));
+
+// P-035 2026-09-21. Deep Research selection reaches the 6 Pro power gate, whose
+// expected composer label now comes from the account's catalogue. Only the
+// fetch is stubbed; the matching helpers stay real.
+vi.mock("../src/api/models.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/api/models.js")>();
+  return { ...actual, fetchModels: (...args: unknown[]) => fetchModels(...args) };
+});
 
 const { setDeepResearch } = await import("../src/browser/conversation.js");
 
@@ -96,7 +105,12 @@ function scenario(options: {
   return { page, plus, toggle, effort };
 }
 
-beforeEach(() => { firstResolved.mockReset(); requireSelector.mockReset(); });
+beforeEach(() => {
+  firstResolved.mockReset();
+  requireSelector.mockReset();
+  fetchModels.mockReset();
+  fetchModels.mockResolvedValue([{ slug: "gpt-6-pro", title: "6 Pro" }]);
+});
 
 describe("native Deep Research selection", () => {
   it("verifies selection from the composer chip after clicking the picker row", async () => {
@@ -154,12 +168,12 @@ describe("native Deep Research selection", () => {
 
   it("rejects High even when the native chip is selected and the slider reports maximum", async () => {
     const test = scenario({ initiallySelected: true, effortLabel: "High" });
-    await expect(setDeepResearch(test.page, true)).rejects.toThrow("maximum power state is not selected");
+    await expect(setDeepResearch(test.page, true)).rejects.toThrow(/composer shows "High"/);
   });
 
   it("also verifies 6 Pro when only the picker reports native mode already selected", async () => {
     const test = scenario({ initiallySelected: true, chipExposed: false, effortLabel: "High" });
-    await expect(setDeepResearch(test.page, true)).rejects.toThrow("maximum power state is not selected");
+    await expect(setDeepResearch(test.page, true)).rejects.toThrow(/composer shows "High"/);
     expect(test.toggle.click).not.toHaveBeenCalled();
   });
 });

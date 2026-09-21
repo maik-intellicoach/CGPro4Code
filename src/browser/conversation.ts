@@ -2,6 +2,7 @@ import type { Page, Locator } from "patchright";
 import { SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
 import { listProjects } from "../api/projects.js";
+import { fetchModels, findProModel, normaliseModelLabel, type ChatgptModel } from "../api/models.js";
 import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, SelectorBrokenError, TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation } from "../core/stream.js";
 
@@ -176,6 +177,7 @@ async function ensureChatTab(page: Page): Promise<void> {
 
 export type ModelVerificationPhase =
   | "model-control-lookup" | "model-control-wait" | "model-control-click"
+  | "model-catalogue-read"
   | "model-open-slider" | "model-button-state" | "model-slider-wait"
   | "model-slider-lookup" | "model-slider-maximum" | "model-slider-minimum"
   | "model-slider-focus" | "model-slider-end" | "model-value-wait"
@@ -189,21 +191,34 @@ export type ModelVerificationPhase =
  *
  * P-035 2026-09-21, observed live on the intelli lane with the slider at 3/3:
  * the row's text is `Extra High` -- the top state's label under the current UI
- * -- where the code previously required `6 Pro`. The menu now holds one item
- * (`Extra High`) and the slider; it no longer renders a model name at all.
+ * -- where the code previously required `6 Pro`.
  *
- * This set is deliberately CLOSED. `High`, `5.6Pro` and `Instant` are lower or
- * older states and must keep failing, and an unrecognised label fails closed,
- * because the thing on the other side of this gate is a paid turn that may run
- * below maximum power. A future rename breaks the lane loudly rather than
- * silently admitting it -- that is the intended direction.
+ * That observation was answered twice, and the second answer is the one that
+ * holds. First the accepted labels were widened to `6 Pro|Extra High`, which is
+ * a HEDGE: it cannot tell "one top state under two names" from "a lower tier
+ * wearing a different label", and it left the gate unable to corroborate the
+ * model NAME at all.
  *
- * KNOWN ASSURANCE GAP, recorded rather than papered over: this gate can no
- * longer corroborate the model NAME, only that the power control sits at its
- * proven maximum and displays a known top-state label. Per-turn model-name
- * verification now has to come from somewhere other than the composer.
+ * Maik, 2026-09-21 13:41: "6 Pro is still mandatory", and the label should be
+ * deterministic on any subscribed account. So the expected label is no longer
+ * written here at all: it is read from the ACCOUNT'S OWN catalogue, which states
+ * the Pro model's title in whatever vocabulary that account renders. A rename
+ * therefore moves both sides together, an account without the Pro model fails
+ * closed with `model_control_unresolved`, and a page sitting on a different
+ * model fails loudly naming both the observed text and the expected title.
+ * `High`, `5.6Pro` and `Instant` keep failing because they are not the
+ * catalogued Pro model's title.
  */
-const MAXIMUM_POWER_LABEL = /^(?:6\s*Pro|Extra\s*High)$/i;
+
+/** The catalogue read, with one retry, for the pre-submit model check. */
+async function readCatalogueForModelCheck(page: Page): Promise<ChatgptModel[]> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const models = await fetchModels(page).catch(() => [] as ChatgptModel[]);
+    if (models.length > 0) return models;
+    if (attempt === 0) await page.waitForTimeout(1_000);
+  }
+  return [];
+}
 
 /** Verify the current 6 Pro power control before any prompt is submitted. */
 export async function ensureProSixMaximum(
@@ -318,7 +333,23 @@ export async function ensureProSixMaximum(
     const model = await requireSelector(page, SELECTORS.selectedPowerModel, "selected thinking model");
     mark("model-selected-text");
     const selected = (await model.textContent() ?? "").trim();
-    if (!MAXIMUM_POWER_LABEL.test(selected)) {
+    // P-035 2026-09-21. What the composer is expected to show is read from the
+    // account's OWN catalogue, never written here. Hardcoding the label is what
+    // made a rename read as a broken UI and cost this project a week.
+    mark("model-catalogue-read");
+    const proModel = findProModel(await readCatalogueForModelCheck(page));
+    if (!proModel) {
+      const unresolved = new PreSubmitInteractionError(
+        "model_control_unresolved",
+        "model_verification",
+        "The account's model catalogue carries no Pro model, so a paid turn could not be proven to run on 6 Pro",
+      );
+      failedPhase = phase;
+      failure = classifyInteractionFailure(unresolved);
+      throw unresolved;
+    }
+    const expectedLabel = normaliseModelLabel(proModel.title ?? proModel.slug);
+    if (normaliseModelLabel(selected) !== expectedLabel) {
       // P-035 2026-09-21. Capture the menu WHILE IT IS STILL OPEN. The daemon's
       // selector diagnostic runs after this path has called closeOpenMenus, so
       // its row reading can only ever say `absent` -- it did, on a live failure,
@@ -345,10 +376,20 @@ export async function ensureProSixMaximum(
       } catch {
         // A diagnostic must never mask the failure it describes.
       }
-      console.error(`[cgpro:model] maximum power check failed: selected="${selected.slice(0, 60)}" ${detail}`);
-      throw new Error("the maximum power state is not selected in the thinking menu");
+      console.error(
+        `[cgpro:model] maximum power check failed: selected="${selected.slice(0, 60)}" ` +
+          `expected="${expectedLabel}" catalogueSlug="${proModel.slug}" ${detail}`,
+      );
+      const wrongModel = new PreSubmitInteractionError(
+        "model_control_unresolved",
+        "model_verification",
+        `The composer shows "${selected}" where the account's catalogue says the Pro model is "${proModel.title ?? proModel.slug}"`,
+      );
+      failedPhase = phase;
+      failure = classifyInteractionFailure(wrongModel);
+      throw wrongModel;
     }
-    return { model: "gpt-6-pro", power: max };
+    return { model: proModel.slug, power: max };
   } catch (error) {
     failedPhase = phase;
     failure = classifyInteractionFailure(error);

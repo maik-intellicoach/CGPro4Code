@@ -4,10 +4,18 @@ import { SelectorBrokenError } from "../src/errors.js";
 
 const requireSelector = vi.fn();
 const firstResolved = vi.fn();
+const fetchModels = vi.fn();
 vi.mock("../src/browser/chatgpt.js", () => ({
   firstResolved: (...args: unknown[]) => firstResolved(...args),
   requireSelector: (...args: unknown[]) => requireSelector(...args),
 }));
+// P-035 2026-09-21. The expected composer label is read from the account's own
+// catalogue, so only the fetch is stubbed; findProModel and normaliseModelLabel
+// stay the real implementations under test.
+vi.mock("../src/api/models.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/api/models.js")>();
+  return { ...actual, fetchModels: (...args: unknown[]) => fetchModels(...args) };
+});
 const { ensureProSixMaximum, menuIsThinkingEffort } = await import("../src/browser/conversation.js");
 
 function setup(options: {
@@ -56,7 +64,12 @@ function setup(options: {
   return { page, model, slider };
 }
 
-beforeEach(() => { requireSelector.mockReset(); firstResolved.mockReset(); });
+beforeEach(() => {
+  requireSelector.mockReset();
+  firstResolved.mockReset();
+  fetchModels.mockReset();
+  fetchModels.mockResolvedValue([{ slug: "gpt-6-pro", title: "6 Pro" }]);
+});
 
 describe("6 Pro maximum thinking admission", () => {
   it("moves a lower slider value to the observed maximum and verifies it", async () => {
@@ -91,24 +104,53 @@ describe("6 Pro maximum thinking admission", () => {
 
   it("refuses an older Pro model even when its power is at maximum", async () => {
     const s = setup({ modelLabel: "5.6Pro" });
-    await expect(ensureProSixMaximum(s.page)).rejects.toThrow("maximum power state is not selected");
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/composer shows "5\.6Pro"/);
     expect(s.slider.focus).toHaveBeenCalledOnce();
   });
 
   // P-035 2026-09-21. This is the label a live intelli preflight read off the
-  // row while the slider sat at 3/3, and the lane failed every turn on it. The
-  // top power state's label moved from `6 Pro` to `Extra High`; the menu no
-  // longer renders a model name at all.
-  it("accepts the label the current UI gives the top power state", async () => {
+  // row while the slider sat at 3/3. It is accepted or refused on ONE basis
+  // only: whether it is the title the account's own catalogue gives its Pro
+  // model. Here the account calls that model `Extra High`, so it passes without
+  // any label being written into this codebase.
+  it("accepts whatever title the account's catalogue gives its Pro model", async () => {
+    fetchModels.mockResolvedValue([{ slug: "gpt-6-pro", title: "Extra High" }]);
     const s = setup({ modelLabel: "Extra High" });
     await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 4 });
   });
 
-  // The accepted set is closed, not a prefix match: a label that merely starts
-  // like a known top state must not admit a paid turn below maximum power.
-  it("refuses a label that is only a prefix of a known top state", async () => {
-    const s = setup({ modelLabel: "Extra" });
-    await expect(ensureProSixMaximum(s.page)).rejects.toThrow("maximum power state is not selected");
+  // A catalogue title of `GPT-6 Pro` and a composer label of `6 Pro` name the
+  // same model, so the comparison drops a leading `gpt` and normalises spacing.
+  it("matches a catalogue title that carries a gpt prefix", async () => {
+    fetchModels.mockResolvedValue([{ slug: "gpt-6-pro", title: "GPT-6 Pro" }]);
+    const s = setup({ modelLabel: "6 Pro" });
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 4 });
+  });
+
+  it("refuses a label that is only a prefix of the catalogued title", async () => {
+    const s = setup({ modelLabel: "6" });
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/composer shows "6"/);
+  });
+
+  // Maik, 2026-09-21 13:41: the label must be deterministic on any subscribed
+  // account. An account whose catalogue carries no Pro model is the one case
+  // where it cannot be, and that must refuse the turn rather than fall through
+  // to whatever the composer happens to show.
+  it("refuses the turn when the account's catalogue carries no Pro model", async () => {
+    fetchModels.mockResolvedValue([{ slug: "gpt-5-5", title: "GPT-5.5" }]);
+    const s = setup();
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/no Pro model/);
+    expect(s.slider.focus).toHaveBeenCalledOnce();
+  });
+
+  // A catalogue that cannot be read is not evidence of anything, so the retry
+  // runs and the turn still refuses rather than admitting a paid turn on a
+  // model nobody could name.
+  it("retries a catalogue read that comes back empty, then refuses", async () => {
+    fetchModels.mockResolvedValue([]);
+    const s = setup();
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/no Pro model/);
+    expect(fetchModels).toHaveBeenCalledTimes(2);
   });
 
   // P-035 2026-09-21. The composer pill opens the thinking-effort menu, so
@@ -233,7 +275,8 @@ describe("6 Pro maximum thinking admission", () => {
       "model-slider-wait", "model-slider-lookup", "model-slider-maximum",
       "model-slider-minimum", "model-slider-focus", "model-slider-end",
       "model-value-wait", "model-slider-current", "model-selected-lookup",
-      "model-selected-text", "model-cleanup-escape", "model-cleanup-menu-count",
+      "model-selected-text", "model-catalogue-read", "model-cleanup-escape",
+      "model-cleanup-menu-count",
     ]);
   });
 
