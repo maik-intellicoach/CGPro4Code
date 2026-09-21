@@ -304,6 +304,13 @@ export interface ServerState {
     plan: string;
     proModelAvailable: boolean;
   };
+  /**
+   * When `account` was last read from the page (ms epoch). P-035 2026-09-21:
+   * the probe used to run only once, at startup, so a lane whose entitlement
+   * changed mid-life kept serving the old answer until its next restart. This
+   * is what `/status` consults to decide whether to re-read.
+   */
+  accountProbedAt?: number;
   /** CGPRO_DAEMON_SLOTS clamped to 1..4; absent means 1. */
   maxSlots?: number;
   slots?: SlotState[];
@@ -337,7 +344,64 @@ export function createServerState(
     reloadConversation: null,
     interaction: { state: "unknown" },
     account,
+    accountProbedAt: account ? Date.now() : undefined,
     maxSlots,
+  };
+}
+
+/**
+ * How long a cached capability probe may answer `/status` before it is re-read.
+ *
+ * P-035 2026-09-21. `proModelAvailable` gates routing to a paid lane, and it was
+ * read exactly once, at daemon start: a lane could run for days on an
+ * entitlement that had since been revoked. The refresh rides `/status` -- the
+ * one place the value is served -- rather than adding a per-turn API call, and
+ * the ceiling is 45 minutes so an hourly observer, or any consumer polling less
+ * often than that, always sees a value at most one poll old.
+ */
+const ACCOUNT_PROBE_TTL_MS = Math.max(
+  60_000,
+  Number(process.env.CGPRO_ACCOUNT_PROBE_TTL_MS ?? 45 * 60_000) || 45 * 60_000,
+);
+
+type DaemonAccount = NonNullable<ServerState["account"]>;
+
+/** Read the account's capability facts from the page this daemon already holds. */
+async function probeAccountCapabilities(page: Page): Promise<DaemonAccount> {
+  return (await readAccountCapabilities(page)).account;
+}
+
+/**
+ * The capability read, plus whether it is EVIDENCE at all.
+ *
+ * P-035 2026-09-21, caught by a test rather than in production. A failed read and
+ * a genuine revocation have the same shape: `proModelAvailable: false`. The
+ * first refresh I wrote accepted either, so one transient blip would have
+ * rewritten an entitled lane as unentitled and taken it out of routing --
+ * a failed read turned into a fact, which is the same defect this project has
+ * been unwinding all week, pointing the other way. `proved` is what lets the
+ * refresh keep the previous answer instead.
+ */
+async function readAccountCapabilities(
+  page: Page,
+): Promise<{ account: DaemonAccount; proved: boolean }> {
+  const auth = await fetchAuthSessionInPage(page);
+  const { me, models } = await fetchDaemonAccountCapabilities(page);
+  const proModelAvailable = findProSlug(models) !== null;
+  const detectedPlan = detectPlan(me);
+  const email = me?.email ?? auth?.user?.email;
+  return {
+    account: {
+      email,
+      // ChatGPT currently omits a plan label for this account while returning
+      // the authenticated Pro model catalogue. The entitlement is the stronger
+      // capability fact; never promote a known non-Pro label.
+      plan: detectedPlan === "unknown" && proModelAvailable ? "pro" : detectedPlan,
+      proModelAvailable,
+    },
+    // An authenticated identity AND a model catalogue that actually came back.
+    // Either missing means this read says nothing about the account.
+    proved: Boolean(email) && models.length > 0,
   };
 }
 
@@ -596,18 +660,7 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
       );
       throw new NotLoggedInError();
     }
-    const auth = await fetchAuthSessionInPage(session.page);
-    const { me, models } = await fetchDaemonAccountCapabilities(session.page);
-    const proModelAvailable = findProSlug(models) !== null;
-    const detectedPlan = detectPlan(me);
-    account = {
-      email: me?.email ?? auth?.user?.email,
-      // ChatGPT currently omits a plan label for this account while returning
-      // the authenticated Pro model catalogue. The entitlement is the stronger
-      // capability fact; never promote a known non-Pro label.
-      plan: detectedPlan === "unknown" && proModelAvailable ? "pro" : detectedPlan,
-      proModelAvailable,
-    };
+    account = await probeAccountCapabilities(session.page);
   } catch (error) {
     // A failed pre-listener probe used to terminate Node while Chrome still
     // owned the persistent profile. Chrome then marked the profile as crashed
@@ -741,6 +794,39 @@ export async function handleRequest(
   if (method === "GET" && url.pathname === "/status") {
     const slots = slotsOf(state);
     const busySlots = slots.filter((s) => s.busy).length;
+    // P-035 2026-09-21. Re-read the capability facts when they are stale, and
+    // only while the lane is provably idle: the probe drives the page this
+    // daemon holds, and `/status` is polled every five minutes by the watchdog,
+    // so it must never contend with a live turn. A failed re-read keeps the
+    // previous answer and says so -- `/status` staying available matters more
+    // than it being fresh, and the staleness is then bounded by the next poll.
+    if (
+      state.account &&
+      typeof state.accountProbedAt === "number" &&
+      busySlots === 0 &&
+      !state.queue.busy &&
+      !state.askInFlight &&
+      Date.now() - state.accountProbedAt > ACCOUNT_PROBE_TTL_MS
+    ) {
+      try {
+        const refreshed = await readAccountCapabilities(state.session.page);
+        if (refreshed.proved) {
+          state.account = refreshed.account;
+          state.accountProbedAt = Date.now();
+          log.info(
+            `account capability refreshed profile=${state.profile ?? "default"} ` +
+              `pro_model_available=${state.account.proModelAvailable}`,
+          );
+        } else {
+          // A read that cannot be told apart from a failed one is not evidence.
+          // Keep the previous answer and leave the clock running, so the next
+          // poll tries again rather than waiting out another full TTL.
+          log.error("account capability refresh returned no readable session or catalogue; keeping the previous answer");
+        }
+      } catch (error) {
+        log.error(`account capability refresh failed: ${(error as Error).message}`);
+      }
+    }
     const status: StatusResponse = {
       pid: process.pid,
       startedAt: state.startedAt.toISOString(),

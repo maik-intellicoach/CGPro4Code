@@ -8,7 +8,7 @@ vi.mock("../src/browser/chatgpt.js", () => ({
   firstResolved: (...args: unknown[]) => firstResolved(...args),
   requireSelector: (...args: unknown[]) => requireSelector(...args),
 }));
-const { ensureProSixMaximum } = await import("../src/browser/conversation.js");
+const { ensureProSixMaximum, menuIsThinkingEffort } = await import("../src/browser/conversation.js");
 
 function setup(options: {
   max?: string | null;
@@ -109,6 +109,23 @@ describe("6 Pro maximum thinking admission", () => {
   it("refuses a label that is only a prefix of a known top state", async () => {
     const s = setup({ modelLabel: "Extra" });
     await expect(ensureProSixMaximum(s.page)).rejects.toThrow("maximum power state is not selected");
+  });
+
+  // P-035 2026-09-21. The composer pill opens the thinking-effort menu, so
+  // tryEnsureModel's model-name search could never match and it warned on every
+  // turn. Detecting the effort menu is what lets it stay quiet, and this is the
+  // detection: the power slider, counted attached rather than visible because
+  // ChatGPT hides it on its ThumbInput span.
+  it("identifies the thinking-effort menu by its attached power slider", async () => {
+    const page = {
+      locator: () => ({ count: async () => 1 }),
+    } as unknown as Page;
+    await expect(menuIsThinkingEffort(page)).resolves.toBe(true);
+  });
+
+  it("does not mistake a menu without a power slider for the effort menu", async () => {
+    const page = { locator: () => ({ count: async () => 0 }) } as unknown as Page;
+    await expect(menuIsThinkingEffort(page)).resolves.toBe(false);
   });
 
   it("refuses a missing 6 Pro control before changing any thinking setting", async () => {

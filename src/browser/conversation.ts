@@ -411,6 +411,31 @@ async function closeOpenMenus(page: Page, onPhase?: (phase: ModelVerificationPha
   }
 }
 
+/**
+ * True when the composer's pill has opened the THINKING-EFFORT menu rather than
+ * a model list, identified by the power slider the effort menu contains.
+ *
+ * P-035 2026-09-21. On the current UI the pill renders the effort level ("Extra
+ * High"), no model name appears anywhere in the composer, and `tryEnsureModel`'s
+ * model-name search could therefore never match again: it printed "no menu item
+ * matched" on EVERY turn. A warning that always fires is one nobody reads, and
+ * the day it fires for a real reason it will look identical.
+ *
+ * Attached count, not visibility: ChatGPT renders `role="slider"` on a hidden
+ * ThumbInput span, so a visible-first lookup would miss the one element that
+ * identifies this menu. Silence here is only safe because the paid-model
+ * outcome is owned downstream by `ensureProSixMaximum`, which fails the turn
+ * closed before submission; a menu that is NOT the effort menu and still lacks
+ * the requested model keeps its loud warning, because that is a real regression.
+ */
+export async function menuIsThinkingEffort(page: Page): Promise<boolean> {
+  let attached = 0;
+  for (const candidate of SELECTORS.thinkingPowerSlider) {
+    attached += await page.locator(candidate).count().catch(() => 0);
+  }
+  return attached > 0;
+}
+
 async function tryEnsureModel(page: Page, slug: string): Promise<void> {
   const trigger = await firstResolved(page, SELECTORS.modelSwitcher);
   if (!trigger) {
@@ -447,7 +472,7 @@ async function tryEnsureModel(page: Page, slug: string): Promise<void> {
           `[cgpro:model] WARNING: found the "Pro" menu item but the click failed. Proceeding with current model.`,
         );
       });
-    } else {
+    } else if (!(await menuIsThinkingEffort(page))) {
       console.error(
         `[cgpro:model] WARNING: model switcher opened but no menu item matched "${slug}" or "Pro". Proceeding with current model. Run \`cgpro doctor\` to audit selectors.`,
       );

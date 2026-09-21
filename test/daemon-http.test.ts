@@ -222,6 +222,48 @@ it("returns authenticated account facts from daemon status", async () => {
   });
 });
 
+it("re-reads a stale account capability probe on an idle lane", async () => {
+  // P-035 2026-09-21. proModelAvailable gated routing to a paid lane and was
+  // read once, at daemon start, so a revoked entitlement stayed True for as long
+  // as the lane lived. The refresh rides /status, the one place it is served.
+  const evaluate = vi.fn(async () => ({ ok: false, code: "network" }));
+  const state = fakeState({
+    account: { email: "account@example.test", plan: "pro", proModelAvailable: true },
+    accountProbedAt: Date.now() - 60 * 60_000,
+    session: { page: { isClosed: () => false, url: () => "https://chatgpt.com/", evaluate } } as unknown as Session,
+  });
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "GET", url: "/status", headers: { authorization: "Bearer test-token" } });
+
+  await handleRequest(req, res, state);
+
+  expect(evaluate).toHaveBeenCalled();
+  // A failed re-read keeps the previous answer rather than emptying it:
+  // /status staying available matters more than it being fresh.
+  expect(parseJsonBody(res as unknown as FakeRes)).toMatchObject({
+    account: { email: "account@example.test", proModelAvailable: true },
+  });
+});
+
+it("never re-probes a busy lane from /status", async () => {
+  const evaluate = vi.fn(async () => ({ ok: false, code: "network" }));
+  const state = fakeState({
+    account: { email: "account@example.test", plan: "pro", proModelAvailable: true },
+    accountProbedAt: Date.now() - 60 * 60_000,
+    askInFlight: true,
+    session: { page: { isClosed: () => false, url: () => "https://chatgpt.com/", evaluate } } as unknown as Session,
+  });
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "GET", url: "/status", headers: { authorization: "Bearer test-token" } });
+
+  await handleRequest(req, res, state);
+
+  expect(evaluate).not.toHaveBeenCalled();
+  expect((res as unknown as FakeRes).statusCode).toBe(200);
+});
+
 it("marks an idle lane interaction-ready after a no-submit preflight", async () => {
   runInteractionPreflight.mockResolvedValue({
     accountVerified: true,
