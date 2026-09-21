@@ -237,6 +237,16 @@ export type ModelVerificationPhase =
  */
 const MAX_EFFORT_ROW_LABELS = new Set(["extrahigh"]);
 
+/**
+ * The version number a model label carries: `6 Pro` and `6Pro` give 6,
+ * `GPT-5.5 Pro` gives 5.5, `Extra High` gives null. Read from the RAW label,
+ * because normalising strips the separator that carries `5.5`'s meaning.
+ */
+function modelVersion(label: string): number | null {
+  const found = label.match(/(\d+(?:\.\d+)?)/);
+  return found ? Number(found[1]) : null;
+}
+
 async function readCatalogueForModelCheck(
   page: Page,
 ): Promise<{ models: ChatgptModel[]; reason: string }> {
@@ -411,8 +421,33 @@ export async function ensureProSixMaximum(
       );
       return { model: proModel.slug, power: max };
     }
-    const expectedLabel = normaliseModelLabel(proModel.title ?? proModel.slug);
+    const catalogueLabel = proModel.title ?? proModel.slug;
+    const expectedLabel = normaliseModelLabel(catalogueLabel);
     if (observed !== expectedLabel) {
+      // P-035 2026-09-21. The two sides can disagree and still agree about the
+      // thing that matters. A live personal preflight refused with `The composer
+      // shows "6Pro" where the account's catalogue says the Pro model is
+      // "GPT-5.5 Pro"` -- a Pro account whose UI offers 6 Pro while the API still
+      // lists 5.5 Pro, which is a catalogue lagging a rollout, not a turn running
+      // on the wrong model. So the rule is one-directional: the composer must be
+      // on a Pro model AT LEAST AS NEW as the catalogue's. Older still refuses
+      // (that is the deliberate 5.6-Pro refusal), a label that does not name a Pro
+      // model still refuses (`6`, `High`), and the disagreement is printed either
+      // way so the lag is visible instead of silent.
+      const composerVersion = modelVersion(selected);
+      const catalogueVersion = modelVersion(catalogueLabel);
+      const atLeastAsNew =
+        observed.includes("pro") &&
+        composerVersion !== null &&
+        catalogueVersion !== null &&
+        composerVersion >= catalogueVersion;
+      if (atLeastAsNew) {
+        console.error(
+          `[cgpro:model] catalogue lags the composer: composer="${selected}" catalogue="${catalogueLabel}". ` +
+            "The composer is at least as new and this is a Pro model, so the turn proceeds.",
+        );
+        return { model: proModel.slug, power: max };
+      }
       // P-035 2026-09-21. Capture the menu WHILE IT IS STILL OPEN. The daemon's
       // selector diagnostic runs after this path has called closeOpenMenus, so
       // its row reading can only ever say `absent` -- it did, on a live failure,

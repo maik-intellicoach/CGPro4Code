@@ -129,6 +129,16 @@ describe("6 Pro maximum thinking admission", () => {
     await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 4 });
   });
 
+  // P-035 2026-09-21. A Pro account whose UI offers 6 Pro while the account's
+  // catalogue still lists 5.5 Pro is a catalogue lagging a rollout, not a turn on
+  // the wrong model. The live personal refusal read exactly that, so the rule is
+  // one-directional: at least as new is accepted, older still refuses (below).
+  it("accepts a composer model at least as new as the catalogue's, and says the catalogue lags", async () => {
+    fetchModels.mockResolvedValue([{ slug: "gpt-5-5-pro", title: "GPT-5.5 Pro" }]);
+    const s = setup({ modelLabel: "6Pro" });
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-5-5-pro", power: 4 });
+  });
+
   // P-035 2026-09-21. The composer pill opens TWO popovers, and when the effort
   // one is open the row this gate reads carries the effort label. That is not a
   // model name and must not be compared as one: the live refusal on intelli read
