@@ -1014,24 +1014,40 @@ async function clickConnector(page: Page, row: Locator, name: string): Promise<v
 export async function setConnector(page: Page, name: string): Promise<void> {
   const connectorName = name.trim();
   if (!connectorName) throw new Error("connector name must not be empty");
+  // P-035 2026-09-21. Per-step timing on stderr, where the daemon already
+  // captures this module's diagnostics. The phase timeline calls this whole
+  // function one 114.8-second block, and every wait inside it is small and
+  // bounded (3-8s), so the cost is in how MANY of them run rather than in any
+  // one -- which is invisible at phase resolution and obvious at step
+  // resolution. Nine marks, one line each.
+  let markAt = Date.now();
+  const step = (label: string): void => {
+    console.error(`[cgpro:connector] step=${label} ms=${Date.now() - markAt}`);
+    markAt = Date.now();
+  };
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
   await composer.click();
   await page.keyboard.press("Meta+A");
   await page.keyboard.press("Backspace");
   await page.keyboard.type("@");
   await page.waitForTimeout(300);
+  step("at-sign-typed");
 
   let connector = await waitForComposerTool(page, connectorName);
+  step("picker-wait");
   if (connector) {
     // Already attached - skip the click (clicking an attached row can
     // toggle it off) and accept the honest state.
     if (await attachedState(connector)) {
       await page.keyboard.press("Escape").catch(() => undefined);
+      step("already-attached");
       return;
     }
     await clickConnector(page, connector, connectorName);
+    step("picker-click");
     await page.waitForTimeout(300);
     await assertConnectorAttached(page, connectorName);
+    step("attach-assert");
     // Dismiss the @-picker, exactly as the already-attached branch above does.
     // Leaving it open was the 2026-09-17 prompt-loss bug: CDP insertText goes to
     // whatever holds focus, so the whole prompt was typed into the picker's
@@ -1054,6 +1070,7 @@ export async function setConnector(page: Page, name: string): Promise<void> {
   await composer.click();
   await page.keyboard.press("Meta+A");
   await page.keyboard.press("Backspace");
+  step("picker-missing");
   if (!(await openComposerToolsPopover(page))) {
     await recordConnectorDiagnostics(page);
     throw new Error(`ChatGPT connector picker is unavailable; could not select "${connectorName}".`);
@@ -1080,6 +1097,7 @@ export async function setConnector(page: Page, name: string): Promise<void> {
     // short set of suggestions, so absence there is not absence from the
     // account. Search the exact configured name before trying older nested
     // menu layouts.
+    step("plus-popover");
     const pluginSearch = await pluginSearchBox(page);
     if (pluginSearch) {
       await pluginSearch.fill(connectorName);
