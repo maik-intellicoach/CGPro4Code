@@ -1149,7 +1149,15 @@ it.each([
   const result = parseJsonBody(res as unknown as FakeRes) as Record<string, unknown>;
   expect(result.code).toBe(expected.code);
   expect(result.failure).toEqual(expected);
-  expect(JSON.stringify(result)).not.toContain("private");
+  // The intent is that exception INTERNALS never reach the wire. It used to
+  // assert the absence of the word "private", which the fixture's own selector
+  // name contains, so it passed for the wrong reason and broke the moment the
+  // refusal's own sentence was added to the response.
+  const wire = JSON.stringify(result);
+  expect(wire).not.toContain('"cause"');
+  expect(wire).not.toContain("stack");
+  expect(wire).not.toContain('"hint"');
+  expect(result.message).toEqual(expect.any(String));
 });
 
 describe("a failed turn never lets its own telemetry hold the lane", () => {

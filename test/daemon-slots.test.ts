@@ -486,8 +486,19 @@ describe("bounded preflight lease lifecycle", () => {
       phase, ...(failed ? { failedPhase: failed } : {}),
       elapsedMs: expect.any(Number), phaseElapsedMs: expect.any(Number),
       timeline: expect.any(Array), timelineTruncated: false,
+      // P-035 2026-09-21. The refusal carries its own sentence as well as its
+      // code: "which gate refused" and "what it saw" are different facts, and
+      // the second is what a diagnosis runs on.
+      message: expect.any(String),
     });
-    expect(request.res.writes.join("")).not.toContain("private");
+    // The intent here is that exception INTERNALS never reach the wire -- no
+    // cause, no stack, no CLI hint. It used to assert the absence of the word
+    // "private", which the fixture's own selector name contains and which the
+    // message legitimately carries, so it tested the wrong thing twice.
+    const wire = request.res.writes.join("");
+    expect(wire).not.toContain('"cause"');
+    expect(wire).not.toContain("stack");
+    expect(wire).not.toContain('"hint"');
     expect(state.queue.busy).toBe(false);
   });
 
@@ -522,6 +533,7 @@ describe("bounded preflight lease lifecycle", () => {
       expect(JSON.parse(request.res.writes.join(""))).toEqual({
         error: "interaction_preflight_failed", code: "interaction_preflight_timeout",
         phase: "model-slider-focus", elapsedMs: 140_000, phaseElapsedMs: 2_000,
+        message: expect.any(String),
         timeline: [
           { phase: "slot-page", startedMs: 0, durationMs: 1_000 },
           { phase: "project-row-wait", startedMs: 1_000, durationMs: 137_000 },

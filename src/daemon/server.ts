@@ -1177,9 +1177,15 @@ export async function handleRequest(
       };
       if (!res.destroyed && cancelled !== "interaction_preflight_disconnected") {
         res.writeHead(409, { "Content-Type": "application/json" });
+        // P-035 2026-09-21. The message travels with the code. Without it the
+        // caller learns only WHICH gate refused, never what it saw: a catalogue
+        // read that failed and a catalogue with no Pro model are the same code,
+        // and the sentence that tells them apart was being dropped here. The ask
+        // path has always passed `message` through; this one did not.
         res.end(JSON.stringify({
           error: "interaction_preflight_failed",
           ...(failureCode ? { code: failureCode } : {}),
+          message: error instanceof Error ? error.message.slice(0, 400) : String(error).slice(0, 400),
           phase: cancelled ? phase : error instanceof PreSubmitInteractionError ? error.phase : phase,
           ...(failedPhase ? { failedPhase } : {}),
           ...(failure ? { failure } : {}),
