@@ -1121,3 +1121,73 @@ it.each([
   expect(result.failure).toEqual(expected);
   expect(JSON.stringify(result)).not.toContain("private");
 });
+
+describe("a failed turn never lets its own telemetry hold the lane", () => {
+  // P-035 2026-09-21. `ask turn failed: ChatGPT UI changed: selector "Projects
+  // navigation" no longer resolves` was followed 20m41s later by the diagnostic
+  // that captured it (daemon.log 01:13:34 -> 01:34:15, invocation 46c030c5). The
+  // slot, askInFlight and the client's SSE stream were all held for that whole
+  // window, so a correct `STOP refused ... in_flight=1` read as a stuck lease and
+  // the client needed an external SIGTERM at 15 min. These two tests are the bite
+  // check on the bound: with the unbounded await, neither request settles at all.
+  function neverResolvingPage() {
+    return {
+      isClosed: () => false,
+      url: () => "https://chatgpt.com/",
+      // describeSelectorState's first move is `locator(c).count()` on the locator
+      // itself -- NOT `.first().count()`. Returning only `first` here makes that
+      // call throw a TypeError, which the capture's own `.catch()` swallows, so the
+      // bound is never exercised and the test passes against the unfixed code.
+      locator: () => ({
+        count: () => new Promise(() => {}),
+        first: () => ({ isVisible: () => new Promise(() => {}) }),
+      }),
+    };
+  }
+
+  it("releases the slot and answers the client when the diagnostic hangs", async () => {
+    const previous = process.env.CGPRO_SELECTOR_DIAGNOSTIC_TIMEOUT_MS;
+    process.env.CGPRO_SELECTOR_DIAGNOSTIC_TIMEOUT_MS = "120";
+    try {
+      const page = neverResolvingPage();
+      const state = fakeState({ session: { page } as unknown as Session });
+      slotsOf(state)[0].page = page as unknown as import("patchright").Page;
+
+      const emitter = new StreamEmitter();
+      // A terminal event ends the async iteration; the rejection then takes the
+      // catch path under test.
+      emitter.push({
+        type: "error",
+        message: "selector gone",
+        promptSubmitted: false,
+        code: "selector_unresolved",
+      });
+      runAskOnSession.mockReturnValue({
+        events: emitter,
+        result: Promise.resolve().then(() => {
+          throw new SelectorBrokenError("private project");
+        }),
+        cancel: async () => {},
+      });
+
+      const req = new FakeReq() as unknown as IncomingMessage;
+      const res = new FakeRes() as unknown as ServerResponse;
+      Object.assign(req, { method: "POST" });
+      const pending = handleAsk(req, res as unknown as ServerResponse, state);
+      sendBody(req, { prompt: "hi" });
+      await pending;
+
+      const slot = slotsOf(state)[0];
+      expect(slot.leasedBy).toBeNull();
+      expect(slot.askInFlight).toBe(false);
+      expect(state.queue.busy).toBe(false);
+      // The client learns the turn failed instead of waiting on a stream the
+      // daemon is still holding open. Without the bound this request never
+      // settles, which is the bite check on this test.
+      expect((res as unknown as FakeRes).writes.join("")).toContain("event: error");
+    } finally {
+      if (previous === undefined) delete process.env.CGPRO_SELECTOR_DIAGNOSTIC_TIMEOUT_MS;
+      else process.env.CGPRO_SELECTOR_DIAGNOSTIC_TIMEOUT_MS = previous;
+    }
+  });
+});

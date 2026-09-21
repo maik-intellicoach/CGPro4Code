@@ -70,6 +70,9 @@ const PROBE_PROMPT_MAX_CHARS = 200_000;
 const PREFLIGHT_TIMEOUT_MS = 140_000;
 const PROBE_PREFLIGHT_TIMEOUT_MS = 290_000;
 const PREFLIGHT_CLOSE_TIMEOUT_MS = 10_000;
+// The preflight diagnostic budget stays where it was (3s): the daemon-slots
+// quarantine test's timing depends on it, and its whole point is a prompt 409.
+const PREFLIGHT_DIAGNOSTIC_TIMEOUT_MS = 3_000;
 const QUEUE_MAX = Math.max(1, Number(process.env.CGPRO_DAEMON_QUEUE_MAX) || 4);
 const QUEUE_MAX_WAIT_MS = Math.max(1, Number(process.env.CGPRO_DAEMON_QUEUE_MAX_WAIT_MS) || 7_200_000);
 
@@ -1088,12 +1091,7 @@ export async function handleRequest(
         // eat into.
         const diagPage = pageCaptured ? await ownedPage : null;
         if (diagPage && !diagPage.isClosed()) {
-          await Promise.race([
-            describeSelectorState(diagPage)
-              .then((d) => log.error(`selector diagnostic: ${d}`))
-              .catch(() => undefined),
-            new Promise<void>((resolve) => setTimeout(resolve, 3_000)),
-          ]);
+          log.error(`selector diagnostic: ${await describeSelectorStateBounded(diagPage, PREFLIGHT_DIAGNOSTIC_TIMEOUT_MS)}`);
         }
       } catch {
         /* never let diagnostics mask the real failure */
@@ -1483,7 +1481,15 @@ export async function handleAsk(
         `invocation=${slot.currentInvocation ?? "-"} url=${slot.page?.url() ?? "-"}`,
       );
       if (err instanceof SelectorBrokenError && slot.page && !slot.page.isClosed()) {
-        const diagnostic = await describeSelectorState(slot.page).catch(() => "unavailable");
+        // P-035 2026-09-21. This used to await the unbounded capture. On a page
+        // whose selectors stopped resolving, one capture took 20m41s (daemon.log
+        // 01:13:34 -> 01:34:15, invocation 46c030c5) and held slot 0, askInFlight
+        // and the client's SSE stream for all of it -- after the turn had already
+        // failed. The client then needed an external SIGTERM at 15 min and reported
+        // "cancellation unconfirmed", and `STOP refused ... in_flight=1` was
+        // CORRECT throughout, because a handler really was still running. One leak,
+        // three symptoms. Telemetry never gates capacity.
+        const diagnostic = await describeSelectorStateBounded(slot.page);
         log.error(`selector diagnostic: ${diagnostic}`);
       }
       if (!clientGone) {
@@ -1598,6 +1604,36 @@ function readJsonBody<T>(
  * let a paid turn run below maximum power. When it fails, nothing recorded what
  * the label actually held, so every repair attempt was a guess.
  */
+// P-035 2026-09-21. Both selector-diagnostic call sites need the same rule: a
+// capture is telemetry, so it may never hold a slot, an in-flight turn or an open
+// SSE stream. The default is generous because a healthy capture is ~70 CDP
+// round-trips and finishing it is worth a few seconds; the floor exists so the
+// bound itself is testable. Read per call, not at module load, so a test can
+// lower it without re-importing the module.
+function selectorDiagnosticTimeoutMs(): number {
+  const raw = Number(process.env.CGPRO_SELECTOR_DIAGNOSTIC_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw >= 50 ? raw : 8_000;
+}
+
+async function describeSelectorStateBounded(
+  page: Page,
+  timeoutMs = selectorDiagnosticTimeoutMs(),
+): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      // The losing promise keeps running read-only; it is already error-handled,
+      // so abandoning it cannot surface as an unhandled rejection.
+      describeSelectorState(page).catch(() => "unavailable"),
+      new Promise<string>((resolve) => {
+        timer = setTimeout(() => resolve(`timed out after ${timeoutMs}ms`), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function describeSelectorState(page: Page): Promise<string> {
   const groups: Array<[string, string[]]> = [
     ["composer", SELECTORS.composer],
