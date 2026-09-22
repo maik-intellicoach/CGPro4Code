@@ -31,11 +31,17 @@ const { ensureProSixMaximum, menuIsThinkingEffort } = await import("../src/brows
 function setup(options: {
   max?: string | null;
   sticks?: boolean;
-  modelLabel?: string;
+  /** The composer row's own text. Since 2026-09-22 this is the EFFORT label. */
+  effortLabel?: string;
   clickTimesOut?: boolean;
   menuOpened?: boolean;
   openMenus?: number;
   menuStaysOpen?: boolean;
+  /** The model list the picker reports, newest first. */
+  pickerEntries?: string[];
+  pickerCheckedIndex?: number;
+  /** The picker names no selected model at all. */
+  pickerEmpty?: boolean;
 } = {}) {
   let value = "1";
   const model = {
@@ -44,7 +50,12 @@ function setup(options: {
     }),
     getAttribute: vi.fn(async (name: string) => options.menuOpened && name === "data-state" ? "open" : null),
   };
-  const selected = { textContent: vi.fn(async () => options.modelLabel === "High" && value === (options.max ?? "4") ? "6Pro" : options.modelLabel ?? "6Pro") };
+  const selected = {
+    textContent: vi.fn(async () =>
+      options.effortLabel === "High" && value === (options.max ?? "4") ? "6Pro" : options.effortLabel ?? "6Pro",
+    ),
+    click: vi.fn(async () => {}),
+  };
   const slider = {
     getAttribute: vi.fn(async (name: string) => ({
       "aria-valuemin": "0",
@@ -67,11 +78,24 @@ function setup(options: {
       if (key === "Escape" && !options.menuStaysOpen) openMenus = 0;
     }) },
     waitForTimeout: vi.fn(async () => {}),
-    evaluate: vi.fn(async () => openMenus),
+    // Three probes share this entry point on the real page, told apart by
+    // argument shape: the pointer-blocker count takes a selector string, the
+    // picker read takes `{ max }`, and the menu dump takes
+    // `{ selectedSelector, max }` and returns prose.
+    evaluate: vi.fn(async (_fn: unknown, arg: unknown) => {
+      if (typeof arg === "string") return openMenus;
+      const keys = arg && typeof arg === "object" ? Object.keys(arg) : [];
+      if (keys.includes("selectedSelector")) return "row=\"6 Pro\" menus=1 menuItems=[] sliders=[4/4]";
+      if (options.pickerEmpty) return { entries: [], checkedIndex: -1 };
+      return {
+        entries: options.pickerEntries ?? ["Latest", "GPT-5.6 Sol", "GPT-5.5"],
+        checkedIndex: options.pickerCheckedIndex ?? 0,
+      };
+    }),
   } as unknown as Page;
   requireSelector.mockResolvedValueOnce(model).mockResolvedValueOnce(slider).mockResolvedValueOnce(selected);
   firstResolved.mockResolvedValue(options.menuOpened ? slider : null);
-  return { page, model, slider };
+  return { page, model, slider, selected };
 }
 
 beforeEach(() => {
@@ -84,7 +108,7 @@ beforeEach(() => {
 describe("6 Pro maximum thinking admission", () => {
   it("moves a lower slider value to the observed maximum and verifies it", async () => {
     const s = setup();
-    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 4 });
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "Latest", power: 4 });
     expect(s.slider.focus).toHaveBeenCalledWith({ timeout: 5_000 });
     expect(s.page.keyboard.press).toHaveBeenCalledWith("End");
     expect(s.page.keyboard.press).toHaveBeenCalledWith("Escape");
@@ -92,7 +116,7 @@ describe("6 Pro maximum thinking admission", () => {
 
   it("uses the live maximum instead of assuming a fixed number", async () => {
     const s = setup({ max: "5" });
-    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 5 });
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "Latest", power: 5 });
   });
 
   it("refuses submission when maximum power does not stick", async () => {
@@ -107,62 +131,60 @@ describe("6 Pro maximum thinking admission", () => {
     expect(s.slider.focus).not.toHaveBeenCalled();
   });
 
-  it("upgrades High to maximum power and verifies the resulting 6 Pro model", async () => {
-    const s = setup({ modelLabel: "High" });
-    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 4 });
+  it("upgrades a lower effort level to maximum power and proceeds", async () => {
+    const s = setup({ effortLabel: "High" });
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "Latest", power: 4 });
   });
 
-  it("refuses an older Pro model even when its power is at maximum", async () => {
-    const s = setup({ modelLabel: "5.6Pro" });
-    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/composer shows "5\.6Pro"/);
+  // P-035 2026-09-22. Maik's three ordered screenshots settled what the row
+  // carries: the collapsed pill reads "6 Pro", the first click opens the EFFORT
+  // panel, and clicking the "6 Pro >" row switches to the MODEL list, where
+  // "Latest" carries the check. So the row's own label is the effort level, and
+  // the model is read from the picker's checked entry.
+  it("reads the model from the picker and reports the model it actually saw", async () => {
+    const s = setup({ effortLabel: "Extra High", pickerEntries: ["Latest", "GPT-5.6 Sol", "GPT-5.5"] });
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "Latest", power: 4 });
+  });
+
+  it("refuses when the picker is on an older model than its newest entry", async () => {
+    const s = setup({ pickerEntries: ["Latest", "GPT-5.6 Sol", "GPT-5.5"], pickerCheckedIndex: 2 });
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(
+      /has "GPT-5\.5" selected, where the newest model is "Latest"/,
+    );
     expect(s.slider.focus).toHaveBeenCalledOnce();
   });
 
-  // P-035 2026-09-21. This is the label a live intelli preflight read off the
-  // row while the slider sat at 3/3. It is accepted or refused on ONE basis
-  // only: whether it is the title the account's own catalogue gives its Pro
-  // model. Here the account calls that model `Extra High`, so it passes without
-  // any label being written into this codebase.
-  it("accepts whatever title the account's catalogue gives its Pro model", async () => {
-    fetchModels.mockResolvedValue([{ slug: "gpt-6-pro", title: "Extra High" }]);
-    const s = setup({ modelLabel: "Extra High" });
-    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 4 });
+  // The picker is the app's own ordering, newest first, so whichever entry sits
+  // at the top is the newest -- no model name is written into this codebase.
+  it("accepts whichever entry the picker puts first, whatever it is called", async () => {
+    const s = setup({ pickerEntries: ["GPT-5.7 Pro", "GMT-5.6 Sol"], pickerCheckedIndex: 0 });
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "GPT-5.7 Pro", power: 4 });
   });
 
-  // P-035 2026-09-21. A Pro account whose UI offers 6 Pro while the account's
-  // catalogue still lists 5.5 Pro is a catalogue lagging a rollout, not a turn on
-  // the wrong model. The live personal refusal read exactly that, so the rule is
-  // one-directional: at least as new is accepted, older still refuses (below).
-  it("accepts a composer model at least as new as the catalogue's, and says the catalogue lags", async () => {
+  // P-035 2026-09-22. The API catalogue lags the composer -- it still lists
+  // GPT-5.5 Pro while the picker offers a newer list -- which is exactly why the
+  // catalogue stopped being the anchor. It is read for the account's entitlement
+  // and logged for drift, never compared against the composer.
+  it("proceeds when the catalogue lags the picker, and says so in the log", async () => {
     fetchModels.mockResolvedValue([{ slug: "gpt-5-5-pro", title: "GPT-5.5 Pro" }]);
-    const s = setup({ modelLabel: "6Pro" });
-    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-5-5-pro", power: 4 });
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const s = setup({ effortLabel: "Extra High", pickerEntries: ["Latest", "GPT-5.6 Sol"] });
+      await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "Latest", power: 4 });
+      expect(error.mock.calls.flat().join(" ")).toContain('catalogue="GPT-5.5 Pro"');
+    } finally {
+      error.mockRestore();
+    }
   });
 
-  // P-035 2026-09-21. The composer pill opens TWO popovers, and when the effort
-  // one is open the row this gate reads carries the effort label. That is not a
-  // model name and must not be compared as one: the live refusal on intelli read
-  // `The composer shows "Extra High" where the account's catalogue says the Pro
-  // model is "GPT-5.5 Pro"`, which refused a lane whose composer was fine. An
-  // effort label leaves the model to the catalogue, which is what it is for;
-  // maximum effort is proven by the slider's own arithmetic.
-  it("reads the row's effort label as no model opinion and takes the model from the catalogue", async () => {
-    fetchModels.mockResolvedValue([{ slug: "gpt-5-5-pro", title: "GPT-5.5 Pro" }]);
-    const s = setup({ modelLabel: "Extra High" });
-    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-5-5-pro", power: 4 });
+  it("refuses when the picker names no selected model", async () => {
+    const s = setup({ pickerEmpty: true });
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/named no selected model/);
   });
 
-  // A catalogue title of `GPT-6 Pro` and a composer label of `6 Pro` name the
-  // same model, so the comparison drops a leading `gpt` and normalises spacing.
-  it("matches a catalogue title that carries a gpt prefix", async () => {
-    fetchModels.mockResolvedValue([{ slug: "gpt-6-pro", title: "GPT-6 Pro" }]);
-    const s = setup({ modelLabel: "6 Pro" });
-    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 4 });
-  });
-
-  it("refuses a label that is only a prefix of the catalogued title", async () => {
-    const s = setup({ modelLabel: "6" });
-    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/composer shows "6"/);
+  it("refuses whichever model the picker reports once it is not the newest", async () => {
+    const s = setup({ pickerEntries: ["Latest", "GPT-5.6 Sol", "GPT-5"], pickerCheckedIndex: 1 });
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/has "GPT-5\.6 Sol" selected/);
   });
 
   // Maik, 2026-09-21 13:41: the label must be deterministic on any subscribed
@@ -246,7 +268,7 @@ describe("6 Pro maximum thinking admission", () => {
 
   it("accepts a timed-out activation when the live menu postcondition is already open", async () => {
     const s = setup({ clickTimesOut: true, menuOpened: true });
-    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 4 });
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "Latest", power: 4 });
     expect(s.model.getAttribute).not.toHaveBeenCalled();
   });
 
@@ -279,7 +301,7 @@ describe("6 Pro maximum thinking admission", () => {
   it("retries Escape and warns, without throwing, when the menu refuses to close", async () => {
     const warn = vi.spyOn(console, "error").mockImplementation(() => {});
     const s = setup({ menuStaysOpen: true });
-    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "gpt-6-pro", power: 4 });
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "Latest", power: 4 });
     const escapes = (s.page.keyboard.press as unknown as { mock: { calls: string[][] } }).mock.calls
       .filter((call) => call[0] === "Escape").length;
     expect(escapes).toBeGreaterThan(1);

@@ -2,7 +2,7 @@ import type { Page, Locator } from "patchright";
 import { SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
 import { listProjects } from "../api/projects.js";
-import { fetchModelsWithReason, findProModel, normaliseModelLabel, type ChatgptModel } from "../api/models.js";
+import { fetchModelsWithReason, findProModel, type ChatgptModel } from "../api/models.js";
 import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, SelectorBrokenError, TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation } from "../core/stream.js";
 
@@ -220,32 +220,25 @@ export type ModelVerificationPhase =
  * fault is in the read.
  */
 /**
- * The one composer-row label that means "maximum thinking effort" rather than a
- * model name.
+ * P-035 2026-09-22. `MAX_EFFORT_ROW_LABELS` and `modelVersion` used to live here.
+ * Both rested on reading the composer's row as a model name. Maik's three ordered
+ * screenshots of the live composer settled it: the row carries the EFFORT level
+ * ("6 Pro" collapsed, "Extra High" on a second account, "6Pro" on a third -- the
+ * same Pro level in three rollout spellings), and the model is chosen separately
+ * in the model list behind it. So the effort vocabulary was never needed to
+ * recognise a model, and comparing an effort label's digits to the catalogue's
+ * model version was comparing two different axes. See `readPickerModel`.
  *
- * The pill carries `aria-haspopup="menu"` and drives both the model picker and
- * the thinking-effort control, so the row the model gate reads holds either a
- * model name or an effort label. `Extra High` is what the top of the effort
- * slider reads, and this codebase has carried it as the alternative to the model
- * name since before this gate existed -- which is the evidence that it means
- * "6 Pro at maximum", not "some other model".
- *
- * Deliberately NOT a general effort vocabulary. `High`, `Medium` and `Instant`
- * stay refusals, because those are genuinely lower states: the Deep Research gate
- * refuses `High` even when its own chip is selected and the slider reports
- * maximum, and that must keep refusing (P-035 2026-09-21).
+ * What survives is the one job the effort label still has: the levels BELOW the
+ * top. The slider's own `aria-valuenow` is what proves the effort, so a row that
+ * still names one of these while the slider reports its maximum is a
+ * contradiction, and P-035 2026-09-21 recorded exactly that shape live -- the
+ * Deep Research gate saw `High` with the chip selected and the slider at maximum.
+ * A paid turn is not admitted on a contradiction. Matched on the whole
+ * normalised label, never as a substring: `Extra High` normalises to `extrahigh`
+ * and is the TOP level, not a lower one.
  */
-const MAX_EFFORT_ROW_LABELS = new Set(["extrahigh"]);
-
-/**
- * The version number a model label carries: `6 Pro` and `6Pro` give 6,
- * `GPT-5.5 Pro` gives 5.5, `Extra High` gives null. Read from the RAW label,
- * because normalising strips the separator that carries `5.5`'s meaning.
- */
-function modelVersion(label: string): number | null {
-  const found = label.match(/(\d+(?:\.\d+)?)/);
-  return found ? Number(found[1]) : null;
-}
+const LOWER_EFFORT_LABELS = new Set(["high", "medium", "low", "instant", "minimal"]);
 
 async function readCatalogueForModelCheck(
   page: Page,
@@ -316,7 +309,83 @@ async function describeModelMenu(page: Page): Promise<string> {
   }
 }
 
-/** Verify the current 6 Pro power control before any prompt is submitted. */
+interface PickedModel {
+  /** Every selectable entry, in the picker's own order (newest first). */
+  entries: string[];
+  /** Text of the checked entry, "" when none is checked. */
+  checked: string;
+  /** Text of the first entry: the newest model, by the app's own ordering. */
+  first: string;
+  /** Index of the checked entry, -1 when none is checked. */
+  checkedIndex: number;
+}
+
+/**
+ * The model the composer is actually on, from the picker's own checked entry.
+ *
+ * P-035 2026-09-22, from Maik's three ordered screenshots of the live composer:
+ * the collapsed pill reads "6 Pro"; the first click opens the EFFORT panel (a
+ * "6 Pro >" row plus the power slider); clicking that row switches to the MODEL
+ * list, where "Latest" carries the check above "GPT-5.6 Sol" and "GPT-5.5
+ * Leaving on October 14". "6 Pro" therefore names the maximum thinking-EFFORT
+ * level, not a model, and the model is a separate axis.
+ *
+ * Selectable entries are the ones carrying `aria-checked` or `data-state`; the
+ * two control rows in the same popover (`aria-label="Select model"` and
+ * `aria-label="Power"`) carry neither. That separates the model list from the
+ * controls without hardcoding a single model name. The app orders the list
+ * newest first, so "the checked entry is the first" is a structural fact about
+ * the composer rather than a label this repo would have to keep in step.
+ *
+ * One click on the row labelled "Select model" opens the model list when the
+ * effort panel is showing; when the entries are already rendered, no click is
+ * needed. Never throws: an unreadable picker returns no entries, which the
+ * caller refuses on.
+ */
+async function readPickerModel(page: Page, row: Locator): Promise<PickedModel> {
+  const read = async (): Promise<{ entries: string[]; checkedIndex: number }> => {
+    try {
+      return await page.evaluate(
+        ({ max }: { max: number }) => {
+          const clean = (value: string | null): string =>
+            (value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+          const selectable = Array.from(
+            document.querySelectorAll('[role="menuitem"],[role="menuitemradio"]'),
+          ).filter(
+            (el) =>
+              el.getAttribute("aria-checked") !== null || el.getAttribute("data-state") !== null,
+          );
+          return {
+            entries: selectable.map((el) => clean(el.textContent)),
+            checkedIndex: selectable.findIndex(
+              (el) =>
+                el.getAttribute("aria-checked") === "true" ||
+                el.getAttribute("data-state") === "checked",
+            ),
+          };
+        },
+        { max: MODEL_MENU_TEXT_MAX },
+      );
+    } catch {
+      return { entries: [], checkedIndex: -1 };
+    }
+  };
+
+  let { entries, checkedIndex } = await read();
+  if (checkedIndex < 0) {
+    await row.click({ timeout: 5_000 }).catch(() => undefined);
+    await page.waitForTimeout(2_000);
+    ({ entries, checkedIndex } = await read());
+  }
+  return {
+    entries,
+    checked: checkedIndex >= 0 ? entries[checkedIndex] ?? "" : "",
+    first: entries[0] ?? "",
+    checkedIndex,
+  };
+}
+
+/** Verify the current Pro effort at maximum on the newest model, before any prompt is submitted. */
 export async function ensureProSixMaximum(
   page: Page,
   onPhase?: (phase: ModelVerificationPhase, failedPhase?: ModelVerificationPhase, failure?: InteractionFailure) => void,
@@ -423,15 +492,34 @@ export async function ensureProSixMaximum(
     if (current === null || Number(current) !== max) {
       throw new Error("6 Pro thinking power did not reach its maximum");
     }
-    // On the current UI, moving the power slider upgrades High to 6 Pro.
-    // Verify the resulting model, rather than rejecting the lower initial level.
+    // On the current UI, moving the power slider is what puts the composer on Pro
+    // effort; the model is a separate choice made in the same popover.
     mark("model-selected-lookup");
     const model = await requireSelector(page, SELECTORS.selectedPowerModel, "selected thinking model");
     mark("model-selected-text");
-    const selected = (await model.textContent() ?? "").trim();
-    // P-035 2026-09-21. What the composer is expected to show is read from the
-    // account's OWN catalogue, never written here. Hardcoding the label is what
-    // made a rename read as a broken UI and cost this project a week.
+    const effortLabel = (await model.textContent() ?? "").trim();
+    // The slider above already proved the effort reached its maximum; a row that
+    // still names a LOWER level contradicts it. P-035 2026-09-21 kept this
+    // refusal for the Deep Research gate, which saw `High` with the native chip
+    // selected and the slider at maximum -- and it keeps refusing now, on the
+    // axis it was always about (effort), rather than by comparing the label to a
+    // catalogue model title.
+    if (LOWER_EFFORT_LABELS.has(effortLabel.toLowerCase().replace(/\s+/g, ""))) {
+      const unresolved = new PreSubmitInteractionError(
+        "model_control_unresolved",
+        "model_verification",
+        `The composer shows "${effortLabel}" where the thinking control reports its maximum, so Pro effort could not be verified`,
+      );
+      failedPhase = phase;
+      failure = classifyInteractionFailure(unresolved);
+      throw unresolved;
+    }
+    // P-035 2026-09-21. What the account offers is read from the account's OWN
+    // catalogue, never written here. Hardcoding a label is what made a rename read
+    // as a broken UI and cost this project a week. The catalogue is now evidence
+    // about the ACCOUNT, not the anchor for the composer: Maik's screenshots show
+    // the API still lists GPT-5.5 Pro while the picker offers a newer list, so a
+    // catalogue can lag a rollout and must not be what the composer is judged by.
     mark("model-catalogue-read");
     const catalogue = await readCatalogueForModelCheck(page);
     const proModel = findProModel(catalogue.models);
@@ -451,82 +539,38 @@ export async function ensureProSixMaximum(
       failure = classifyInteractionFailure(unresolved);
       throw unresolved;
     }
-    // P-035 2026-09-21. The composer pill opens TWO popovers -- the model picker
-    // and the thinking-effort control -- and when the effort one is open, the row
-    // this gate reads carries the EFFORT label ("Extra High") rather than a model
-    // name. Comparing that to the catalogue's title refused a perfectly good lane:
-    // the live refusal read
-    //   The composer shows "Extra High" where the account's catalogue says the
-    //   Pro model is "GPT-5.5 Pro"
-    // An effort label is no opinion about the model at all, so it must not be read
-    // as one. The model then comes from the catalogue, which is what a catalogue
-    // is for, and maximum effort is already proven above by the slider's own
-    // aria-valuenow -- arithmetic, which needs no label.
-    //
-    // The strict comparison below is unchanged for a row that DOES name a model,
-    // including the deliberate refusal of an older Pro model.
-    const observed = normaliseModelLabel(selected);
-    if (MAX_EFFORT_ROW_LABELS.has(observed)) {
-      // P-035 2026-09-22. This branch certifies a model nobody looked at: the row
-      // carries the effort label, so the model comes from the account's API
-      // catalogue, and on the intelli lane that catalogue says 5.5 Pro. Record
-      // the popover's own structure while it is still open, which is the only
-      // place the composer's real model can be read.
-      const detail = await describeModelMenu(page);
-      console.error(
-        `[cgpro:model] composer row reads the effort label "${selected}" (the effort popover was open); ` +
-          `model taken from the catalogue: "${proModel.title ?? proModel.slug}" at maximum power ${detail}`,
-      );
-      return { model: proModel.slug, power: max };
-    }
     const catalogueLabel = proModel.title ?? proModel.slug;
-    const expectedLabel = normaliseModelLabel(catalogueLabel);
-    if (observed !== expectedLabel) {
-      // P-035 2026-09-21. The two sides can disagree and still agree about the
-      // thing that matters. A live personal preflight refused with `The composer
-      // shows "6Pro" where the account's catalogue says the Pro model is
-      // "GPT-5.5 Pro"` -- a Pro account whose UI offers 6 Pro while the API still
-      // lists 5.5 Pro, which is a catalogue lagging a rollout, not a turn running
-      // on the wrong model. So the rule is one-directional: the composer must be
-      // on a Pro model AT LEAST AS NEW as the catalogue's. Older still refuses
-      // (that is the deliberate 5.6-Pro refusal), a label that does not name a Pro
-      // model still refuses (`6`, `High`), and the disagreement is printed either
-      // way so the lag is visible instead of silent.
-      const composerVersion = modelVersion(selected);
-      const catalogueVersion = modelVersion(catalogueLabel);
-      const atLeastAsNew =
-        observed.includes("pro") &&
-        composerVersion !== null &&
-        catalogueVersion !== null &&
-        composerVersion >= catalogueVersion;
-      if (atLeastAsNew) {
-        console.error(
-          `[cgpro:model] catalogue lags the composer: composer="${selected}" catalogue="${catalogueLabel}". ` +
-            "The composer is at least as new and this is a Pro model, so the turn proceeds.",
-        );
-        return { model: proModel.slug, power: max };
-      }
-      // P-035 2026-09-21. Capture the menu WHILE IT IS STILL OPEN. The daemon's
-      // selector diagnostic runs after this path has called closeOpenMenus, so
-      // its row reading can only ever say `absent` -- it did, on a live failure,
-      // and that is why repairing this assertion has cost guess after guess.
-      // P-035 2026-09-22: extracted to describeModelMenu, which the effort-label
-      // branch above now calls too, and which records each item's own state.
+    // The model comes from the picker's checked entry, and the requirement is the
+    // picker's NEWEST model. The effort label this row carries ("Extra High",
+    // "6Pro" and "6 Pro" are the same Pro level in three rollout spellings) is no
+    // opinion about the model at all, so it is recorded and never compared.
+    const picked = await readPickerModel(page, model);
+    if (picked.checkedIndex !== 0) {
       const detail = await describeModelMenu(page);
       console.error(
-        `[cgpro:model] maximum power check failed: selected="${selected.slice(0, 60)}" ` +
-          `expected="${expectedLabel}" catalogueSlug="${proModel.slug}" ${detail}`,
+        `[cgpro:model] the composer is not on the picker's newest model: ${detail} ` +
+          `catalogue="${catalogueLabel}"`,
       );
       const wrongModel = new PreSubmitInteractionError(
         "model_control_unresolved",
         "model_verification",
-        `The composer shows "${selected}" where the account's catalogue says the Pro model is "${proModel.title ?? proModel.slug}"`,
+        picked.entries.length === 0
+          ? "The composer's model picker named no selected model, so a paid turn could not be proven to run on the newest model at Pro effort"
+          : `The composer's model picker has "${picked.checked}" selected, where the newest model is "${picked.first}"`,
       );
       failedPhase = phase;
       failure = classifyInteractionFailure(wrongModel);
       throw wrongModel;
     }
-    return { model: proModel.slug, power: max };
+    console.error(
+      `[cgpro:model] Pro effort on the picker's newest model: effort="${effortLabel}" ` +
+        `selected="${picked.checked}" of [${picked.entries.join(", ")}] ` +
+        `catalogue="${catalogueLabel}"`,
+    );
+    // The model reported is the one the picker showed, not the catalogue's slug.
+    // The catalogue can lag the composer (it lists GPT-5.5 Pro while the picker
+    // offers a newer list), so naming it here would record a model nobody read.
+    return { model: picked.checked, power: max };
   } catch (error) {
     failedPhase = phase;
     failure = classifyInteractionFailure(error);

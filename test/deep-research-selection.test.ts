@@ -69,6 +69,9 @@ function scenario(options: {
   const effort = {
     textContent: vi.fn(async () => options.effortLabel ?? "6Pro"),
     getAttribute: vi.fn(async () => null),
+    // P-035 2026-09-22. The row labelled "Select model" is clicked once to open
+    // the model list when the effort panel is showing.
+    click: vi.fn(async () => {}),
   };
   const page = {
     keyboard: {
@@ -77,6 +80,14 @@ function scenario(options: {
       press: vi.fn(async (key: string) => { if (key === "End") power = "4"; else popoverOpen = false; }),
     },
     waitForTimeout: vi.fn(async () => {}),
+    // The picker's own checked entry is where the model is read from since
+    // 2026-09-22; a selector-string argument is the pointer-blocker count.
+    evaluate: vi.fn(async (_fn: unknown, arg: unknown) => {
+      if (typeof arg === "string") return 0;
+      const keys = arg && typeof arg === "object" ? Object.keys(arg) : [];
+      if (keys.includes("selectedSelector")) return "row=\"6Pro\" menus=1 menuItems=[] sliders=[4/4]";
+      return { entries: options.pickerEntries ?? ["Latest", "GPT-5.6 Sol"], checkedIndex: 0 };
+    }),
   } as unknown as Page;
   let power = "2";
   requireSelector.mockImplementation(async (_page: Page, _selectors: string[], name: string) => {
