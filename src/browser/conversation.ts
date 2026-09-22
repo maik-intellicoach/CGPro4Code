@@ -240,6 +240,27 @@ export type ModelVerificationPhase =
  */
 const LOWER_EFFORT_LABELS = new Set(["high", "medium", "low", "instant", "minimal"]);
 
+/**
+ * The app's own affordance for "always the newest model", by its on-screen name.
+ *
+ * P-035 2026-09-22. A live review objected to the first version of the picker
+ * read, correctly: "the checked entry is the first entry" proves POSITION, not
+ * recency, so an app that ever promotes a pinned or recommended entry above the
+ * newest model would be certified as newest while every other part of the gate
+ * still validated. A dump of every attribute each entry carries was taken to
+ * find an independent recency signal, and there is none: the only per-entry
+ * attribute is the checked state itself, and the only icon is the checkmark on
+ * the checked entry. So "which entry does the app call latest" is the strongest
+ * signal available, and it is a NAME rather than a position.
+ *
+ * This is deliberately not a model name. `Latest` is a control the app offers --
+ * the same one Maik reads as "where we should stay" -- so a rename fails CLOSED
+ * and loudly (the whole list is logged) instead of certifying an older model.
+ * A silent false positive cost this project a week once already; a loud refusal
+ * costs one turn.
+ */
+const NEWEST_MODEL_SENTINELS = new Set(["latest"]);
+
 async function readCatalogueForModelCheck(
   page: Page,
 ): Promise<{ models: ChatgptModel[]; reason: string }> {
@@ -318,6 +339,65 @@ interface PickedModel {
   first: string;
   /** Index of the checked entry, -1 when none is checked. */
   checkedIndex: number;
+}
+
+/**
+ * Every attribute a picker entry carries, one bounded line each.
+ *
+ * P-035 2026-09-22. This exists to answer ONE open question that a live ChatGPT
+ * Pro review raised against `readPickerModel`: "the checked entry is the first
+ * entry" proves POSITION, not recency, so an app that ever promotes a pinned or
+ * recommended entry above the newest model would be certified as newest while
+ * every other part of the gate still validates. If the picker marks recency in
+ * any way of its own -- a badge, a title, an aria-description, an icon, a testid
+ * on a wrapper -- that mark is the signal the gate should anchor on instead.
+ *
+ * Gated on `CGPRO_PICKER_DUMP=1` rather than logged every turn: it is a layout
+ * question with one answer, and the answer is meant to make this function
+ * unnecessary. Chrome only and bounded on every axis; never throws.
+ */
+async function describePickerEntries(page: Page): Promise<string> {
+  try {
+    return await page.evaluate(
+      ({ max, htmlMax }: { max: number; htmlMax: number }) => {
+        const clean = (value: string | null | undefined): string =>
+          (value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+        const selectable = Array.from(
+          document.querySelectorAll('[role="menuitem"],[role="menuitemradio"]'),
+        ).filter(
+          (el) =>
+            el.getAttribute("aria-checked") !== null || el.getAttribute("data-state") !== null,
+        );
+        return selectable
+          .map((el, index) => {
+            const attrs = ["aria-label", "aria-checked", "aria-description", "data-state", "title", "data-testid"]
+              .map((name) => {
+                const value = el.getAttribute(name);
+                return value ? `${name}=${clean(value)}` : null;
+              })
+              .filter(Boolean)
+              .join(" ");
+            // `getAttribute`, never `.className`: on an SVG element that is an
+            // SVGAnimatedString, and the first run of this dump died on it.
+            const icon = Array.from(el.querySelectorAll("svg use, svg"))
+              .slice(0, 2)
+              .map((node) =>
+                clean(node.getAttribute("href") ?? node.getAttribute("data-testid") ?? node.getAttribute("class")),
+              )
+              .filter(Boolean)
+              .join("|");
+            return (
+              `[${index}] text="${clean(el.textContent)}" ${attrs || "no-attrs"}` +
+              `${icon ? ` icon=${icon}` : ""} html=${clean(el.outerHTML).slice(0, htmlMax)}`
+            );
+          })
+          .join(" ;; ");
+      },
+      { max: MODEL_MENU_TEXT_MAX, htmlMax: 220 },
+    );
+  } catch {
+    return "picker entries unavailable";
+  }
 }
 
 /**
@@ -545,7 +625,14 @@ export async function ensureProSixMaximum(
     // "6Pro" and "6 Pro" are the same Pro level in three rollout spellings) is no
     // opinion about the model at all, so it is recorded and never compared.
     const picked = await readPickerModel(page, model);
-    if (picked.checkedIndex !== 0) {
+    // Two conditions, because position alone is not evidence of recency (see
+    // NEWEST_MODEL_SENTINELS): the checked entry must be the picker's own
+    // newest-model affordance, and it must be the entry the picker puts first.
+    // Either one failing refuses, with the whole list on the record.
+    const checkedIsNewest = NEWEST_MODEL_SENTINELS.has(
+      picked.checked.toLowerCase().replace(/\s+/g, ""),
+    );
+    if (!checkedIsNewest || picked.checkedIndex !== 0) {
       const detail = await describeModelMenu(page);
       console.error(
         `[cgpro:model] the composer is not on the picker's newest model: ${detail} ` +
@@ -565,7 +652,10 @@ export async function ensureProSixMaximum(
     console.error(
       `[cgpro:model] Pro effort on the picker's newest model: effort="${effortLabel}" ` +
         `selected="${picked.checked}" of [${picked.entries.join(", ")}] ` +
-        `catalogue="${catalogueLabel}"`,
+        `catalogue="${catalogueLabel}"` +
+        (process.env.CGPRO_PICKER_DUMP === "1"
+          ? ` pickerEntries=${await describePickerEntries(page)}`
+          : ""),
     );
     // The model reported is the one the picker showed, not the catalogue's slug.
     // The catalogue can lag the composer (it lists GPT-5.5 Pro while the picker

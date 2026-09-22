@@ -154,11 +154,26 @@ describe("6 Pro maximum thinking admission", () => {
     expect(s.slider.focus).toHaveBeenCalledOnce();
   });
 
-  // The picker is the app's own ordering, newest first, so whichever entry sits
-  // at the top is the newest -- no model name is written into this codebase.
-  it("accepts whichever entry the picker puts first, whatever it is called", async () => {
-    const s = setup({ pickerEntries: ["GPT-5.7 Pro", "GMT-5.6 Sol"], pickerCheckedIndex: 0 });
-    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "GPT-5.7 Pro", power: 4 });
+  // P-035 2026-09-22, from a live review of the first version of this read. That
+  // version required only "the checked entry is first", and the review's
+  // counterexample is exactly this fixture: an app that promotes an older model
+  // above the newest one, with the checkmark, the DOM and every other part of the
+  // gate still perfectly valid. Position alone would certify it as newest.
+  // This is the failing test that counterexample asked for, and it now passes.
+  it("refuses an older model promoted to the top of the picker", async () => {
+    const s = setup({
+      pickerEntries: ["GPT-5.5 Leaving on October 14", "Latest", "GPT-5.6 Sol"],
+      pickerCheckedIndex: 0,
+    });
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(
+      /has "GPT-5\.5 Leaving on October 14" selected/,
+    );
+    expect(s.slider.focus).toHaveBeenCalledOnce();
+  });
+
+  it("refuses when the newest entry is not the one the app calls latest", async () => {
+    const s = setup({ pickerEntries: ["GPT-5.7 Pro", "Latest"], pickerCheckedIndex: 0 });
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/where the newest model is "GPT-5\.7 Pro"/);
   });
 
   // P-035 2026-09-22. The API catalogue lags the composer -- it still lists
