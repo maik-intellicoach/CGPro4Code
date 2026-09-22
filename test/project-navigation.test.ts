@@ -26,9 +26,17 @@ function pageFor(
     // Defaults to the first attempt that does not throw.
     navigatesOnAttempt?: number;
     startUrl?: string;
+    // P-035 2026-09-22. A pointer-intercepting overlay (`#modal-beacon`) over the
+    // sidebar. `clearsOnEscape` models the real one: a preflight nineteen seconds
+    // after the live failure ran the same ladder clean, so Escape does clear it.
+    blocker?: { count: number; clearsOnEscape: boolean; label?: string };
+    // A page that cannot answer the overlay probe at all. The probe runs on the
+    // failure path, so it must never replace the click's own error.
+    probeFails?: boolean;
   } = { matches: 1 },
 ) {
   let currentUrl = sidebar.startUrl ?? "https://chatgpt.com/";
+  let blockerCount = sidebar.blocker?.count ?? 0;
   const rowClick = vi.fn(async () => {});
   // The row's LABEL is what gets clicked, and it carries its own waitFor: the
   // row being visible never made the text node inside it clickable, which is
@@ -60,10 +68,22 @@ function pageFor(
       return sidebarMatch;
     }),
   };
+  const press = vi.fn(async () => {
+    if (sidebar.blocker?.clearsOnEscape) blockerCount = 0;
+  });
+  // Two probes share this entry point on the real page: the closure COUNT passes
+  // a selector string, the blocker DESCRIPTION passes an options object.
+  const evaluate = vi.fn(async (_fn: unknown, arg: unknown) => {
+    if (sidebar.probeFails) throw new Error("page is gone");
+    if (typeof arg === "string") return blockerCount;
+    return blockerCount > 0 ? sidebar.blocker?.label ?? 'div id="modal-beacon"' : "";
+  });
   const page = {
     goto: vi.fn(), waitForTimeout: vi.fn(async () => {}), getByRole: vi.fn(), isClosed: vi.fn(() => false),
     url: vi.fn(() => currentUrl),
     locator: vi.fn(() => ({ ...sidebarLocator, filter: vi.fn(() => ({ first: () => row })) })),
+    keyboard: { press },
+    evaluate,
     waitForURL: vi.fn(async (predicate: (url: URL) => boolean) => {
       if (!predicate(new URL(destination, "https://chatgpt.com"))) throw new Error("Wrong Project URL");
     }),
@@ -72,7 +92,7 @@ function pageFor(
     if (name === "composer") return {};
     return { click: vi.fn(async () => {}) };
   });
-  return { page, rowClick, row, label, labelWait, sidebarMatch };
+  return { page, rowClick, row, label, labelWait, sidebarMatch, press };
 }
 
 beforeEach(() => { vi.clearAllMocks(); projects.mockResolvedValue([target]); });
@@ -208,4 +228,35 @@ describe("Project directory sidebar click", () => {
     expect(JSON.stringify(onPhase.mock.calls)).not.toContain("private");
   });
 
+  // P-035 2026-09-22, daemon.log 05:33:34Z. An open `#modal-beacon` overlay
+  // intercepted pointer events over the sidebar, so three identical 15s clicks
+  // ran against the same blocker and the turn died. Nineteen seconds later a
+  // preflight on the same daemon ran the whole ladder clean in 55s -- the blocker
+  // was transient and a dismissal cleared it. The retry was the defect.
+  it("clears a pointer-intercepting overlay before retrying the sidebar click", async () => {
+    const { page, sidebarMatch, press } = pageFor(undefined, {
+      matches: 1, failFirstAttempts: 1, blocker: { count: 1, clearsOnEscape: true },
+    });
+    await openConversation(page, { gizmoId: target.id });
+    expect(sidebarMatch.click).toHaveBeenCalledTimes(2);
+    expect(press).toHaveBeenCalledWith("Escape");
+  });
+
+  it("names the blocker when the sidebar click never lands", async () => {
+    const { page } = pageFor(undefined, {
+      matches: 1,
+      failFirstAttempts: 9,
+      blocker: { count: 1, clearsOnEscape: false, label: 'div id="modal-beacon" data-state="open"' },
+    });
+    await expect(openConversation(page, { gizmoId: target.id })).rejects.toThrow(
+      /blockedBy=.*modal-beacon/,
+    );
+  });
+
+  it("never lets the overlay probe mask the click's own error", async () => {
+    const { page } = pageFor(undefined, { matches: 1, failFirstAttempts: 9, probeFails: true });
+    await expect(openConversation(page, { gizmoId: target.id })).rejects.toThrow(
+      /could not be clicked after 3 attempts/,
+    );
+  });
 });

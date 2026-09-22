@@ -1228,4 +1228,82 @@ describe("a failed turn never lets its own telemetry hold the lane", () => {
       else process.env.CGPRO_SELECTOR_DIAGNOSTIC_TIMEOUT_MS = previous;
     }
   });
+
+  // P-035 2026-09-22. The Projects-navigation failure that killed the turn is a
+  // PLAIN Error, and the capture used to be gated on SelectorBrokenError -- so the
+  // one failure the user asked to be able to look at wrote no page identity and
+  // no screenshot, while `failures/` held nothing dated 09-22. Live: daemon.log
+  // 05:33:34Z carried the whole stack trace and the directory stayed empty.
+  function capturingPage() {
+    const screenshot = vi.fn(async () => {});
+    // `close()` models the browser dying under the turn. The page must read as
+    // OPEN when the turn starts -- `slotPage` replaces a closed tab before
+    // dispatch -- and CLOSED by the time the failure is captured.
+    const page = {
+      isClosed: () => false,
+      close: () => { page.isClosed = () => true; },
+      url: () => "https://chatgpt.com/",
+      screenshot,
+      evaluate: vi.fn(async () => "url=\"https://chatgpt.com/\" viewport=1512x944 overlay=1"),
+      keyboard: { press: vi.fn(async () => {}) },
+      locator: () => ({ count: () => 0, first: () => ({ isVisible: () => false }) }),
+    };
+    return { screenshot, page };
+  }
+
+  it("captures the page for a failed turn that is not a selector failure", async () => {
+    const { page, screenshot } = capturingPage();
+    const state = fakeState({ session: { page } as unknown as Session });
+    slotsOf(state)[0].page = page as unknown as import("patchright").Page;
+
+    const emitter = new StreamEmitter();
+    emitter.push({ type: "error", message: "click timed out", promptSubmitted: false });
+    runAskOnSession.mockReturnValue({
+      events: emitter,
+      result: Promise.resolve().then(() => {
+        throw new Error("Projects navigation could not be clicked after 3 attempts");
+      }),
+      cancel: async () => {},
+    });
+
+    const req = new FakeReq() as unknown as IncomingMessage;
+    const res = new FakeRes() as unknown as ServerResponse;
+    Object.assign(req, { method: "POST" });
+    const pending = handleAsk(req, res as unknown as ServerResponse, state);
+    sendBody(req, { prompt: "hi" });
+    await pending;
+
+    expect(screenshot).toHaveBeenCalledOnce();
+    expect(slotsOf(state)[0].leasedBy).toBeNull();
+    expect((res as unknown as FakeRes).writes.join("")).toContain("event: error");
+  });
+
+  it("never screenshots a page that closed under the turn", async () => {
+    const { page, screenshot } = capturingPage();
+    const state = fakeState({ session: { page } as unknown as Session });
+    slotsOf(state)[0].page = page as unknown as import("patchright").Page;
+
+    const emitter = new StreamEmitter();
+    emitter.push({ type: "error", message: "browser gone", promptSubmitted: false });
+    // The daemon consumes this at `await runner.result`, after the events loop.
+    // The rejection lands DURING the loop, so the harness would call it unhandled
+    // for one microtask tick even though nothing leaks; marking it observed here
+    // keeps the runner-up noise out of the report without weakening the assertion.
+    const result = Promise.resolve().then(() => {
+      page.close();
+      throw new Error("Target page has been closed");
+    });
+    result.catch(() => undefined);
+    runAskOnSession.mockReturnValue({ events: emitter, result, cancel: async () => {} });
+
+    const req = new FakeReq() as unknown as IncomingMessage;
+    const res = new FakeRes() as unknown as ServerResponse;
+    Object.assign(req, { method: "POST" });
+    const pending = handleAsk(req, res as unknown as ServerResponse, state);
+    sendBody(req, { prompt: "hi" });
+    await pending;
+
+    expect(screenshot).not.toHaveBeenCalled();
+    expect(slotsOf(state)[0].leasedBy).toBeNull();
+  });
 });

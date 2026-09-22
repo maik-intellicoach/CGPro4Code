@@ -48,7 +48,7 @@ import {
   type AskOptions,
   type AskRunner,
 } from "../core/orchestrator.js";
-import { classifyInteractionFailure, type InteractionFailure, NotLoggedInError, PreSubmitInteractionError, SelectorBrokenError } from "../errors.js";
+import { classifyInteractionFailure, type InteractionFailure, NotLoggedInError, PreSubmitInteractionError } from "../errors.js";
 import { SELECTORS, TURN_CRITICAL_SELECTORS, type SelectorSet } from "../browser/selectors.js";
 import {
   clearDaemonInfo,
@@ -1528,7 +1528,7 @@ export async function handleAsk(
         `ask turn failed: ${(err as Error).message} slot=${slot.id} ` +
         `invocation=${slot.currentInvocation ?? "-"} url=${slot.page?.url() ?? "-"}`,
       );
-      if (err instanceof SelectorBrokenError && slot.page && !slot.page.isClosed()) {
+      if (slot.page && !slot.page.isClosed()) {
         // P-035 2026-09-21. This used to await the unbounded capture. On a page
         // whose selectors stopped resolving, one capture took 20m41s (daemon.log
         // 01:13:34 -> 01:34:15, invocation 46c030c5) and held slot 0, askInFlight
@@ -1537,8 +1537,20 @@ export async function handleAsk(
         // "cancellation unconfirmed", and `STOP refused ... in_flight=1` was
         // CORRECT throughout, because a handler really was still running. One leak,
         // three symptoms. Telemetry never gates capacity.
+        //
+        // P-035 2026-09-22. This was gated on `SelectorBrokenError`, and the
+        // Projects-navigation failure is a plain Error -- so the one failure the
+        // user asked to be able to look at produced NO page identity and NO
+        // screenshot. `failures/` held nothing dated 09-22 while daemon.log held
+        // the whole stack trace. The composite below is time-boxed slice by slice
+        // (1.2s identity, 3s shot, then whatever is left), so widening the gate
+        // does not re-open the leak above.
         const diagnostic = await describeFailure(slot.page);
-        log.error(`selector diagnostic: ${diagnostic}`);
+        log.error(`failure diagnostic: ${diagnostic}`);
+        log.error(
+          "to watch this lane live, restart it with CGPRO_VISIBLE=1 ensure_cgpro_running.sh " +
+          "(the window is parked again the moment the slot is released)",
+        );
       }
       if (!clientGone) {
         writeEvent("error", err instanceof PreSubmitInteractionError
@@ -1764,7 +1776,7 @@ const IDENTITY_CAPTURE_MAX = 120;
 async function describePageIdentity(page: Page): Promise<string> {
   try {
     return await page.evaluate(
-      ({ max }: { max: number }) => {
+      ({ max, overlay }: { max: number; overlay: string }) => {
         const clean = (value: string | null | undefined): string =>
           (value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
         const has = (selector: string): boolean => document.querySelector(selector) !== null;
@@ -1773,6 +1785,14 @@ async function describePageIdentity(page: Page): Promise<string> {
         return (
           `url="${clean(location.href)}" title="${clean(document.title)}" ` +
           `ready=${document.readyState} hidden=${document.visibilityState} ` +
+          // P-035 2026-09-22. The window is parked off-screen and minimised while
+          // a lane is idle, and the app lays itself out from whatever size that
+          // window reports. Two failures now point at that posture -- a minimised
+          // renderer starving the readiness ladder (fixed 09-21), and a
+          // pointer-intercepting overlay over the sidebar (09-22) -- so the size
+          // is recorded rather than argued about.
+          `viewport=${window.innerWidth}x${window.innerHeight} ` +
+          `overlay=${document.querySelectorAll(overlay).length} ` +
           `heading="${clean(document.querySelector("h1, h2")?.textContent)}" appRoot=${appRoot} ` +
           `composer=${has("#prompt-textarea") || has('[data-testid="prompt-textarea"]')} ` +
           `login=${has('[data-testid="login-button"]') || has('a[href*="/auth/login"]')} ` +
@@ -1780,7 +1800,7 @@ async function describePageIdentity(page: Page): Promise<string> {
           `scripts=${document.scripts.length}`
         );
       },
-      { max: IDENTITY_CAPTURE_MAX },
+      { max: IDENTITY_CAPTURE_MAX, overlay: SELECTORS.blockingOverlay[0] },
     );
   } catch {
     return "page identity unavailable";

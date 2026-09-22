@@ -47,6 +47,22 @@ export interface SelectorSet {
   newChatButton: string[];
   /** File upload input (hidden, used via setInputFiles). */
   fileUpload: string[];
+  /**
+   * Full-screen overlays that intercept pointer events without exposing any
+   * role `OPEN_MENU_SELECTOR` matches.
+   *
+   * P-035 2026-09-22. Playwright named this one itself, verbatim, on the
+   * Projects-navigation failure that killed the turn:
+   *   `<div data-state="open" class="fixed inset-0 z-50 …dark:before:bg-black/50…">`
+   *   from `<div id="modal-beacon" data-testid="modal-beacon"
+   *         data-ignore-for-page-load="true">`
+   * The host carries an id and a testid and NO role, so the closure proof in
+   * `closeOpenMenus` counted zero open overlays while the sidebar was
+   * unreachable, and the click helper retried the same blocked click three
+   * times. Deliberately NOT in TURN_CRITICAL_SELECTORS: absence is the healthy
+   * state, and that audit only fails on absence.
+   */
+  blockingOverlay: string[];
 }
 
 export const SELECTORS: SelectorSet = {
@@ -190,6 +206,10 @@ export const SELECTORS: SelectorSet = {
     'input[type="file"]',
     'input[type="file"][data-testid="file-upload"]',
     'input[type="file"][data-testid="file-upload-button"]',
+  ],
+  blockingOverlay: [
+    '[data-testid="modal-beacon"] [data-state="open"]',
+    '#modal-beacon [data-state="open"]',
   ],
 };
 

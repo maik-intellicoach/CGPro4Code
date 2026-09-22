@@ -503,6 +503,92 @@ const MENU_CLOSE_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_MENU_CLOSE_ATTE
 const OPEN_MENU_SELECTOR = '[role="menu"],[role="listbox"],[role="dialog"],[aria-modal="true"]';
 
 /**
+ * Anything that can sit over the page and eat a click, whether or not it
+ * exposes a role. The role-based set alone was blind to the overlay that killed
+ * a turn on 2026-09-22; see SELECTORS.blockingOverlay.
+ */
+const POINTER_BLOCKER_SELECTOR = `${OPEN_MENU_SELECTOR}, ${joinSelectors(SELECTORS.blockingOverlay)}`;
+
+const BLOCKER_TEXT_MAX = 60;
+
+/**
+ * Press Escape until no pointer blocker is left, bounded, and never throwing.
+ * Returns the number STILL attached: 0 when the page is clear, -1 when the page
+ * could not answer at all.
+ *
+ * P-035 2026-09-22. This is the dismissal `closeOpenMenus` was doing all along,
+ * lifted out so the click path can use it too. The distinction it introduces is
+ * the point: a leftover count of 0 means "provably clear", and everything else
+ * means "not proven", which the caller must not read as success.
+ */
+async function dismissPointerBlockers(
+  page: Page,
+  onPhase?: (phase: ModelVerificationPhase) => void,
+): Promise<number> {
+  try {
+    for (let attempt = 0; attempt < MENU_CLOSE_ATTEMPTS; attempt++) {
+      onPhase?.("model-cleanup-escape");
+      await page.keyboard.press("Escape").catch(() => undefined);
+      onPhase?.("model-cleanup-menu-count");
+      const open = await page
+        .evaluate((selector) => document.querySelectorAll(selector).length, POINTER_BLOCKER_SELECTOR)
+        .catch(() => -1);
+      if (open === 0) return 0;
+      onPhase?.("model-cleanup-wait");
+      await page.waitForTimeout(250);
+    }
+    return await page
+      .evaluate((selector) => document.querySelectorAll(selector).length, POINTER_BLOCKER_SELECTOR)
+      .catch(() => -1);
+  } catch {
+    // A dismissal runs on the failure path; it may never replace the real error.
+    return -1;
+  }
+}
+
+/**
+ * Name the overlay that is eating the click, for the failure message.
+ *
+ * Chrome only, bounded, and never throwing: what this exists for is the case
+ * where Playwright says "subtree intercepts pointer events" and nothing else
+ * names the element. The user asked to be able to see what page a failure
+ * happened on, and an element id is what makes that answerable after the fact.
+ */
+async function describePointerBlocker(page: Page): Promise<string> {
+  try {
+    return await page.evaluate(
+      ({ host, max }: { host: string; max: number }) => {
+        const clean = (value: string | null | undefined): string =>
+          (value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+        const el = document.querySelector(host);
+        if (!el) return "";
+        const attrs = ["id", "data-testid", "role", "data-state", "class"]
+          .map((name) => {
+            const value = el.getAttribute(name);
+            if (!value) return null;
+            // A class list is long and mostly styling; keep only the shape
+            // markers that identify the overlay.
+            const trimmed = name === "class"
+              ? value.split(/\s+/).filter((c) => /^(fixed|absolute|inset-0|z-\d+)$/.test(c)).join(" ")
+              : value;
+            return trimmed ? `${name}=${clean(trimmed)}` : null;
+          })
+          .filter(Boolean)
+          .join(" ");
+        const inside = Array.from(el.querySelectorAll('[role="dialog"],button,[role="menuitem"]'))
+          .slice(0, 3)
+          .map((node) => `"${clean(node.textContent)}"`)
+          .join(" ");
+        return `${el.tagName.toLowerCase()}${attrs ? ` ${attrs}` : ""}${inside ? ` text=[${inside}]` : ""}`;
+      },
+      { host: SELECTORS.blockingOverlay[0], max: BLOCKER_TEXT_MAX },
+    );
+  } catch {
+    return "";
+  }
+}
+
+/**
  * Close any open menu and PROVE it closed.
  *
  * P-035 2026-09-18: the Escape here used to be fire-and-forget, so this function
@@ -530,23 +616,11 @@ const OPEN_MENU_SELECTOR = '[role="menu"],[role="listbox"],[role="dialog"],[aria
 async function closeOpenMenus(page: Page, onPhase?: (phase: ModelVerificationPhase) => void): Promise<void> {
   // This runs from a `finally`, so it must never throw: an exception here would
   // replace whatever real error the caller was already reporting.
-  try {
-    for (let attempt = 0; attempt < MENU_CLOSE_ATTEMPTS; attempt++) {
-      onPhase?.("model-cleanup-escape");
-      await page.keyboard.press("Escape").catch(() => undefined);
-      onPhase?.("model-cleanup-menu-count");
-      const open = await page
-        .evaluate((selector) => document.querySelectorAll(selector).length, OPEN_MENU_SELECTOR)
-        .catch(() => -1);
-      if (open === 0) return;
-      onPhase?.("model-cleanup-wait");
-      await page.waitForTimeout(250);
-    }
+  const left = await dismissPointerBlockers(page, onPhase);
+  if (left !== 0) {
     console.error(
       "[cgpro:model] WARNING: a menu is still open after setting the thinking control. Its focus trap can truncate the prompt mid-insert; the composer verification will refuse to submit if it does.",
     );
-  } catch {
-    // Best effort only. The composer verification remains the backstop.
   }
 }
 
@@ -2383,6 +2457,12 @@ async function clickFirstActionable(
   let lastError: unknown;
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (settled?.()) return;
+    // P-035 2026-09-22. Retrying the identical click is what wasted the turn: a
+    // pointer-intercepting overlay (`#modal-beacon`) sat over the sidebar, so
+    // three 15s attempts ran against the same blocker and the turn died -- while
+    // a preflight nineteen seconds later cleared the ladder in 55s. Dismiss first,
+    // then click. Only between attempts, so the happy path is untouched.
+    if (attempt > 0) await dismissPointerBlockers(page);
     const matches = page.locator(selector);
     const count = await matches.count().catch(() => 0);
     for (let index = 0; index < count; index++) {
@@ -2406,9 +2486,13 @@ async function clickFirstActionable(
   for (let index = 0; index < count; index++) {
     if (await matches.nth(index).isVisible().catch(() => false)) visible++;
   }
+  // Name the blocker when one is still up. Playwright's own message says
+  // "subtree intercepts pointer events" without saying what the subtree IS.
+  const blocker = await describePointerBlocker(page);
   throw new Error(
     `${name} could not be clicked after ${attempts} attempts ` +
-      `(matches=${count}, visible=${visible}, url=${page.url()})` +
+      `(matches=${count}, visible=${visible}, url=${page.url()}` +
+      `${blocker ? `, blockedBy=${blocker}` : ""})` +
       (lastError instanceof Error ? `: ${lastError.message}` : ""),
   );
 }
