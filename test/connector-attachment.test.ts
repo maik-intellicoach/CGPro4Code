@@ -405,6 +405,20 @@ it("recognizes an unmarked composer pill after a timed-out click", async () => {
   expect(page.clickedLabels).toEqual(["connector"]);
 });
 
+it("names why a timed-out connector click stalled, from the call log's last lines", async () => {
+  const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const { page, setRows } = makePage();
+  setRows([{ label: "connector", visible: true, onSelected: () => {
+    setRows([{ label: "connector", visible: true, inComposer: true }]);
+    throw new Error("locator.click: Timeout 5000ms exceeded.\nCall log:\n  - waiting for locator\n"
+      + "  - attempting click action\n  - element is not stable");
+  } }]);
+  await expect(setConnector(page, "connector")).resolves.toBeUndefined();
+  expect(stderr).toHaveBeenCalledWith(
+    "[cgpro:connector] click-timeout attempt=1 reason=- attempting click action | - element is not stable");
+  stderr.mockRestore();
+});
+
 it("emits a typed pre-submit failure after two timed-out clicks with no attachment", async () => {
   const { page, setRows } = makePage();
   const replacement: FakeRow = {

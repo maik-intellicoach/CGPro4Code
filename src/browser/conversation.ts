@@ -1299,6 +1299,18 @@ async function assertConnectorAttached(page: Page, connectorName: string): Promi
  * Actual tool use remains a separate postcondition for the caller because
  * a successful attachment does not prove that the model invoked the tool.
  */
+/**
+ * P-035 2026-09-23. Why a click stalled lives in the LAST lines of Playwright's
+ * call log ("element is not stable", "<div …> intercepts pointer events",
+ * "element was detached"); the first line only says it timed out. The connector
+ * click costs 3-60 s across the lanes and nothing on record says why, so name
+ * the cause before changing the click.
+ */
+function clickStallReason(error: Error): string {
+  return error.message.split("\n").map((line) => line.trim()).filter((line) => line.startsWith("-"))
+    .slice(-2).join(" | ").slice(0, 240) || "no call log";
+}
+
 async function clickConnector(page: Page, row: Locator, name: string): Promise<void> {
   try {
     await row.click({ timeout: 5_000 });
@@ -1307,6 +1319,7 @@ async function clickConnector(page: Page, row: Locator, name: string): Promise<v
     // one fresh exact row; never force-click through a popover or toggle off an
     // attachment that mounted while the first click was timing out.
     if (!(error instanceof Error) || !error.message.includes("Timeout")) throw error;
+    console.error(`[cgpro:connector] click-timeout attempt=1 reason=${clickStallReason(error)}`);
     const refreshed = await waitForComposerTool(page, name);
     if (!refreshed) {
       throw new PreSubmitInteractionError(
@@ -1321,6 +1334,7 @@ async function clickConnector(page: Page, row: Locator, name: string): Promise<v
       await refreshed.click({ timeout: 5_000 });
     } catch (retryError) {
       if (!(retryError instanceof Error) || !retryError.message.includes("Timeout")) throw retryError;
+      console.error(`[cgpro:connector] click-timeout attempt=2 reason=${clickStallReason(retryError)}`);
       const finalRow = await waitForComposerTool(page, name);
       if (finalRow && (await isComposerMountedTool(finalRow) || await attachedState(finalRow))) return;
       throw new PreSubmitInteractionError(
