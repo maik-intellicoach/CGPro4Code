@@ -264,6 +264,58 @@ async function readCatalogueForModelCheck(
   return { models: [], reason };
 }
 
+const MODEL_MENU_TEXT_MAX = 60;
+
+/**
+ * Describe the composer pill's open popover, chrome only.
+ *
+ * P-035 2026-09-21: capture the menu WHILE IT IS STILL OPEN. The daemon's
+ * selector diagnostic runs after this path has called closeOpenMenus, so its row
+ * reading can only ever say `absent` -- it did, on a live failure, and that is
+ * why repairing this assertion has cost guess after guess.
+ *
+ * P-035 2026-09-22: each item now carries its own aria-label, aria-checked and
+ * data-state, and the open-menu count is recorded. "Which model does the picker
+ * say is selected" is a question about those attributes, and the effort-label
+ * branch was answering it from the catalogue instead of asking.
+ *
+ * Bounded and chrome-only: the row the gate reads, the menu's item labels and
+ * their state, and the slider's values. No prompt or answer text can be here.
+ * Never throws -- a diagnostic must not mask the failure it describes.
+ */
+async function describeModelMenu(page: Page): Promise<string> {
+  try {
+    return await page.evaluate(
+      ({ selectedSelector, max }: { selectedSelector: string; max: number }) => {
+        const clean = (value: string | null): string =>
+          (value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+        const row = document.querySelector(selectedSelector);
+        const items = Array.from(
+          document.querySelectorAll('[role="menuitem"],[role="menuitemradio"]'),
+        )
+          .slice(0, 10)
+          .map(
+            (el) =>
+              `"${clean(el.textContent)}"[label=${clean(el.getAttribute("aria-label")) || "-"}` +
+              ` checked=${el.getAttribute("aria-checked") ?? "-"}` +
+              ` state=${el.getAttribute("data-state") ?? "-"}]`,
+          );
+        const sliders = Array.from(document.querySelectorAll('[role="slider"]'))
+          .slice(0, 4)
+          .map((el) => `${el.getAttribute("aria-valuenow")}/${el.getAttribute("aria-valuemax")}`);
+        const menus = document.querySelectorAll('[role="menu"],[role="listbox"],[role="dialog"]').length;
+        return (
+          `row="${clean(row ? row.textContent : null)}" menus=${menus} ` +
+          `menuItems=[${items.join(" ")}] sliders=[${sliders.join(" ")}]`
+        );
+      },
+      { selectedSelector: SELECTORS.selectedPowerModel[0], max: MODEL_MENU_TEXT_MAX },
+    );
+  } catch {
+    return "unavailable";
+  }
+}
+
 /** Verify the current 6 Pro power control before any prompt is submitted. */
 export async function ensureProSixMaximum(
   page: Page,
@@ -415,9 +467,15 @@ export async function ensureProSixMaximum(
     // including the deliberate refusal of an older Pro model.
     const observed = normaliseModelLabel(selected);
     if (MAX_EFFORT_ROW_LABELS.has(observed)) {
+      // P-035 2026-09-22. This branch certifies a model nobody looked at: the row
+      // carries the effort label, so the model comes from the account's API
+      // catalogue, and on the intelli lane that catalogue says 5.5 Pro. Record
+      // the popover's own structure while it is still open, which is the only
+      // place the composer's real model can be read.
+      const detail = await describeModelMenu(page);
       console.error(
         `[cgpro:model] composer row reads the effort label "${selected}" (the effort popover was open); ` +
-          `model taken from the catalogue: "${proModel.title ?? proModel.slug}" at maximum power`,
+          `model taken from the catalogue: "${proModel.title ?? proModel.slug}" at maximum power ${detail}`,
       );
       return { model: proModel.slug, power: max };
     }
@@ -452,28 +510,9 @@ export async function ensureProSixMaximum(
       // selector diagnostic runs after this path has called closeOpenMenus, so
       // its row reading can only ever say `absent` -- it did, on a live failure,
       // and that is why repairing this assertion has cost guess after guess.
-      // Bounded and chrome-only: the row the assertion reads, the menu's item
-      // labels, and the slider's values. No prompt or answer text can be here.
-      let detail = "unavailable";
-      try {
-        detail = await page.evaluate(
-          ({ selectedSelector, max }) => {
-            const clean = (value: string | null): string =>
-              (value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
-            const row = document.querySelector(selectedSelector);
-            const items = Array.from(document.querySelectorAll('[role="menuitem"]'))
-              .slice(0, 8)
-              .map((el) => `"${clean(el.textContent)}"`);
-            const sliders = Array.from(document.querySelectorAll('[role="slider"]'))
-              .slice(0, 4)
-              .map((el) => `${el.getAttribute("aria-valuenow")}/${el.getAttribute("aria-valuemax")}`);
-            return `row="${clean(row ? row.textContent : null)}" menuItems=[${items.join(" ")}] sliders=[${sliders.join(" ")}]`;
-          },
-          { selectedSelector: SELECTORS.selectedPowerModel[0], max: 60 },
-        );
-      } catch {
-        // A diagnostic must never mask the failure it describes.
-      }
+      // P-035 2026-09-22: extracted to describeModelMenu, which the effort-label
+      // branch above now calls too, and which records each item's own state.
+      const detail = await describeModelMenu(page);
       console.error(
         `[cgpro:model] maximum power check failed: selected="${selected.slice(0, 60)}" ` +
           `expected="${expectedLabel}" catalogueSlug="${proModel.slug}" ${detail}`,
