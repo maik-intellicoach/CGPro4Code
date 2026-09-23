@@ -30,7 +30,7 @@ import { randomBytes } from "node:crypto";
 import { appendFileSync, openSync, writeSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Page } from "patchright";
-import { openSession, parkWindow, showWindow, type Session } from "../browser/session.js";
+import { describeWindow, openSession, parkWindow, showWindow, type Session } from "../browser/session.js";
 import { fetchAuthSessionInPage, goHome, isLoggedIn } from "../browser/chatgpt.js";
 import {
   currentConversationId,
@@ -462,7 +462,9 @@ export function slotsOf(state: ServerState): SlotState[] {
  * at 415x on `project-chat-surface` and 1600x on `project-navigation-lookup`
  * against the same page un-minimised. Hiding and rendering are disjoint on this
  * stack (minimising starves the page; headless is Cloudflare-challenged), so the
- * window is shown while its slot is leased and parked the moment it is released.
+ * window is shown while its slot is leased and parked once the whole daemon is
+ * idle (P-035 2026-09-23: parking on each release minimised a window a sibling
+ * slot was still working in, and its screenshot then hung).
  *
  * Best-effort by construction. A posture that failed is strictly better than a
  * daemon that refused a turn, so this never throws and never blocks: it is fired
@@ -475,7 +477,7 @@ function applyWorkPosture(state: ServerState, slot: SlotState, show: boolean): v
   if (!state.background) return;
   const page = slot.page;
   if (!page || page.isClosed()) return;
-  let work: Promise<void>;
+  let work: Promise<number | null>;
   try {
     const context = page.context();
     work = show ? showWindow(context, page) : parkWindow(context, page);
@@ -483,7 +485,14 @@ function applyWorkPosture(state: ServerState, slot: SlotState, show: boolean): v
     // A lease must never fail because its window could not be touched.
     return;
   }
-  void work.catch(() => undefined);
+  // P-035 2026-09-23. Which window each slot lives in, timestamped beside the
+  // lease lines, so whether slots share a window is read off ordinary traffic.
+  void work
+    .then((windowId) => {
+      if (windowId !== null) log.info(`slot window slot=${slot.id} window=${windowId} state=${show ? "normal" : "minimized"}`);
+      else log.error(`slot window posture failed slot=${slot.id} want=${show ? "normal" : "minimized"} (reason on stderr)`);
+    })
+    .catch(() => undefined);
 }
 
 /** Leases the lowest free slot. Callers hold queue capacity first, so one is always free. */
@@ -505,7 +514,13 @@ function leaseSlot(state: ServerState, reason: string): SlotState {
 function releaseSlot(state: ServerState, slot: SlotState, reason: string): void {
   slot.busy = false;
   slot.leasedBy = null;
-  applyWorkPosture(state, slot, false);
+  // Park only when nothing is working: a sibling slot may share this window,
+  // and parking it under a busy slot starved that slot's page (P-035 2026-09-23).
+  // A quarantined preflight slot stays busy for the process's life and must not
+  // hold every other window up forever (P-035 2026-09-23 review).
+  if (!slotsOf(state).some((s) => s.busy && s.leasedBy !== "preflight-quarantined")) {
+    for (const idle of slotsOf(state)) applyWorkPosture(state, idle, false);
+  }
   log.info(`slot released slot=${slot.id} by=${reason}`);
 }
 
@@ -523,9 +538,15 @@ async function slotPage(
   // Publish ownership before navigation/authentication, which may themselves hang.
   slot.page = page;
   capture?.(page);
+  // A page opened inside a lease must be shown for that lease; leaseSlot's show
+  // ran before the page existed. ponytail: shown twice because the session's
+  // park-on-create listener races the first show; a per-window posture queue if
+  // the order ever flaps after the second one.
+  if (slot.busy) applyWorkPosture(state, slot, true);
   try {
     await goHome(page);
     if (!(await isLoggedIn(page, 8_000))) throw new NotLoggedInError();
+    if (slot.busy) applyWorkPosture(state, slot, true);
   } catch (err) {
     await page.close().catch(() => undefined);
     throw err;
@@ -1307,6 +1328,7 @@ export async function handleRequest(
     }
     slot.busy = true;
     slot.leasedBy = "reload-inner";
+    applyWorkPosture(state, slot, true);
     log.info(`slot leased slot=${slot.id} by=reload-inner`);
     try {
       const page = await slotPage(state, slot);
@@ -1549,7 +1571,7 @@ export async function handleAsk(
         log.error(`failure diagnostic: ${diagnostic}`);
         log.error(
           "to watch this lane live, restart it with CGPRO_VISIBLE=1 ensure_cgpro_running.sh " +
-          "(the window is parked again the moment the slot is released)",
+          "(the window is parked again once the daemon is idle)",
         );
       }
       if (!clientGone) {
@@ -1720,12 +1742,13 @@ async function describeFailure(page: Page, timeoutMs = selectorDiagnosticTimeout
   // `remaining()` after every slice, so the composite still cannot outlast the
   // caller's own bound however many slices are added.
   const remaining = (): number => Math.max(200, timeoutMs - (Date.now() - startedAt));
+  const window = await withTimeout(describeWindow(page), Math.min(500, remaining()), "window=timed-out");
   const shot = await withTimeout(
     captureFailureShot(page),
     Math.min(SCREENSHOT_TIMEOUT_MS, remaining()),
     "screenshot timed out",
   );
-  return `${identity} shot=${shot} ${await describeSelectorStateBounded(page, remaining())}`;
+  return `${identity} ${window} shot=${shot} ${await describeSelectorStateBounded(page, remaining())}`;
 }
 
 const SCREENSHOT_TIMEOUT_MS = 3_000;

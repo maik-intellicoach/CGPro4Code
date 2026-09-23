@@ -191,7 +191,7 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
  * Never throws. A window that could not be minimised is strictly better than a
  * dead daemon, so a failure is one loud stderr line and nothing else.
  */
-export async function parkWindow(context: BrowserContext, page: Page): Promise<void> {
+export async function parkWindow(context: BrowserContext, page: Page): Promise<number | null> {
   try {
     const cdp = await context.newCDPSession(page);
     try {
@@ -200,6 +200,7 @@ export async function parkWindow(context: BrowserContext, page: Page): Promise<v
         windowId,
         bounds: { windowState: "minimized" },
       });
+      return windowId;
     } finally {
       await cdp.detach().catch(() => undefined);
     }
@@ -208,6 +209,7 @@ export async function parkWindow(context: BrowserContext, page: Page): Promise<v
       `[cgpro:background] could not minimise a browser window: ${(err as Error).message}. ` +
         "It may be visible on the desktop; the session continues.",
     );
+    return null;
   }
 }
 
@@ -219,8 +221,8 @@ export async function parkWindow(context: BrowserContext, page: Page): Promise<v
  * renders at all -- measured at 415x on one step and 1600x on another against the
  * same page un-minimised. The two ways to hide a window are both unusable here
  * (minimising starves the page, headless is Cloudflare-challenged), so the posture
- * follows the work instead: a lane's window is up while it holds a slot and
- * minimised the moment it lets go.
+ * follows the work instead: a lane's window is up while any of its slots works and
+ * minimised once the daemon is idle.
  *
  * `windowState: "normal"` only. Bounds are deliberately omitted -- CDP rejects a
  * state change that carries left/top/width/height -- and `focus` is deliberately
@@ -230,7 +232,7 @@ export async function parkWindow(context: BrowserContext, page: Page): Promise<v
  * Never throws, for the same reason `parkWindow` never does: a window that stayed
  * hidden is strictly better than a dead daemon.
  */
-export async function showWindow(context: BrowserContext, page: Page): Promise<void> {
+export async function showWindow(context: BrowserContext, page: Page): Promise<number | null> {
   try {
     const cdp = await context.newCDPSession(page);
     try {
@@ -239,6 +241,7 @@ export async function showWindow(context: BrowserContext, page: Page): Promise<v
         windowId,
         bounds: { windowState: "normal" },
       });
+      return windowId;
     } finally {
       await cdp.detach().catch(() => undefined);
     }
@@ -247,6 +250,30 @@ export async function showWindow(context: BrowserContext, page: Page): Promise<v
       `[cgpro:background] could not restore a browser window: ${(err as Error).message}. ` +
         "It stays hidden and the session continues.",
     );
+    return null;
+  }
+}
+
+/**
+ * P-035 2026-09-23. `window=<id>:<state>` for a failure diagnostic. A screenshot
+ * hung on six of six second-slot failures and on slot 0 only while another slot
+ * was busy, and nothing recorded which window a page lives in or whether it was
+ * minimised at the time. Bounded by the caller; never throws.
+ */
+export async function describeWindow(page: Page): Promise<string> {
+  try {
+    const cdp = await page.context().newCDPSession(page);
+    try {
+      const { windowId, bounds } = (await cdp.send("Browser.getWindowForTarget")) as {
+        windowId: number;
+        bounds?: { windowState?: string };
+      };
+      return `window=${windowId}:${bounds?.windowState ?? "unknown"}`;
+    } finally {
+      await cdp.detach().catch(() => undefined);
+    }
+  } catch (err) {
+    return `window=unavailable(${String((err as Error)?.message ?? err).slice(0, 60)})`;
   }
 }
 

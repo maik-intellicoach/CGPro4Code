@@ -33,6 +33,16 @@ vi.mock("../src/browser/conversation.js", async () => {
   return { ...actual, ...browserConversation };
 });
 
+// P-035 2026-09-23. Window posture is observed at the helpers, not through CDP.
+const posture = vi.hoisted(() => ({
+  showWindow: vi.fn(async () => 7),
+  parkWindow: vi.fn(async () => 7),
+}));
+vi.mock("../src/browser/session.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/browser/session.js")>("../src/browser/session.js");
+  return { ...actual, ...posture };
+});
+
 const {
   AskQueue,
   createServerState,
@@ -70,8 +80,10 @@ class FakeRes extends EventEmitter {
 
 const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
-function fakePage(name: string): { name: string; isClosed: () => boolean; once: ReturnType<typeof vi.fn>; url: () => string } {
-  return { name, isClosed: () => false, once: vi.fn(), url: () => "https://chatgpt.com/" };
+function fakePage(name: string): {
+  name: string; isClosed: () => boolean; once: ReturnType<typeof vi.fn>; url: () => string; context: () => object;
+} {
+  return { name, isClosed: () => false, once: vi.fn(), url: () => "https://chatgpt.com/", context: () => ({}) };
 }
 
 function fakeSession(): Session {
@@ -124,6 +136,8 @@ beforeEach(() => {
   runInteractionPreflight.mockReset();
   chatgpt.goHome.mockClear();
   chatgpt.isLoggedIn.mockClear();
+  posture.showWindow.mockClear();
+  posture.parkWindow.mockClear();
   delete process.env.CGPRO_DAEMON_SLOTS;
 });
 
@@ -233,6 +247,58 @@ describe("per-slot daemon instancing", () => {
     expect(await status(state)).toMatchObject({
       busy: false, currentConversation: null, lastConversation: "conv-1", slots: { total: 2, busy: 0, free: 2 },
     });
+  });
+
+  it("shows a page opened inside its lease and parks windows only once the daemon is idle", async () => {
+    process.env.CGPRO_DAEMON_SLOTS = "2";
+    const state = createServerState(fakeSession(), { background: true });
+    const first = pendingRunner("conv-1");
+    const second = pendingRunner("conv-2");
+    runAskOnSession.mockReturnValueOnce(first.runner).mockReturnValueOnce(second.runner);
+
+    const ask1 = ask(state, "inv-1");
+    await tick();
+    const ask2 = ask(state, "inv-2");
+    await tick();
+    const secondPage = (runAskOnSession.mock.calls[1][1] as Session).page;
+    // leaseSlot's show ran before this page existed; the page is shown for its lease.
+    expect(posture.showWindow.mock.calls.map((c) => c[1])).toContain(secondPage);
+
+    posture.parkWindow.mockClear();
+    second.finish();
+    await ask2.pending;
+    // Slot 0 is still working, possibly in the same window: nothing is parked.
+    expect(posture.parkWindow).not.toHaveBeenCalled();
+
+    first.finish();
+    await ask1.pending;
+    // Idle daemon: every open slot page is parked.
+    expect(posture.parkWindow.mock.calls.map((c) => c[1])).toEqual(
+      expect.arrayContaining([state.session.page, secondPage]),
+    );
+  });
+
+  it("does not let a quarantined preflight slot hold every other window up", async () => {
+    process.env.CGPRO_DAEMON_SLOTS = "2";
+    const state = createServerState(fakeSession(), { background: true });
+    const first = pendingRunner("conv-1");
+    const second = pendingRunner("conv-2");
+    runAskOnSession.mockReturnValueOnce(first.runner).mockReturnValueOnce(second.runner);
+    const ask1 = ask(state, "inv-1");
+    await tick();
+    first.finish();
+    await ask1.pending;
+    // What the preflight quarantine path leaves behind for the process's life.
+    state.slots![0].busy = true;
+    state.slots![0].leasedBy = "preflight-quarantined";
+
+    posture.parkWindow.mockClear();
+    const ask2 = ask(state, "inv-2");
+    await tick();
+    const secondPage = (runAskOnSession.mock.calls[1][1] as Session).page;
+    second.finish();
+    await ask2.pending;
+    expect(posture.parkWindow.mock.calls.map((c) => c[1])).toContain(secondPage);
   });
 
   it("keeps today's single lane when the env is unset", async () => {
