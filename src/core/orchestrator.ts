@@ -25,13 +25,16 @@ import {
   StreamEmitter,
   type StreamEvent,
 } from "./stream.js";
-import { classifyInteractionFailure, type InteractionFailure, NotLoggedInError, PreSubmitInteractionError } from "../errors.js";
+import { classifyInteractionFailure, type InteractionFailure, NotLoggedInError, PreSubmitInteractionError, TurnTimeoutError } from "../errors.js";
 import { requireAccount, verifyFiling, type FilingProof } from "../api/conversation-filing.js";
 import { joinSelectors, SELECTORS as SELECTORS_DUMP } from "../browser/selectors.js";
 import { fetchLatestTurnConnectorState, type LatestTurnConnectorState, fetchLatestNativeResearchReport, fetchNativeResearchUserNodes, type NativeResearchReport } from "../api/conversations.js";
 
 const CONNECTOR_EVIDENCE_POLL_MS = 30_000;
 const CONNECTOR_EVIDENCE_RATE_LIMIT_BACKOFF_MS = 120_000;
+// P-035 2026-09-23. How long a mid-turn 404 on a just-created conversation counts
+// as "not readable yet" before it is the missing conversation it may really be.
+const CONNECTOR_NOT_FOUND_GRACE_MS = 120_000;
 
 export interface AskOptions {
   prompt: string;
@@ -230,6 +233,8 @@ function runAskInner(
   let connectorSnapshot: LatestTurnConnectorState | null = null;
   let connectorCompletionConfirmed = false;
   let connectorEvidenceBackoffUntil = 0;
+  let connectorNotFoundSince: number | null = null;
+  let connectorNotFoundError: Error | null = null;
   let connectorEvidencePollInFlight: Promise<void> | null = null;
   const nativeState: { report: NativeResearchReport | null } = { report: null };
   let nextNativeReportPollAt = 0;
@@ -337,6 +342,7 @@ function runAskInner(
         emitter.push({ type: "tool", name: "prompt-submitted", meta: opts.connector === undefined ? {} : { connector: opts.connector } });
       }
       log(`sendPrompt done (priorBubbles=${priorBubbles}), url=${page.url()}`);
+      const submittedAt = Date.now();
 
       const runConnectorEvidencePoll = async (force = false): Promise<void> => {
         if (opts.connector === undefined || cancelled) return;
@@ -350,7 +356,8 @@ function runAskInner(
           if (typeof callId === "string") observedConnectorCallIds.add(callId);
         }
         const started = collected.find((event) => event.type === "started");
-        const conversationId = currentConversationId(page) ??
+        const urlConversationId = currentConversationId(page);
+        const conversationId = urlConversationId ??
           (started?.type === "started" ? started.conversationId ?? null : null);
         if (!conversationId) return;
         lastConnectorEvidencePollAt = now;
@@ -369,9 +376,29 @@ function runAskInner(
             force,
           );
         } catch (err) {
-          // Unlike rate limits, a denied/missing conversation cannot recover
-          // through progress polling; surface it and preserve partial output.
-          if (force || (err instanceof Error && /\bHTTP 4(?!29)\d{2}\b/.test(err.message))) throw err;
+          const status = err instanceof Error ? Number(/\bHTTP (\d{3})\b/.exec(err.message)?.[1] ?? 0) : 0;
+          // P-035 2026-09-23. Content-free, one line per failed read: settles
+          // whether a post-Send 404 clears (read-after-create lag) or persists.
+          console.error(
+            `[cgpro:connector] ${new Date(now).toISOString()} evidence read failed ` +
+              `invocation=${opts.invocationId ?? "-"} status=${status || "none"}` +
+              `${status ? "" : ` err=${err instanceof Error ? err.name : typeof err}`} ` +
+              `source=${urlConversationId ? "url" : "sse"} sinceSubmitMs=${now - submittedAt} forced=${force}`,
+          );
+          // P-035 2026-09-23. The SSE `started` id exists ~1 s after Send, before
+          // GET /conversation/<id> serves it, and a 404 there killed every intelli
+          // connector turn (91ae62ef, and three times on 09-21). It is "not readable
+          // yet" -- but only for a bounded window from the first 404, so a
+          // conversation that really is missing still fails as HTTP 404 in bounded
+          // time instead of stalling completion until the turn's deadline.
+          if (!force && status === 404) {
+            connectorNotFoundSince ??= now;
+            connectorNotFoundError = err as Error;
+            if (now - connectorNotFoundSince < CONNECTOR_NOT_FOUND_GRACE_MS) return;
+          }
+          // Other denials cannot recover through progress polling; surface them
+          // and preserve partial output. 429 has its own backoff below.
+          if (force || (status >= 400 && status < 500 && status !== 429)) throw err;
           if (err instanceof Error && err.message.includes("HTTP 429")) {
             const retryAfterMs = (err as Error & { retryAfterMs?: number }).retryAfterMs;
             connectorEvidenceBackoffUntil = Date.now() + Math.max(
@@ -381,6 +408,8 @@ function runAskInner(
           }
           return;
         }
+        connectorNotFoundSince = null;
+        connectorNotFoundError = null;
         // A resumed conversation GET can lag Send and still expose an old turn.
         if (!state.currentUserNodeId || priorNativeUsers.has(state.currentUserNodeId)) return;
         connectorSnapshot = state;
@@ -506,6 +535,11 @@ function runAskInner(
               const partial = await readLatestAssistantText(page).catch(() => "");
               if (partial) emitter.push({ type: "delta", text: partial });
             }
+          }
+          // A turn shorter than the 404 grace would otherwise end as a timeout
+          // that hides the 404 it was waiting out (P-035 2026-09-23 review).
+          if (err instanceof TurnTimeoutError && connectorNotFoundError) {
+            throw Object.assign(connectorNotFoundError, { cause: err });
           }
           throw err;
         }

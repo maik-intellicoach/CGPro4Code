@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "patchright";
 import type { Session } from "../src/browser/session.js";
 import type { StreamEvent } from "../src/core/stream.js";
-import { PreSubmitInteractionError } from "../src/errors.js";
+import { PreSubmitInteractionError, TurnTimeoutError } from "../src/errors.js";
 
 const requireAccount = vi.fn();
 const verifyFiling = vi.fn();
@@ -507,6 +507,52 @@ describe("runAskOnSession connector contract", () => {
     expect(events).toContainEqual({ type: "delta", text: "new answer" });
     expect(events.some(e => e.type === "done")).toBe(false);
     expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(1);
+  });
+
+  // P-035 2026-09-23. intelli's connector turns died ~1 s after Send on a 404 from
+  // the mid-turn read of a conversation too new to be served (91ae62ef).
+  it("waits out a 404 right after Send and completes once the conversation is readable", async () => {
+    currentConversationId.mockReturnValue("conversation");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    fetchLatestTurnConnectorState.mockRejectedValueOnce(new Error("conversation connector state fetch failed with HTTP 404"));
+    waitTurnComplete.mockImplementationOnce(async (_p, _t, _n, _s, control) => {
+      expect(await control.confirmComplete()).toBe(false);
+      clock.mockReturnValue(1_031_000);
+      expect(await control.confirmComplete()).toBe(true);
+    });
+    const runner = runAskOnSession({ prompt: "test", connector: "connector", timeoutSec: 1200, headless: false }, session());
+    await expect(runner.result).resolves.toBeDefined();
+    expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(2);
+    clock.mockRestore();
+  });
+
+  it("fails a 404 that outlasts the grace as HTTP 404, not as a stalled turn", async () => {
+    currentConversationId.mockReturnValue("conversation");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    fetchLatestTurnConnectorState.mockRejectedValue(new Error("conversation connector state fetch failed with HTTP 404"));
+    waitTurnComplete.mockImplementationOnce(async (_p, _t, _n, _s, control) => {
+      expect(await control.confirmComplete()).toBe(false);
+      clock.mockReturnValue(1_060_000);
+      expect(await control.confirmComplete()).toBe(false);
+      clock.mockReturnValue(1_121_000);
+      await control.confirmComplete();
+      throw new Error("a durable 404 was swallowed");
+    });
+    const runner = runAskOnSession({ prompt: "test", connector: "connector", timeoutSec: 1200, headless: false }, session());
+    await expect(runner.result).rejects.toThrow("HTTP 404");
+    expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(3);
+    clock.mockRestore();
+  });
+
+  it("reports a 404 still inside its grace as HTTP 404 when the turn times out first", async () => {
+    currentConversationId.mockReturnValue("conversation");
+    fetchLatestTurnConnectorState.mockRejectedValue(new Error("conversation connector state fetch failed with HTTP 404"));
+    waitTurnComplete.mockImplementationOnce(async (_p, _t, _n, _s, control) => {
+      expect(await control.confirmComplete()).toBe(false);
+      throw new TurnTimeoutError(60);
+    });
+    const runner = runAskOnSession({ prompt: "test", connector: "connector", timeoutSec: 60, headless: false }, session());
+    await expect(runner.result).rejects.toThrow("HTTP 404");
   });
 
   it("fails before sending when the required connector cannot be selected", async () => {
