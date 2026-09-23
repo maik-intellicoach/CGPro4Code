@@ -1064,6 +1064,16 @@ export function exactConnectorLabelIndex(labels: string[], name: string): number
   );
 }
 
+/**
+ * P-035 2026-09-23. Ceiling on each element read along the connector picker path.
+ * Playwright waits 30 s by default for a locator that does not resolve, and a
+ * picker row the app closed or re-rendered does not resolve: `attachedState`
+ * could spend 30 s on each of up to 12 reads, and the picker-click step measured
+ * 80.8 s and 168 s on intelli. A bounded read comes back empty and the step's
+ * own retry and deadline decide. `isVisible` and `count` never wait.
+ */
+const PICKER_READ_TIMEOUT_MS = 1_000;
+
 async function visibleComposerTool(page: Page, name: string): Promise<Locator | null> {
   // Let the browser narrow the DOM before crossing the automation boundary.
   // Scanning every button and span with serial isVisible/innerText calls made
@@ -1074,7 +1084,7 @@ async function visibleComposerTool(page: Page, name: string): Promise<Locator | 
     for (let i = 0; i < count; i++) {
       const candidate = candidates.nth(i);
       if (!(await candidate.isVisible().catch(() => false))) continue;
-      const label = await candidate.innerText().catch(() => "");
+      const label = await candidate.innerText({ timeout: PICKER_READ_TIMEOUT_MS }).catch(() => "");
       if (exactConnectorLabelIndex([label], name) === 0) return candidate;
     }
     return null;
@@ -1173,10 +1183,19 @@ const ATTACHED_STATE_ATTRIBUTES = ["aria-checked", "aria-pressed", "data-state"]
 /** How many ancestor levels `attachedState` walks before failing closed. */
 const ATTACHED_STATE_ANCESTOR_DEPTH = 3;
 
-/** Read the first present attached-state attribute value on a row, without interpreting it. */
-async function presentState(row: Locator): Promise<string | null> {
+/**
+ * Read the first present attached-state attribute value on a row, without
+ * interpreting it. `undefined` means the row itself could not be read inside
+ * PICKER_READ_TIMEOUT_MS; the remaining attributes would wait the same way.
+ */
+export async function presentState(row: Locator): Promise<string | null | undefined> {
   for (const attribute of ATTACHED_STATE_ATTRIBUTES) {
-    const value = await row.getAttribute(attribute).catch(() => null);
+    let value: string | null;
+    try {
+      value = await row.getAttribute(attribute, { timeout: PICKER_READ_TIMEOUT_MS });
+    } catch {
+      return undefined;
+    }
     if (value !== null) return value;
   }
   return null;
@@ -1193,15 +1212,19 @@ async function presentState(row: Locator): Promise<string | null> {
  * attributes; only the exact values "true" / "checked" accept, anything
  * else stays fail-closed. Patchright resolves `..` as the parent element.
  */
-async function attachedState(row: Locator): Promise<string | null> {
+export async function attachedState(row: Locator): Promise<string | null> {
   const accept = (value: string | null): string | null =>
     value === "true" || value === "checked" ? value : null;
   const own = await presentState(row);
+  // An unreadable row has no readable ancestors either: fail closed now, and
+  // the caller's click/retry path decides, instead of waiting out every level.
+  if (own === undefined) return null;
   if (own !== null) return accept(own);
   let ancestor: Locator = row;
   for (let depth = 0; depth < ATTACHED_STATE_ANCESTOR_DEPTH; depth++) {
     ancestor = ancestor.locator("..");
     const raw = await presentState(ancestor);
+    if (raw === undefined) return null;
     if (raw !== null) return accept(raw);
   }
   return null;
@@ -1221,7 +1244,7 @@ async function isComposerMountedTool(row: Locator): Promise<boolean> {
   return row.evaluate((element) => {
     const form = element.closest("form");
     return Boolean(form?.querySelector("#prompt-textarea, [data-testid=\"prompt-textarea\"]"));
-  }).catch(() => false);
+  }, undefined, { timeout: PICKER_READ_TIMEOUT_MS }).catch(() => false);
 }
 
 /**

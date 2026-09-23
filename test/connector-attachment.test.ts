@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Page } from "patchright";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Locator, Page } from "patchright";
 
 // P-035: connector selection must be an honest composer-attachment
 // postcondition. A visible exact-label row (often a plain span with no ARIA
@@ -36,7 +36,7 @@ vi.mock("../src/browser/chatgpt.js", () => ({
   requireSelector: vi.fn(async () => ({ click: vi.fn(async () => {}) })),
 }));
 
-const { setConnector } = await import("../src/browser/conversation.js");
+const { attachedState, presentState, setConnector } = await import("../src/browser/conversation.js");
 
 beforeEach(() => {
   firstResolved.mockReset();
@@ -440,4 +440,52 @@ it("emits a typed pre-submit failure after two timed-out clicks with no attachme
     promptSubmitted: false,
   });
   expect(page.clickedLabels).toEqual(["connector", "connector"]);
+});
+
+describe("picker reads are bounded (P-035 2026-09-23)", () => {
+  // Playwright waits for a locator that does not resolve until its timeout,
+  // 30 s by default, and a picker row the app closed or re-rendered never
+  // resolves on its own. The fake keeps exactly that contract: the read
+  // settles only when the caller's timeout (default 30 s) runs out.
+  function staleRow(): { row: Locator; reads: Array<number | undefined> } {
+    const reads: Array<number | undefined> = [];
+    const row = {
+      getAttribute: (_attribute: string, options?: { timeout?: number }) => {
+        reads.push(options?.timeout);
+        return new Promise<string | null>((_, reject) => {
+          setTimeout(() => reject(new Error("locator.getAttribute: Timeout exceeded")), options?.timeout ?? 30_000);
+        });
+      },
+      locator: () => row,
+    };
+    return { row: row as unknown as Locator, reads };
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("presentState gives up on a row that never resolves within about 1 s, not 30 s", async () => {
+    vi.useFakeTimers();
+    const { row, reads } = staleRow();
+    let settled = false;
+    void presentState(row).then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(settled).toBe(true);
+    expect(reads).toEqual([1_000]);
+  });
+
+  it("attachedState stops walking ancestors once the row cannot be read", async () => {
+    vi.useFakeTimers();
+    const { row, reads } = staleRow();
+    let result: string | null | "pending" = "pending";
+    void attachedState(row).then((value) => {
+      result = value;
+    });
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(result).toBeNull();
+    expect(reads).toHaveLength(1);
+  });
 });
