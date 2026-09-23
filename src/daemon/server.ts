@@ -453,6 +453,11 @@ export function slotsOf(state: ServerState): SlotState[] {
   return state.slots;
 }
 
+/** First still-open slot page. Slot 0's page stays closed until its next lease. */
+export function openSlotPage(slots: SlotState[]): Page | null {
+  return slots.map((s) => s.page).find((p): p is Page => p != null && !p.isClosed()) ?? null;
+}
+
 /**
  * P-035 2026-09-21. The window posture follows the work.
  *
@@ -806,7 +811,7 @@ export async function handleRequest(
   // in-flight count is returned so a caller knows what it audited.
   if (method === "GET" && url.pathname === "/selectors") {
     const slots = slotsOf(state);
-    const page = slots.map((slot) => slot.page).find((candidate): candidate is Page => candidate != null && !candidate.isClosed());
+    const page = openSlotPage(slots);
     if (!page) {
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "no_page", detail: "no slot holds an open page" }));
@@ -865,17 +870,24 @@ export async function handleRequest(
     // daemon holds, and `/status` is polled every five minutes by the watchdog,
     // so it must never contend with a live turn. A failed re-read keeps the
     // previous answer and says so -- `/status` staying available matters more
-    // than it being fresh, and the staleness is then bounded by the next poll.
+    // than it being fresh, and the staleness is then bounded by the next poll
+    // that finds an open page.
+    // The read goes through any still-open slot page, not slot 0's: slot 0's
+    // page stays closed until its next lease (a preflight timeout or a tab
+    // close), and reading through it failed every poll, forever. With no open
+    // page at all the refresh is skipped until a lease reopens one.
+    const refreshPage = openSlotPage(slots);
     if (
       state.account &&
       typeof state.accountProbedAt === "number" &&
       busySlots === 0 &&
       !state.queue.busy &&
       !state.askInFlight &&
-      Date.now() - state.accountProbedAt > ACCOUNT_PROBE_TTL_MS
+      Date.now() - state.accountProbedAt > ACCOUNT_PROBE_TTL_MS &&
+      refreshPage !== null
     ) {
       try {
-        const refreshed = await readAccountCapabilities(state.session.page);
+        const refreshed = await readAccountCapabilities(refreshPage);
         if (refreshed.proved) {
           state.account = refreshed.account;
           state.accountProbedAt = Date.now();

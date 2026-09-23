@@ -42,7 +42,7 @@ vi.mock("../src/browser/chatgpt.js", async () => {
   return { ...actual, fetchAuthSessionInPage: (...args: unknown[]) => fetchAuthSessionInPage(...args) };
 });
 
-const { handleRequest, createServerState } = await import("../src/daemon/server.js");
+const { handleRequest, createServerState, slotsOf } = await import("../src/daemon/server.js");
 
 class FakeReq extends EventEmitter {
   headers: Record<string, string> = {};
@@ -143,5 +143,41 @@ describe("account capability refresh", () => {
     await getStatus(state);
 
     expect(fetchModels).not.toHaveBeenCalled();
+  });
+
+  // P-035 2026-09-23. Slot 0's page stays closed until slot 0's next lease, so
+  // reading through `state.session.page` failed every poll and `/status` kept
+  // the startup answer forever. The refresh reads through any open slot page.
+  it("re-reads through a live slot page when slot 0's page has closed", async () => {
+    fetchAuthSessionInPage.mockResolvedValue({ user: { email: "account@example.test" } });
+    fetchMe.mockResolvedValue({ email: "account@example.test" });
+    fetchModels.mockResolvedValue([{ slug: "gpt-5" }]);
+
+    const state = staleIdleLane();
+    const closed = { isClosed: () => true, url: () => "about:blank" } as unknown as Page;
+    const live = { isClosed: () => false, url: () => "https://chatgpt.com/" } as unknown as Page;
+    state.session.page = closed;
+    state.maxSlots = 2;
+    slotsOf(state)[1].page = live;
+    const probedBefore = state.accountProbedAt!;
+
+    await getStatus(state);
+
+    expect(fetchModels).toHaveBeenCalledWith(live);
+    expect(fetchModels).not.toHaveBeenCalledWith(closed);
+    expect(state.accountProbedAt).toBeGreaterThan(probedBefore);
+  });
+
+  it("keeps the previous answer without reading when no slot page is open", async () => {
+    const state = staleIdleLane();
+    state.session.page = { isClosed: () => true, url: () => "about:blank" } as unknown as Page;
+    const probedBefore = state.accountProbedAt;
+
+    const res = await getStatus(state);
+
+    expect(res.statusCode).toBe(200);
+    expect(fetchAuthSessionInPage).not.toHaveBeenCalled();
+    expect(state.accountProbedAt).toBe(probedBefore);
+    expect(state.account?.proModelAvailable).toBe(true);
   });
 });
