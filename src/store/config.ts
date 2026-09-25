@@ -10,12 +10,11 @@ export interface CgproConfig {
 }
 
 const DEFAULTS: CgproConfig = {
-  // GPT-5.5 Pro is the entire reason cgpro exists. Force the slug —
-  // earlier comment claimed Pro accounts default to it server-side
-  // but the user's account actually defaults to gpt-5-5-thinking and
-  // we silently used that instead. Verified via `cgpro status` that
-  // this slug is in the user's catalogue.
-  defaultModel: "gpt-5-5-pro",
+  // Force the Pro slug: the account default is a non-Pro model. P-035
+  // 2026-09-26: gpt-6-pro, not gpt-5-5-pro. The Pro-6 maximum gate runs only
+  // for this exact slug, so a bare `cgpro ask` (the research pulse's
+  // no-daemon route) asked GPT-5.5 Pro unverified; gpt-5.x is retired here.
+  defaultModel: "gpt-6-pro",
   defaultWeb: true,
   defaultHeadless: false,
   // GPT-5.5 Pro extended-thinking turns can run over an hour for hard

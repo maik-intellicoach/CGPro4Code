@@ -112,6 +112,31 @@ describe("Project directory navigation", () => {
     expect(page.goto).not.toHaveBeenCalled();
     expect(requireSelector.mock.calls.some(c => c[2] === "composer")).toBe(true);
   });
+  // P-035 2026-09-26: the sidebar lost its /projects link; the directory page still loads.
+  it("loads the Projects directory directly when the sidebar has no link to it", async () => {
+    const { page, rowClick, sidebarMatch } = pageFor(undefined, { matches: 0 });
+    vi.mocked(page.goto).mockImplementation(async (url: string) => {
+      (page.url as ReturnType<typeof vi.fn>).mockReturnValue(url);
+      return null;
+    });
+    const onPhase = vi.fn();
+    await openConversation(page, { gizmoId: target.id }, onPhase);
+    expect(page.goto).toHaveBeenCalledWith("https://chatgpt.com/projects", expect.anything());
+    expect(sidebarMatch.click).not.toHaveBeenCalled();
+    expect(onPhase.mock.calls.map(([phase]) => phase)).toContain("project-navigation-direct");
+    expect(onPhase.mock.calls.map(([phase]) => phase)).not.toContain("project-navigation-lookup");
+    expect(rowClick).toHaveBeenCalledOnce();
+  });
+
+  it("matches the Project row by its current and its former options-button name", async () => {
+    const { page } = pageFor();
+    await openConversation(page, { gizmoId: target.id });
+    const name = vi.mocked(page.getByRole).mock.calls[0][1]?.name as RegExp;
+    expect(name.test("Project actions for Work")).toBe(true);
+    expect(name.test("Open project options for Work")).toBe(true);
+    expect(name.test("Project actions for Work 2")).toBe(false);
+  });
+
   it("never gates the Project branch on the surface-dependent home composer", async () => {
     // FIX A (P-035 2026-09-16): the branch used to require the home composer
     // before the Chat surface was selected, so a Work-surface or simply slow

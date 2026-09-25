@@ -328,6 +328,7 @@ export async function detectBotChallenge(page: Page): Promise<boolean> {
   const composer = await firstResolved(page, [
     "#prompt-textarea",
     '[data-testid="prompt-textarea"]',
+    'div[contenteditable="true"][data-composer-markdown]',
   ]);
   const loginLink = await firstResolved(page, [
     'a[href*="login"]',

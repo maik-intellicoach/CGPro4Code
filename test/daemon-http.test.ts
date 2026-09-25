@@ -843,7 +843,7 @@ describe("daemon-side selector audit", () => {
     // structural composer pill rather than a text-exact label.
     expect(body.missingCritical).not.toContain("composer");
     expect(body.missingCritical).not.toContain("fileUpload");
-    expect(body.missingCritical).toEqual(["modelSwitcher", "thinkingPowerButton", "projectsNavigation"]);
+    expect(body.missingCritical).toEqual(["modelSwitcher", "thinkingPowerButton"]);
   });
 
   it("names the drift when a turn-critical selector stops resolving", async () => {

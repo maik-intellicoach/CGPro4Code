@@ -21,10 +21,14 @@ import { setExpectedReloadNavigation } from "../core/stream.js";
  */
 export type ProjectNavigationPhase =
   | "project-home" | "project-chat-surface" | "project-list-wait" | "project-list"
-  | "project-identity" | "project-navigation-lookup" | "project-navigation-wait"
+  | "project-identity" | "project-navigation-direct" | "project-navigation-lookup" | "project-navigation-wait"
   | "project-navigation-click" | "project-row-wait" | "project-row-retry-wait"
   | "project-label-wait" | "project-label-click" | "project-destination-wait"
   | "project-composer" | "project-model";
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 export async function openConversation(
   page: Page,
@@ -73,6 +77,17 @@ export async function openConversation(
         return false;
       }
     };
+    // P-035 2026-09-26: the sidebar no longer links to /projects (Projects is a
+    // section heading), but the directory page itself still loads. The list
+    // wait above already let the sidebar render, so no link now means the new
+    // UI, not a slow one. A direct load of the DIRECTORY is not the cold
+    // Project deep link warned about above; the row click below stays client
+    // navigation.
+    if (!onProjectsDirectory() &&
+        await page.locator(joinSelectors(SELECTORS.projectsNavigation)).count() === 0) {
+      onPhase?.("project-navigation-direct");
+      await page.goto("https://chatgpt.com/projects", { waitUntil: "domcontentloaded", timeout: 60_000 });
+    }
     if (!onProjectsDirectory()) {
       onPhase?.("project-navigation-lookup");
       await requireSelectorPatient(page, SELECTORS.projectsNavigation, "Projects navigation");
@@ -88,7 +103,10 @@ export async function openConversation(
     // sidebar row. Re-resolve it per attempt instead of failing once, the
     // same shape the send button already uses (P-035 2026-09-16).
     const rowLocator = () => page.locator(joinSelectors(SELECTORS.projectRows)).filter({
-      has: page.getByRole("button", { name: `Open project options for ${project.name}`, exact: true }),
+      // Renamed from "Open project options for" on 2026-09-26 (P-035).
+      has: page.getByRole("button", {
+        name: new RegExp(`^(?:Open project options|Project actions) for ${escapeRegExp(project.name)}$`),
+      }),
     }).first();
     let row = rowLocator();
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -890,7 +908,7 @@ export async function setWebSearch(page: Page, on: boolean): Promise<boolean> {
   // research, so toggling it on disables those — that's intentional.
 
   // Try inline first (older layouts).
-  let toggle = await firstResolved(page, SELECTORS.webSearchToggle.slice(3)); // skip the menuitemradio variants
+  let toggle = await firstResolved(page, SELECTORS.webSearchToggle.slice(4)); // skip the popover-only variants
   let viaPopover = false;
   if (!toggle) {
     if (await openComposerToolsPopover(page)) {
@@ -1163,6 +1181,7 @@ async function pluginSearchBox(page: Page): Promise<Locator | null> {
     const id = await candidate.getAttribute("id").catch(() => null);
     const testId = await candidate.getAttribute("data-testid").catch(() => null);
     if (id === "prompt-textarea" || testId === "prompt-textarea") continue;
+    if (await candidate.getAttribute("data-composer-markdown").catch(() => null) !== null) continue;
     const searchHint = [
       await candidate.getAttribute("placeholder").catch(() => null),
       await candidate.getAttribute("data-placeholder").catch(() => null),
@@ -1243,7 +1262,7 @@ export async function attachedState(row: Locator): Promise<string | null> {
 async function isComposerMountedTool(row: Locator): Promise<boolean> {
   return row.evaluate((element) => {
     const form = element.closest("form");
-    return Boolean(form?.querySelector("#prompt-textarea, [data-testid=\"prompt-textarea\"]"));
+    return Boolean(form?.querySelector("#prompt-textarea, [data-testid=\"prompt-textarea\"], [data-composer-markdown]"));
   }, undefined, { timeout: PICKER_READ_TIMEOUT_MS }).catch(() => false);
 }
 

@@ -1829,7 +1829,7 @@ async function describePageIdentity(page: Page): Promise<string> {
           `viewport=${window.innerWidth}x${window.innerHeight} ` +
           `overlay=${document.querySelectorAll(overlay).length} ` +
           `heading="${clean(document.querySelector("h1, h2")?.textContent)}" appRoot=${appRoot} ` +
-          `composer=${has("#prompt-textarea") || has('[data-testid="prompt-textarea"]')} ` +
+          `composer=${has("#prompt-textarea") || has('[data-testid="prompt-textarea"]') || has("[data-composer-markdown]")} ` +
           `login=${has('[data-testid="login-button"]') || has('a[href*="/auth/login"]')} ` +
           `challenge=${has("#challenge-form") || has("#cf-wrapper") || has("#challenge-stage")} ` +
           `scripts=${document.scripts.length}`

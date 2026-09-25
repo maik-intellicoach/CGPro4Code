@@ -5,6 +5,13 @@
  * Verified against chatgpt.com as of July 21, 2026 (C-092 drift: the
  * "Work" area rollout moved the model picker out of the header into an
  * inline composer pill and added a Chat/Work surface toggle).
+ *
+ * P-035 2026-09-26 drift, read live on the ms1980 lane: the composer lost
+ * `#prompt-textarea` (now a ProseMirror div with `data-composer-markdown`), the
+ * model pill lost `__composer-pill` (now `aria-label="Select ChatGPT model"`),
+ * the sidebar lost its `/projects` link (Projects is a section heading; the
+ * directory page still loads), project rows lost `role="row"`, and the "+"
+ * popover became a flat list of `button[data-list-navigation-item]` rows.
  */
 
 export interface SelectorSet {
@@ -67,6 +74,8 @@ export interface SelectorSet {
 
 export const SELECTORS: SelectorSet = {
   composer: [
+    // Live first (P-035 2026-09-26); the older forms stay as tail fallbacks.
+    'div[contenteditable="true"][data-composer-markdown]',
     "#prompt-textarea",
     '[data-testid="prompt-textarea"]',
     'textarea[placeholder*="Message"]',
@@ -93,11 +102,15 @@ export const SELECTORS: SelectorSet = {
     'button:has-text("Stop generating")',
   ],
   modelSwitcher: [
+    'form button[aria-label="Select ChatGPT model"]',
     'button.__composer-pill[aria-haspopup="menu"]',
     'button[data-testid="model-switcher-dropdown-button"]',
     'header button[aria-label*="Model selector"]',
     'header button[aria-label*="Sélecteur"]',
-    'button[aria-haspopup="menu"]:has(svg)',
+    // Scoped to the composer form: unscoped, this matched 16 buttons on
+    // 2026-09-26 and the first was the profile menu, so the model switch opened
+    // the wrong menu and found no Pro item (research pulse, P-035).
+    'form button[aria-haspopup="menu"]:has(svg)',
   ],
     // Working candidate first (P-035 2026-09-16): every lane probed had this
     // entry matching and the ones after it dead, so the daemon paid a failed
@@ -111,6 +124,7 @@ export const SELECTORS: SelectorSet = {
     // structure is the same strategy `modelSwitcher` already relies on, and
     // correctness is unchanged: the gate still refuses unless the menu opens,
     // the slider reaches aria-valuemax, and the menu reads 6 Pro.
+    'form button[aria-label="Select ChatGPT model"]',
     'button.__composer-pill[aria-haspopup="menu"]',
     'button:has(:text-matches("^(?:6\\\\s*Pro|High|Instant)$", "i"))',
     'button:has-text("Thinking effort")',
@@ -119,12 +133,14 @@ export const SELECTORS: SelectorSet = {
   selectedPowerModel: ['[role="menuitem"][aria-label="Select model"]'],
   thinkingPowerSlider: ['[role="slider"][aria-valuemax]'],
   projectsNavigation: ['a[href="/projects"]'],
-  projectRows: ['[role="row"]'],
+  projectRows: ['[data-project-row="true"]', '[role="row"]'],
   chatTabRadio: [
     'button[role="radio"]:has-text("Chat")',
     'div[role="radiogroup"] button:has-text("Chat")',
   ],
   webSearchToggle: [
+    // P-035 2026-09-26: the popover is a flat list of plain buttons, no roles.
+    'button[data-list-navigation-item]:has-text("Web search")',
     // Current chatgpt.com (April 2026): web search is a menuitemradio
     // inside the "+ Add files and more" composer popover. Has no
     // aria-label, no data-testid — only the inner text.
@@ -147,6 +163,7 @@ export const SELECTORS: SelectorSet = {
     '[data-radix-popper-content-wrapper] span:text-is("Deep research")',
   ],
   deepResearchSelected: [
+    'form [data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"]',
     '#prompt-textarea [data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"]',
     'form [data-testid*="deep-research" i]',
     'form button:text-is("Deep research")',
@@ -237,7 +254,6 @@ export const TURN_CRITICAL_SELECTORS: Array<keyof SelectorSet> = [
   "composer",
   "modelSwitcher",
   "thinkingPowerButton",
-  "projectsNavigation",
 ];
 
 export function joinSelectors(set: string[]): string {
