@@ -33,6 +33,8 @@ function pageFor(
     // A page that cannot answer the overlay probe at all. The probe runs on the
     // failure path, so it must never replace the click's own error.
     probeFails?: boolean;
+    // P-035 2026-09-26: the row carries a "Start new chat in project" button.
+    startChat?: boolean;
   } = { matches: 1 },
 ) {
   let currentUrl = sidebar.startUrl ?? "https://chatgpt.com/";
@@ -43,9 +45,13 @@ function pageFor(
   // what turned this line into 21 timeouts in seven days (P-035 2026-09-18).
   const labelWait = vi.fn(async () => {});
   const label = { waitFor: labelWait, click: rowClick };
+  // The current UI's "Start new chat in project" button; absent (count 0) on older rows.
+  const startChatClick = vi.fn(async () => {});
+  const startChat = { count: vi.fn(async () => sidebar.startChat ? 1 : 0), waitFor: vi.fn(async () => {}), click: startChatClick };
   const row = {
     waitFor: vi.fn(async () => {}),
     getByText: vi.fn(() => ({ first: () => label })),
+    getByRole: vi.fn(() => ({ first: () => startChat })),
   };
   // The sidebar link is resolved imperatively (count/nth/isVisible/click) so a
   // hidden duplicate can be skipped and a timeout can be retried, rather than
@@ -92,7 +98,7 @@ function pageFor(
     if (name === "composer") return {};
     return { click: vi.fn(async () => {}) };
   });
-  return { page, rowClick, row, label, labelWait, sidebarMatch, press };
+  return { page, rowClick, row, label, labelWait, sidebarMatch, press, startChatClick };
 }
 
 beforeEach(() => { vi.clearAllMocks(); projects.mockResolvedValue([target]); });
@@ -126,6 +132,13 @@ describe("Project directory navigation", () => {
     expect(onPhase.mock.calls.map(([phase]) => phase)).toContain("project-navigation-direct");
     expect(onPhase.mock.calls.map(([phase]) => phase)).not.toContain("project-navigation-lookup");
     expect(rowClick).toHaveBeenCalledOnce();
+  });
+
+  it("opens the Project through the row's start-chat button, not the name that only expands it", async () => {
+    const { page, rowClick, startChatClick } = pageFor(undefined, { matches: 1, startChat: true });
+    await openConversation(page, { gizmoId: target.id });
+    expect(startChatClick).toHaveBeenCalledOnce();
+    expect(rowClick).not.toHaveBeenCalled();
   });
 
   it("matches the Project row by its current and its former options-button name", async () => {

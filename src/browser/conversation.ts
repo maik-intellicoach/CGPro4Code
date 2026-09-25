@@ -130,7 +130,11 @@ export async function openConversation(
     // would only have moved the boundary. The fixed 5s settle this replaces was
     // a hedge for the same thing, and click() re-resolves per retry anyway, so
     // a row that re-renders mid-click is already covered.
-    const label = row.getByText(project.name, { exact: true }).first();
+    // P-035 2026-09-26: clicking the name now only expands the row; the row's
+    // "Start new chat in project" button is what opens /g/<id>/project (read
+    // live on ms1980). Older rows have no such button and navigate on the name.
+    const startChat = row.getByRole("button", { name: "Start new chat in project", exact: true }).first();
+    const label = await startChat.count() > 0 ? startChat : row.getByText(project.name, { exact: true }).first();
     onPhase?.("project-label-wait");
     await label.waitFor({ state: "visible", timeout: 20_000 });
     onPhase?.("project-label-click");
