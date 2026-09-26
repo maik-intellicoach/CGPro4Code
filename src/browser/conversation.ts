@@ -1106,15 +1106,18 @@ async function visibleComposerTool(page: Page, name: string): Promise<Locator | 
   const expected = name.replace(/\s+/g, " ").trim().toLocaleLowerCase();
   const matchingCandidate = async (selector: string): Promise<Locator | null> => {
     const candidates = page.locator(selector).filter({ hasText: name });
-    const index = await candidates
-      .evaluateAll((elements, label) => elements.findIndex((element) => {
+    const [index, scanned] = await candidates
+      .evaluateAll((elements, label) => [elements.findIndex((element) => {
         const el = element as HTMLElement;
         const box = el.getBoundingClientRect();
         return box.width > 0 && box.height > 0 &&
           el.checkVisibility({ visibilityProperty: true }) &&
           el.innerText.replace(/\s+/g, " ").trim().toLocaleLowerCase() === label;
-      }), expected)
-      .catch(() => -1);
+      }), elements.length], expected)
+      .catch(() => [-1, 0]);
+    // Diagnostic for the picker-click stall (P-035 2026-09-26): how many page
+    // elements a locator that resolves by this filter must scan.
+    if (scanned > 20) console.error(`[cgpro:connector] lookup selector=${selector.slice(0, 20)} candidates=${scanned} match=${index}`);
     // ponytail: a re-render between this pass and the caller's use can shift
     // nth(); callers re-verify the row (attached state, exact click) and retry.
     return index >= 0 ? candidates.nth(index) : null;
@@ -1366,15 +1369,20 @@ function clickStallReason(error: Error): string {
 }
 
 async function clickConnector(page: Page, row: Locator, name: string): Promise<void> {
+  const clickStart = Date.now();
+  const mark = (what: string) => console.error(`[cgpro:connector] click-sub ${what} ms=${Date.now() - clickStart}`);
   try {
     await row.click({ timeout: 5_000 });
+    mark("first-click-done");
   } catch (error) {
+    mark("first-click-threw");
     // ChatGPT can replace the @ results between observation and click. Resolve
     // one fresh exact row; never force-click through a popover or toggle off an
     // attachment that mounted while the first click was timing out.
     if (!(error instanceof Error) || !error.message.includes("Timeout")) throw error;
     console.error(`[cgpro:connector] click-timeout attempt=1 reason=${clickStallReason(error)}`);
     const refreshed = await waitForComposerTool(page, name);
+    mark(`refresh-lookup found=${Boolean(refreshed)}`);
     if (!refreshed) {
       throw new PreSubmitInteractionError(
         "connector_control_activation_timeout",
