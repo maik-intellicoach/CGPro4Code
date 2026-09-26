@@ -1097,19 +1097,27 @@ export function exactConnectorLabelIndex(labels: string[], name: string): number
 const PICKER_READ_TIMEOUT_MS = 1_000;
 
 async function visibleComposerTool(page: Page, name: string): Promise<Locator | null> {
-  // Let the browser narrow the DOM before crossing the automation boundary.
-  // Scanning every button and span with serial isVisible/innerText calls made
-  // one nominally bounded picker poll take minutes on large Project pages.
+  // Let the browser narrow the DOM before crossing the automation boundary, then
+  // decide visibility and the exact label in ONE in-page pass per selector.
+  // Previews of earlier Project chats ("@<connector> SYSTEM: ...") also contain
+  // the name, so per-candidate isVisible/innerText round trips grew with the
+  // Project's history: on 2026-09-26 picker-wait went from a 3 s median to 29 s
+  // (max 147 s) and every lane preflight hit its 140 s budget.
+  const expected = name.replace(/\s+/g, " ").trim().toLocaleLowerCase();
   const matchingCandidate = async (selector: string): Promise<Locator | null> => {
     const candidates = page.locator(selector).filter({ hasText: name });
-    const count = await candidates.count().catch(() => 0);
-    for (let i = 0; i < count; i++) {
-      const candidate = candidates.nth(i);
-      if (!(await candidate.isVisible().catch(() => false))) continue;
-      const label = await candidate.innerText({ timeout: PICKER_READ_TIMEOUT_MS }).catch(() => "");
-      if (exactConnectorLabelIndex([label], name) === 0) return candidate;
-    }
-    return null;
+    const index = await candidates
+      .evaluateAll((elements, label) => elements.findIndex((element) => {
+        const el = element as HTMLElement;
+        const box = el.getBoundingClientRect();
+        return box.width > 0 && box.height > 0 &&
+          el.checkVisibility({ visibilityProperty: true }) &&
+          el.innerText.replace(/\s+/g, " ").trim().toLocaleLowerCase() === label;
+      }), expected)
+      .catch(() => -1);
+    // ponytail: a re-render between this pass and the caller's use can shift
+    // nth(); callers re-verify the row (attached state, exact click) and retry.
+    return index >= 0 ? candidates.nth(index) : null;
   };
 
   const interactive = await matchingCandidate(

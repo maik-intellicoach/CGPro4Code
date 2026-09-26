@@ -63,6 +63,7 @@ function makePage() {
   let devMode = false;
   let devSelect: (() => void) | null = null;
   const innerTextReads: string[] = [];
+  let roundTrips = 0;
 
   const page = {
     keyboard: {
@@ -76,8 +77,12 @@ function makePage() {
 
   const rowLoc = (row: FakeRow | undefined) => ({
     count: async () => (row ? 1 : 0),
-    isVisible: async () => row?.visible ?? false,
+    isVisible: async () => {
+      roundTrips++;
+      return row?.visible ?? false;
+    },
     innerText: async () => {
+      roundTrips++;
       if (row) innerTextReads.push(row.label);
       return row?.label ?? "";
     },
@@ -105,6 +110,18 @@ function makePage() {
   const makeCandidates = (sourceRows = rows) => ({
     count: async () => sourceRows.length,
     nth: (i: number) => rowLoc(sourceRows[i]),
+    // One in-page pass over DOM-like stand-ins, mirroring Playwright's evaluateAll.
+    evaluateAll: async <R, A>(fn: (elements: unknown[], arg: A) => R, arg: A): Promise<R> => {
+      roundTrips++;
+      return fn(sourceRows.map((row) => ({
+        getBoundingClientRect: () => (row.visible ? { width: 10, height: 10 } : { width: 0, height: 0 }),
+        checkVisibility: () => row.visible,
+        get innerText() {
+          innerTextReads.push(row.label);
+          return row.label;
+        },
+      })), arg);
+    },
     filter: (options?: { hasText?: string | RegExp }) => {
       if (typeof options?.hasText === "string") {
         const expected = options.hasText.toLocaleLowerCase();
@@ -129,6 +146,9 @@ function makePage() {
       devSelect = onSelect;
     },
     innerTextReads,
+    get roundTrips(): number {
+      return roundTrips;
+    },
   };
 }
 
@@ -143,6 +163,21 @@ describe("connector selection honest attachment (P-035)", () => {
     await expect(setConnector(scenario.page, "p035-low-risk-workstation")).resolves.toBeUndefined();
 
     expect(scenario.innerTextReads).toEqual(["p035-low-risk-workstation"]);
+  });
+
+  it("finds the row in bounded round trips when chat previews also contain the name", async () => {
+    const scenario = makePage();
+    scenario.setRows([
+      ...Array.from({ length: 500 }, (_, i) => ({
+        label: `@p035-low-risk-workstation SYSTEM: earlier Project chat ${i}`,
+        visible: true,
+      })),
+      { label: "p035-low-risk-workstation", visible: true, attrs: { "aria-checked": "true" } },
+    ]);
+
+    await expect(setConnector(scenario.page, "p035-low-risk-workstation")).resolves.toBeUndefined();
+
+    expect(scenario.roundTrips).toBeLessThan(20);
   });
 
   it("rejects when an exact-label click lands but no connector becomes attached", async () => {
