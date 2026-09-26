@@ -1218,24 +1218,6 @@ const ATTACHED_STATE_ATTRIBUTES = ["aria-checked", "aria-pressed", "data-state"]
 const ATTACHED_STATE_ANCESTOR_DEPTH = 3;
 
 /**
- * Read the first present attached-state attribute value on a row, without
- * interpreting it. `undefined` means the row itself could not be read inside
- * PICKER_READ_TIMEOUT_MS; the remaining attributes would wait the same way.
- */
-export async function presentState(row: Locator): Promise<string | null | undefined> {
-  for (const attribute of ATTACHED_STATE_ATTRIBUTES) {
-    let value: string | null;
-    try {
-      value = await row.getAttribute(attribute, { timeout: PICKER_READ_TIMEOUT_MS });
-    } catch {
-      return undefined;
-    }
-    if (value !== null) return value;
-  }
-  return null;
-}
-
-/**
  * Read the attached-state attribute value when the row or its nearest
  * state-bearing ancestor reports attached, else null.
  *
@@ -1244,24 +1226,26 @@ export async function presentState(row: Locator): Promise<string | null | undefi
  * acceptance evidence), so reading only the label row is not enough. The
  * walk stops at the nearest row that carries one of the accepted state
  * attributes; only the exact values "true" / "checked" accept, anything
- * else stays fail-closed. Patchright resolves `..` as the parent element.
+ * else stays fail-closed.
  */
 export async function attachedState(row: Locator): Promise<string | null> {
-  const accept = (value: string | null): string | null =>
-    value === "true" || value === "checked" ? value : null;
-  const own = await presentState(row);
-  // An unreadable row has no readable ancestors either: fail closed now, and
-  // the caller's click/retry path decides, instead of waiting out every level.
-  if (own === undefined) return null;
-  if (own !== null) return accept(own);
-  let ancestor: Locator = row;
-  for (let depth = 0; depth < ATTACHED_STATE_ANCESTOR_DEPTH; depth++) {
-    ancestor = ancestor.locator("..");
-    const raw = await presentState(ancestor);
-    if (raw === undefined) return null;
-    if (raw !== null) return accept(raw);
-  }
-  return null;
+  // One in-page pass. Each Locator read re-resolves the row's `span:has-text`
+  // filter over the whole page, and this walk made up to 12 of them: on
+  // 2026-09-26 it took about 29 s of a 31 s picker-click step on a long Project
+  // while the click itself took 1.7 s. An unreadable row fails closed and the
+  // caller's click/retry path decides.
+  const raw = await row.evaluate((element, [attributes, depth]) => {
+    let el: Element | null = element;
+    for (let level = 0; el && level <= depth; level++, el = el.parentElement) {
+      for (const attribute of attributes) {
+        const value = el.getAttribute(attribute);
+        if (value !== null) return value;
+      }
+    }
+    return null;
+  }, [ATTACHED_STATE_ATTRIBUTES, ATTACHED_STATE_ANCESTOR_DEPTH] as const, { timeout: PICKER_READ_TIMEOUT_MS })
+    .catch(() => null);
+  return raw === "true" || raw === "checked" ? raw : null;
 }
 
 /**

@@ -36,7 +36,7 @@ vi.mock("../src/browser/chatgpt.js", () => ({
   requireSelector: vi.fn(async () => ({ click: vi.fn(async () => {}) })),
 }));
 
-const { attachedState, presentState, setConnector } = await import("../src/browser/conversation.js");
+const { attachedState, setConnector } = await import("../src/browser/conversation.js");
 
 beforeEach(() => {
   firstResolved.mockReset();
@@ -86,10 +86,16 @@ function makePage() {
       if (row) innerTextReads.push(row.label);
       return row?.label ?? "";
     },
-    getAttribute: async (attr: string) => row?.attrs?.[attr] ?? null,
-    evaluate: async () => row?.inComposer ?? false,
-    // `attachedState` walks the bounded ancestor chain via `locator("..")` —
-    // resolve it to the enclosing row.
+    getAttribute: async (attr: string) => {
+      roundTrips++;
+      return row?.attrs?.[attr] ?? null;
+    },
+    // One in-page pass over a DOM-like stand-in, mirroring Playwright's evaluate.
+    evaluate: async <R, A>(fn: (element: unknown, arg: A) => R, arg: A): Promise<R> => {
+      roundTrips++;
+      if (!row) throw new Error("locator.evaluate: Timeout exceeded");
+      return fn(domRow(row), arg);
+    },
     locator: () => rowLoc(row?.parent),
     click: async () => {
       if (row) {
@@ -97,6 +103,14 @@ function makePage() {
         await row.onSelected?.();
       }
     },
+  });
+
+  const domRow = (row: FakeRow): unknown => ({
+    getAttribute: (attr: string) => row.attrs?.[attr] ?? null,
+    get parentElement() {
+      return row.parent ? domRow(row.parent) : null;
+    },
+    closest: (selector: string) => (selector === "form" && row.inComposer ? { querySelector: () => ({}) } : null),
   });
 
   const devLoc = () => ({
@@ -178,6 +192,23 @@ describe("connector selection honest attachment (P-035)", () => {
     await expect(setConnector(scenario.page, "p035-low-risk-workstation")).resolves.toBeUndefined();
 
     expect(scenario.roundTrips).toBeLessThan(20);
+  });
+
+  it("reads a row's attached state in one round trip, not one per attribute and ancestor", async () => {
+    const scenario = makePage();
+    const row = {
+      label: "p035-low-risk-workstation",
+      visible: true,
+      parent: { label: "", visible: true, parent: { label: "", visible: true, parent: {
+        label: "", visible: true, attrs: { "aria-checked": "true" },
+      } } },
+    };
+    scenario.setRows([row]);
+    const before = scenario.roundTrips;
+
+    await expect(attachedState(scenario.page.locator("span").nth(0) as unknown as Locator)).resolves.toBe("true");
+
+    expect(scenario.roundTrips - before).toBe(1);
   });
 
   it("rejects when an exact-label click lands but no connector becomes attached", async () => {
@@ -485,10 +516,10 @@ describe("picker reads are bounded (P-035 2026-09-23)", () => {
   function staleRow(): { row: Locator; reads: Array<number | undefined> } {
     const reads: Array<number | undefined> = [];
     const row = {
-      getAttribute: (_attribute: string, options?: { timeout?: number }) => {
+      evaluate: (_fn: unknown, _arg: unknown, options?: { timeout?: number }) => {
         reads.push(options?.timeout);
         return new Promise<string | null>((_, reject) => {
-          setTimeout(() => reject(new Error("locator.getAttribute: Timeout exceeded")), options?.timeout ?? 30_000);
+          setTimeout(() => reject(new Error("locator.evaluate: Timeout exceeded")), options?.timeout ?? 30_000);
         });
       },
       locator: () => row,
@@ -500,19 +531,7 @@ describe("picker reads are bounded (P-035 2026-09-23)", () => {
     vi.useRealTimers();
   });
 
-  it("presentState gives up on a row that never resolves within about 1 s, not 30 s", async () => {
-    vi.useFakeTimers();
-    const { row, reads } = staleRow();
-    let settled = false;
-    void presentState(row).then(() => {
-      settled = true;
-    });
-    await vi.advanceTimersByTimeAsync(1_100);
-    expect(settled).toBe(true);
-    expect(reads).toEqual([1_000]);
-  });
-
-  it("attachedState stops walking ancestors once the row cannot be read", async () => {
+  it("attachedState gives up on a row that never resolves within about 1 s, in one read", async () => {
     vi.useFakeTimers();
     const { row, reads } = staleRow();
     let result: string | null | "pending" = "pending";
@@ -521,6 +540,6 @@ describe("picker reads are bounded (P-035 2026-09-23)", () => {
     });
     await vi.advanceTimersByTimeAsync(1_100);
     expect(result).toBeNull();
-    expect(reads).toHaveLength(1);
+    expect(reads).toEqual([1_000]);
   });
 });
