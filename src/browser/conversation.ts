@@ -2340,6 +2340,15 @@ export async function assertPreflightDraftSafe(
         while (index < max && a[index] === b[index]) index += 1;
         return index;
       };
+      // P-035 2026-09-28 r30. The planning header's letters and digits, in order
+      // but with every separator dropped: the hidden mirror renders the header
+      // with different punctuation and line breaks (`-` becomes a Markdown `*`,
+      // paragraph breaks collapse), so the same header arrives as a different
+      // literal string while every letter and digit stays contiguous and in
+      // order. Lowercased so case is not a divergence either. ONE helper, used
+      // both by the live shape line (r29) and by the mirror admission rule (r30).
+      const reduceAlnum = (value: string): string =>
+        value.replace(/[^\p{L}\p{N}]/gu, "").toLowerCase();
       // P-035 2026-09-28 r29. The content-free CLASS of one code point, so a
       // header divergence can be named in a live line without ever printing a
       // character from the page: `ws` for whitespace, `P:<hex code point>` for
@@ -2740,9 +2749,8 @@ export async function assertPreflightDraftSafe(
           }
           // The same question with every non-letter and non-digit removed, so a
           // punctuation-only divergence (Markdown `-` rendered as `*`, say)
-          // still reports the header as present in words.
-          const reduceAlnum = (value: string): string =>
-            value.replace(/[^\p{L}\p{N}]/gu, "").toLowerCase();
+          // still reports the header as present in words. The helper is hoisted
+          // to the evaluation scope (r30) and shared with the mirror rule.
           const mirrorAlnum = reduceAlnum(mirror);
           const proofAlnum = reduceAlnum(proof);
           alnumContains = mirrorAlnum.includes(proofAlnum) ? "yes" : "no";
@@ -2836,12 +2844,28 @@ export async function assertPreflightDraftSafe(
           // is compared on the unescaped mirror (its own spacing is part of the
           // marker, never normalised away). Nothing else changes: this still
           // needs an admitted owned token and an owned proof.
+          //
+          // P-035 2026-09-28 r30. Live evidence 05:45 (vendor 9b08542, Intelli
+          // pid 86290): the visible composer passed the full provenance proof,
+          // yet the hidden mirror still refused `foreign_text` with
+          // `contains_prefix=no ... alnum_contains=yes alnum_header_at=71` --
+          // the header's letters and digits are all present, contiguous and in
+          // order, only its punctuation and whitespace differ (the Markdown list
+          // `-` serialised as `*`, paragraph breaks collapsed). So under a
+          // provenance proof the header condition is the literal match OR the
+          // letters-and-digits match: the same letters and digits, in order,
+          // ignoring every separator and case. The 40-character floor keeps the
+          // relaxed match meaningful -- a shorter prefix is not a proof that a
+          // full header mirrored. Every other requirement is unchanged: the
+          // owned connector, the literal marker and the aria-hidden ancestor.
           const unescaped = unescape(nodeText);
           const mirror = norm(unescaped);
           const mirrorsOwned = owned.text !== undefined
             ? mirror.includes(norm(owned.text))
             : owned.provenance !== undefined
-              && mirror.includes(norm(owned.provenance.prefix))
+              && (mirror.includes(norm(owned.provenance.prefix))
+                || (reduceAlnum(owned.provenance.prefix).length >= 40
+                  && reduceAlnum(mirror).includes(reduceAlnum(owned.provenance.prefix))))
               && unescaped.includes(owned.provenance.marker);
           if (mirror.includes(owned.connector) && mirrorsOwned) continue;
         }

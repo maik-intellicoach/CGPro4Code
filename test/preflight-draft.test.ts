@@ -1908,8 +1908,13 @@ describe("Markdown-escaped hidden mirror of the proven draft (r28)", () => {
 // substring, so the planner needs to know exactly how it differs inside the
 // mirror without a character of it: where the header sits, how far it agrees,
 // the CLASS of the first divergence, and the same question with every
-// non-letter and non-digit removed. These cases prove each new field and that
-// admission is unchanged: the new fields are diagnostic only.
+// non-letter and non-digit removed. These cases prove each new field.
+//
+// r30 note: the two cases below whose mirror carries a punctuation-only header
+// divergence AND the whole proof (marker included) are now ADMITTED by the
+// r30 mirror rule, so they can no longer reach the shape line. They are kept
+// here as refusing cases by dropping exactly one proven part (the marker, then
+// a header word), which still exercises every r29 field.
 describe("hidden-mirror header divergence shape (r29)", () => {
   const CONNECTOR = "fixture";
   const MARKER = "<!-- CGPRO-PLANNING-INVOCATION-V1 -->";
@@ -1930,16 +1935,20 @@ describe("hidden-mirror header divergence shape (r29)", () => {
     try {
       // The composer holds the header with a Markdown hyphen; the hidden mirror
       // serialises that same list item with a star, so the header is present in
-      // words but not as a literal substring and the mirror refuses.
-      const starred = composed(HEADER.replace(" - item one", " * item one"));
+      // words but not as a literal substring. r30 admits that shape while the
+      // whole proof holds, so this mirror omits the marker and still refuses --
+      // which is what keeps the r29 shape line reporting the divergence.
+      const starredNoMarker = `${HEADER.replace(" - item one", " * item one")}\n`
+        + `USER: the different planning request\ninvocation_id="${UUID}"`;
       const error = await assertPreflightDraftSafe(
-        fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(`${CONNECTOR} ${starred}`) }).page,
+        fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(`${CONNECTOR} ${starredNoMarker}`) }).page,
         { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
       ).catch(caught => caught);
       expect(error).toBeInstanceOf(PreflightDraftProtectedError);
       expect(error.reason).toBe("foreign_text");
       const line = shapeLineOf(spy);
       expect(line).toContain("contains_prefix=no");
+      expect(line).toContain("contains_marker=no");
       expect(line).toContain("alnum_contains=yes");
       expect(line).toContain("have_char=P:2a");
       expect(line).toContain("want_char=P:2d");
@@ -1974,19 +1983,20 @@ describe("hidden-mirror header divergence shape (r29)", () => {
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       // The header's first 40 characters sit AFTER the wrapper, so the anchor is
-      // found at a positive index even though the starred tail still refuses.
-      const starred = composed(HEADER.replace(" - item one", " * item one"));
+      // found at a positive index. The header changes a word BEYOND that anchor,
+      // so it matches neither literally nor by letters and digits and refuses.
+      const changedTail = composed(HEADER.replace("item one", "item changed"));
       const error = await assertPreflightDraftSafe(
         fixture({
           mention: CONNECTOR, text: composed(),
-          ...mirrorOf(`extra wrapper text ${CONNECTOR} ${starred}`),
+          ...mirrorOf(`extra wrapper text ${CONNECTOR} ${changedTail}`),
         }).page,
         { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
       ).catch(caught => caught);
       expect(error.reason).toBe("foreign_text");
       const line = shapeLineOf(spy);
       expect(headerAtOf(line)).toBeGreaterThan(0);
-      expect(line).toContain("alnum_contains=yes");
+      expect(line).toContain("alnum_contains=no");
       expect(line).toContain("alnum_header_at=");
     } finally {
       spy.mockRestore();
@@ -2046,5 +2056,96 @@ describe("hidden-mirror header divergence shape (r29)", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+// P-035 2026-09-28 r30. Live evidence 05:45 SGT (vendor 9b08542, Intelli pid
+// 86290): the visible composer passed the whole provenance proof, yet the hidden
+// mirror (`tag=SPAN hidden=aria path=SPAN<FORM len=3141`) still refused
+// `foreign_text` with `contains_prefix=no alnum_contains=yes alnum_header_at=71`
+// -- the planning header is all there in letters and digits, contiguous and in
+// order, only its punctuation and whitespace differ (the Markdown list `-`
+// serialised as a `*`, line breaks collapsed or dropped). These cases prove the
+// header condition now accepts that letters-and-digits match under a provenance
+// proof, and that nothing else about the mirror rule loosens: the verbatim
+// marker, the owned connector, the aria-hidden ancestor and the 40-character
+// floor all still decide.
+describe("letters-and-digits header match in the hidden mirror (r30)", () => {
+  const CONNECTOR = "fixture";
+  const MARKER = "<!-- CGPRO-PLANNING-INVOCATION-V1 -->";
+  const UUID = "0f8fad5b-d9cb-469f-a165-70867728950e";
+  const HEADER = "planning system header v1\nlane=intelli facade=planning - item one";
+  const composed = (header = HEADER, request = "the different planning request"): string =>
+    `${header}\nUSER: ${request}\n${MARKER}\ninvocation_id="${UUID}"`;
+  // The mirror's own rendering of the composed draft: the list hyphen becomes a
+  // Markdown star and the header's line break is dropped, so the header arrives
+  // with the very same letters and digits in the same order but is not a literal
+  // substring. `header` may be swapped to break the letters-and-digits match.
+  const reformatted = (header = HEADER): string =>
+    `${CONNECTOR} ${header.replace(/\n/g, "").replace(" - ", " * ")} `
+    + `USER: the different planning request ${MARKER} invocation_id="${UUID}"`;
+  const mirrorOf = (body: string, ariaHidden = true) =>
+    ({ foreignText: body, foreignParent: { tagName: "SPAN", ariaHidden } });
+  const reasonOf = async (page: Page, owned: { text?: string; connector?: string;
+    provenance?: { prefix: string; marker: string } }) =>
+    (await assertPreflightDraftSafe(page, owned).then(() => undefined).catch(caught => caught))?.reason;
+
+  it("admits the hidden mirror whose header matches by letters and digits", async () => {
+    // The composer holds this call's own chip and the composed draft; the hidden
+    // span mirrors the whole serialisation, its header rendered with different
+    // punctuation and no line break, yet the same letters and digits in order.
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(reformatted()) }).page,
+      { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+    )).resolves.toBeUndefined();
+  });
+
+  it("refuses the same mirror when one header word changes", async () => {
+    expect(await reasonOf(
+      fixture({ mention: CONNECTOR, text: composed(),
+        ...mirrorOf(reformatted(HEADER.replace("item one", "item changed"))) }).page,
+      { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+    )).toBe("foreign_text");
+  });
+
+  it("refuses the same mirror without the verbatim marker", async () => {
+    const withoutMarker = `${CONNECTOR} ${HEADER.replace(/\n/g, "").replace(" - ", " * ")} `
+      + `USER: the different planning request invocation_id="${UUID}"`;
+    expect(await reasonOf(
+      fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(withoutMarker) }).page,
+      { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+    )).toBe("foreign_text");
+  });
+
+  it("refuses the same mirror without the owned connector", async () => {
+    expect(await reasonOf(
+      fixture({ mention: CONNECTOR, text: composed(),
+        ...mirrorOf(reformatted().replace(CONNECTOR, "other")) }).page,
+      { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+    )).toBe("foreign_text");
+  });
+
+  it("refuses the same content in a visible node", async () => {
+    // The letters-and-digits match needs the aria-hidden ancestor exactly as the
+    // literal match does; a visible copy refuses unchanged.
+    expect(await reasonOf(
+      fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(reformatted(), false) }).page,
+      { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+    )).toBe("foreign_text");
+  });
+
+  it("refuses a header with fewer than 40 letters and digits that matches only by alnum", async () => {
+    // A short header is not proof that a full header mirrored: with fewer than 40
+    // letters and digits the relaxed match is unavailable, so a mirror that
+    // diverges only in punctuation refuses as the literal match fails.
+    const SHORT = "planning header - item one";
+    expect(await reasonOf(
+      fixture({
+        mention: CONNECTOR, text: composed(SHORT),
+        ...mirrorOf(`${CONNECTOR} planning header * item one `
+          + `USER: the different planning request ${MARKER} invocation_id="${UUID}"`),
+      }).page,
+      { connector: CONNECTOR, provenance: { prefix: SHORT, marker: MARKER } },
+    )).toBe("foreign_text");
   });
 });
