@@ -3,7 +3,7 @@ import { SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
 import { listProjects } from "../api/projects.js";
 import { fetchModelsWithReason, findProModel, type ChatgptModel } from "../api/models.js";
-import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, SelectorBrokenError, TurnTimeoutError } from "../errors.js";
+import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, SelectorBrokenError, TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation } from "../core/stream.js";
 
 /**
@@ -34,9 +34,20 @@ export async function openConversation(
   page: Page,
   opts: { model?: string; conversationId?: string; gizmoId?: string; gizmoShortUrl?: string } = {},
   onPhase?: (phase: ProjectNavigationPhase) => void,
+  protectDraft = false,
 ): Promise<void> {
+  // Every protected step proves the CURRENT surface empty before it acts, so
+  // the composer-free Projects directory (the one surface this flow visits
+  // without a composer) is admissible only after the step before it -- home --
+  // was itself proven empty in this same guarded navigation.
+  let sourceProvenEmpty = false;
+  const guard = async (): Promise<void> => {
+    await assertPreflightDraftSafe(page);
+    sourceProvenEmpty = true;
+  };
   if (opts.conversationId) {
     onPhase?.("project-home");
+    if (protectDraft) await guard();
     await page.goto(`https://chatgpt.com/c/${opts.conversationId}`, {
       waitUntil: "domcontentloaded",
       timeout: 60_000,
@@ -44,6 +55,7 @@ export async function openConversation(
   } else if (opts.gizmoId || opts.gizmoShortUrl) {
     const slug = opts.gizmoShortUrl ?? opts.gizmoId!;
     onPhase?.("project-home");
+    if (protectDraft) await guard();
     await goHome(page, { model: opts.model });
     // The Project directory row below is this branch's real readiness gate;
     // the home composer was a surface-dependent proxy for the same thing, and
@@ -53,6 +65,7 @@ export async function openConversation(
     // (P-035 planning-lane incident 2026-09-16: five of eight dispatches).
     // ensureChatTab is idempotent; it no-ops on a single-surface UI.
     onPhase?.("project-chat-surface");
+    if (protectDraft) await guard();
     await ensureChatTab(page);
     onPhase?.("project-list-wait");
     await page.waitForTimeout(5_000);
@@ -86,6 +99,7 @@ export async function openConversation(
     if (!onProjectsDirectory() &&
         await page.locator(joinSelectors(SELECTORS.projectsNavigation)).count() === 0) {
       onPhase?.("project-navigation-direct");
+      if (protectDraft) await guard();
       await page.goto("https://chatgpt.com/projects", { waitUntil: "domcontentloaded", timeout: 60_000 });
     }
     if (!onProjectsDirectory()) {
@@ -94,8 +108,10 @@ export async function openConversation(
       onPhase?.("project-navigation-wait");
       await page.waitForTimeout(5_000);
       onPhase?.("project-navigation-click");
+      if (protectDraft) await guard();
       await clickFirstActionable(
         page, SELECTORS.projectsNavigation, "Projects navigation", 3, onProjectsDirectory,
+        protectDraft ? guard : undefined,
       );
     }
     // A saturated host can take longer than one budget to hydrate the
@@ -138,6 +154,13 @@ export async function openConversation(
     onPhase?.("project-label-wait");
     await label.waitFor({ state: "visible", timeout: 20_000 });
     onPhase?.("project-label-click");
+    // The row's label lives on the Projects directory, the one composer-free
+    // surface in this flow. Admit it only as that known phase, and only after
+    // both the home source and this directory page were proven free of drafts.
+    if (protectDraft) {
+      await assertPreflightDraftSafe(page, { directory: true, sourceProvenEmpty });
+      sourceProvenEmpty = true;
+    }
     await label.click({ timeout: 10_000 });
     onPhase?.("project-destination-wait");
     await page.waitForURL((url) => url.origin === "https://chatgpt.com" &&
@@ -148,6 +171,7 @@ export async function openConversation(
     const url = new URL("https://chatgpt.com/");
     if (opts.model) url.searchParams.set("model", opts.model);
     onPhase?.("project-home");
+    if (protectDraft) await guard();
     await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
   }
 
@@ -159,10 +183,12 @@ export async function openConversation(
   // own model set with no Pro tier. cgpro only ever drives classic
   // chat, so force the Chat surface before touching the model picker.
   onPhase?.("project-chat-surface");
+  if (protectDraft) await guard();
   await ensureChatTab(page);
 
   if (opts.model) {
     onPhase?.("project-model");
+    if (protectDraft) await guard();
     await tryEnsureModel(page, opts.model);
   }
 }
@@ -1393,7 +1419,7 @@ async function clickConnector(page: Page, row: Locator, name: string): Promise<v
   }
 }
 
-export async function setConnector(page: Page, name: string): Promise<void> {
+export async function setConnector(page: Page, name: string, protectDraft = false): Promise<void> {
   const connectorName = name.trim();
   if (!connectorName) throw new Error("connector name must not be empty");
   // P-035 2026-09-21. Per-step timing on stderr, where the daemon already
@@ -1408,8 +1434,11 @@ export async function setConnector(page: Page, name: string): Promise<void> {
     markAt = Date.now();
   };
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
+  if (protectDraft) await assertPreflightDraftSafe(page);
   await composer.click();
+  if (protectDraft) await assertPreflightDraftSafe(page);
   await page.keyboard.press("Meta+A");
+  if (protectDraft) await assertPreflightDraftSafe(page);
   await page.keyboard.press("Backspace");
   await page.keyboard.type("@");
   await page.waitForTimeout(300);
@@ -1448,13 +1477,16 @@ export async function setConnector(page: Page, name: string): Promise<void> {
   }
 
   // Clear the failed @ query before trying older plus-menu layouts.
+  if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
   await page.keyboard.press("Escape").catch(() => undefined);
   await composer.click();
+  if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
   await page.keyboard.press("Meta+A");
+  if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
   await page.keyboard.press("Backspace");
   step("picker-missing");
   if (!(await openComposerToolsPopover(page))) {
-    await recordConnectorDiagnostics(page);
+    if (!protectDraft) await recordConnectorDiagnostics(page);
     throw new Error(`ChatGPT connector picker is unavailable; could not select "${connectorName}".`);
   }
 
@@ -1507,7 +1539,7 @@ export async function setConnector(page: Page, name: string): Promise<void> {
   }
 
   if (!connector) {
-    await recordConnectorDiagnostics(page);
+    if (!protectDraft) await recordConnectorDiagnostics(page);
     await page.keyboard.press("Escape").catch(() => undefined);
     throw new Error(`ChatGPT connector "${connectorName}" is not exposed in the composer tool picker.`);
   }
@@ -1521,7 +1553,7 @@ export async function setConnector(page: Page, name: string): Promise<void> {
   try {
     await clickConnector(page, connector, connectorName);
   } catch (error) {
-    await recordConnectorDiagnostics(page);
+    if (!protectDraft) await recordConnectorDiagnostics(page);
     await page.keyboard.press("Escape").catch(() => undefined);
     if (error instanceof PreSubmitInteractionError) throw error;
     const reason = error instanceof Error ? error.message.split("\n")[0].slice(0, 200) : "unknown click error";
@@ -1543,10 +1575,111 @@ export async function setConnector(page: Page, name: string): Promise<void> {
   await page.waitForTimeout(150);
 }
 
-export async function clearComposer(page: Page): Promise<void> {
+/**
+ * Read-only, content-free admission for the no-submit preflight. Unknown rich
+ * nodes or controls are protected, not converted into a text backup. Only the
+ * exact probe text / single connector token introduced by this call may pass.
+ *
+ * Safe draft admission depends on the known navigation PHASE, never on a
+ * universal composer count. A composer-free page is admissible only as the
+ * exact ChatGPT Projects directory step (`owned.directory`) of a guarded
+ * navigation whose preceding surface was already proven empty
+ * (`owned.sourceProvenEmpty`); every other no-composer page still refuses.
+ */
+export async function assertPreflightDraftSafe(
+  page: Page,
+  owned: { text?: string; connector?: string; directory?: boolean; sourceProvenEmpty?: boolean } = {},
+): Promise<void> {
+  let safe = false;
+  try {
+    safe = await page.evaluate(({ selector, owned }) => {
+      const composers = Array.from(document.querySelectorAll<HTMLElement>(selector));
+      if (location.href === "about:blank") {
+        return composers.length === 0 && document.body?.childNodes.length === 0;
+      }
+      if (location.origin !== "https://chatgpt.com") return false;
+      // Uploads can be outside the editable document, and an empty text value
+      // says nothing about files, pending uploads, or non-text tokens.
+      if (Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'))
+        .some(input => input.files === null || input.files.length > 0)) return false;
+      if (composers.length !== 1) {
+        // The Projects directory is the single composer-free surface the
+        // vendor flow is known to visit. Admit it ONLY when the caller names
+        // that phase, its preceding surface was proven empty in this guarded
+        // navigation, the route is exactly /projects, and read-only DOM checks
+        // find no editor, attachment/upload marker, unknown nested surface or
+        // typed value. A missing composer alone is never a safe condition.
+        if (!owned.directory || !owned.sourceProvenEmpty) return false;
+        if (location.pathname !== "/projects") return false;
+        if (document.querySelectorAll(
+          'textarea, [contenteditable]:not([contenteditable="false"]), [role="textbox"], ' +
+          '[data-type], [data-testid*="attachment" i], [data-testid*="upload" i]:not(input), ' +
+          '[aria-label*="remove" i], img[src^="blob:"], iframe, object, embed, canvas, video, audio',
+        ).length > 0) return false;
+        for (const field of Array.from(document.querySelectorAll<HTMLInputElement>(
+          'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])' +
+          ':not([type="button"]):not([type="submit"]):not([type="file"])',
+        ))) {
+          // A typed search/value on the directory is a draft like any other.
+          if ((field.value ?? "").length > 0) return false;
+        }
+        return true;
+      }
+      const composer = composers[0];
+      const form = composer.closest("form");
+      if (!form || !composer.isConnected || composer.getClientRects().length === 0) return false;
+      if (form.querySelector('img, video, audio, canvas, object, iframe, [data-testid*="attachment" i], [data-testid*="upload" i]:not(input), [data-type], [aria-label*="remove" i]')) return false;
+      for (const control of Array.from(form.querySelectorAll('button, [role="button"]'))) {
+        if (composer.contains(control) || control.closest('[role="menu"], [role="listbox"]')) continue;
+        if (!control.matches('button[data-testid="composer-plus-btn"], button[data-testid="send-button"], button[data-testid="composer-send-button"], button[aria-label="Select ChatGPT model"], button.__composer-pill[aria-haspopup="menu"], button[data-testid="model-switcher-dropdown-button"]')) return false;
+      }
+      const copy = composer.cloneNode(true) as HTMLElement;
+      const tokens = Array.from(copy.querySelectorAll<HTMLElement>('[contenteditable="false"]'));
+      if (tokens.length) {
+        if (!owned.connector || tokens.length !== 1 || tokens[0].tagName !== "A" ||
+            tokens[0].textContent?.trim() !== owned.connector) return false;
+        tokens[0].remove();
+      }
+      // Only familiar text formatting is admissible. Unrecognised rich nodes
+      // (including empty mentions) fail closed even when their text is empty.
+      for (const child of Array.from(copy.querySelectorAll("*"))) {
+        if (!/^(P|BR|SPAN|STRONG|EM|B|I|CODE|PRE|UL|OL|LI)$/.test(child.tagName)) return false;
+        if (Array.from(child.attributes).some(a => /^(data-|contenteditable|role|aria-|hidden|style)/.test(a.name))) return false;
+      }
+      let text = composer instanceof HTMLTextAreaElement ? composer.value : composer.innerText;
+      if (tokens.length) {
+        // A sole owned connector token is admissible, not arbitrary text that
+        // happens to contain the connector name.
+        if (text.trim() !== owned.connector) return false;
+        text = "";
+      }
+      if (owned.text !== undefined) {
+        if (text !== owned.text) return false;
+      } else {
+        if (text.trim() || (copy.textContent ?? "").length > 0) return false;
+        if (composer instanceof HTMLTextAreaElement && text.length > 0) return false;
+      }
+      // Non-control text outside the editable region may be a rich draft chip.
+      const walker = document.createTreeWalker(form, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        if (!node.textContent?.trim() || composer.contains(node)) continue;
+        const parent = node.parentElement;
+        if (!parent?.closest('button, [role="button"], [role="menu"], [role="listbox"]')) return false;
+      }
+      return true;
+    }, { selector: joinSelectors(SELECTORS.composer), owned });
+  } catch { /* Evaluation failure is unknown, never empty. */ }
+  if (safe !== true) throw new PreflightDraftProtectedError();
+}
+
+export async function clearComposer(page: Page, guard?: () => Promise<void>): Promise<void> {
+  await guard?.();
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
   await composer.click();
+  await guard?.();
   await page.keyboard.press("Meta+A");
+  await guard?.();
   await page.keyboard.press("Backspace");
   await page.waitForTimeout(5_000);
 }
@@ -1814,16 +1947,22 @@ export async function probePromptDelivery(
   page: Page,
   prompt: string,
   force?: DeliveryPath,
+  ownedConnector?: string,
 ): Promise<PromptDeliveryProbe> {
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
+  const guard = ownedConnector === undefined ? undefined : () => assertPreflightDraftSafe(page, { connector: ownedConnector });
+  await guard?.();
   await composer.click();
   await page.waitForTimeout(120);
-  await clearComposer(page);
+  await clearComposer(page, guard);
+  if (guard) await assertPreflightDraftSafe(page);
   await focusComposerEnd(page, composer);
+  if (guard) await assertPreflightDraftSafe(page);
   let failed = false;
   try {
     const deliveredBy = await insertComposerText(page, prompt, force);
 
+    if (guard) await assertPreflightDraftSafe(page, { text: prompt });
     const want = normaliseComposerText(prompt);
     const landed = await readComposer(page, composer);
     const probe: PromptDeliveryProbe = {
@@ -1848,12 +1987,13 @@ export async function probePromptDelivery(
     throw error;
   } finally {
     try {
-      await clearComposer(page);
+      await clearComposer(page, guard ? () => assertPreflightDraftSafe(page, { text: prompt }) : undefined);
       const residue = await readComposer(page, composer);
       if (residue === null || residue.trim().length > 0) {
         throw new Error("probe cleanup unverified");
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof PreflightDraftProtectedError) throw error;
       // Keep the typed delivery failure and never put composer contents into
       // an error. The orchestrator's existing cleanup still guards this lane.
       if (failed) console.warn("[cgpro:composer] probe cleanup unverified after delivery failure");
@@ -2685,6 +2825,7 @@ async function clickFirstActionable(
   name: string,
   attempts = 3,
   settled?: () => boolean,
+  guard?: () => Promise<void>,
 ): Promise<void> {
   const selector = joinSelectors(candidates);
   let lastError: unknown;
@@ -2695,12 +2836,14 @@ async function clickFirstActionable(
     // three 15s attempts ran against the same blocker and the turn died -- while
     // a preflight nineteen seconds later cleared the ladder in 55s. Dismiss first,
     // then click. Only between attempts, so the happy path is untouched.
+    await guard?.();
     if (attempt > 0) await dismissPointerBlockers(page);
     const matches = page.locator(selector);
     const count = await matches.count().catch(() => 0);
     for (let index = 0; index < count; index++) {
       const candidate = matches.nth(index);
       if (!(await candidate.isVisible().catch(() => false))) continue;
+      await guard?.();
       try {
         await candidate.click({ timeout: 15_000 });
         return;

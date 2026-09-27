@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Page } from "patchright";
+import type { BrowserContext, Page } from "patchright";
 import type { Session } from "../src/browser/session.js";
 import type { StreamEvent } from "../src/core/stream.js";
-import { PreSubmitInteractionError, TurnTimeoutError } from "../src/errors.js";
+import { ConnectorEvidenceRateLimitError, PreSubmitInteractionError, TurnTimeoutError } from "../src/errors.js";
 
 const requireAccount = vi.fn();
 const verifyFiling = vi.fn();
@@ -16,6 +16,7 @@ const currentConversationId = vi.fn();
 const latestAssistantModelSlug = vi.fn();
 const openConversation = vi.fn();
 const clearComposer = vi.fn();
+const assertPreflightDraftSafe = vi.fn();
 const readLatestAssistantText = vi.fn();
 const sendPrompt = vi.fn();
 const setConnector = vi.fn();
@@ -36,6 +37,7 @@ vi.mock("../src/browser/chatgpt.js", () => ({
 vi.mock("../src/browser/conversation.js", () => ({
   ensureProSixMaximum: (...args: unknown[]) => ensureProSixMaximum(...args),
   clearComposer: (...args: unknown[]) => clearComposer(...args),
+  assertPreflightDraftSafe: (...args: unknown[]) => assertPreflightDraftSafe(...args),
   currentConversationId: (...args: unknown[]) => currentConversationId(...args),
   latestAssistantModelSlug: (...args: unknown[]) => latestAssistantModelSlug(...args),
   openConversation: (...args: unknown[]) => openConversation(...args),
@@ -71,6 +73,7 @@ function session(): Session {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  assertPreflightDraftSafe.mockReset().mockResolvedValue(undefined);
   requireAccount.mockReset().mockResolvedValue(undefined);
   verifyFiling.mockReset().mockResolvedValue({ status: "unavailable", conversationId: "id", projectId: null, accountVerified: false });
   fetchNativeResearchUserNodes.mockResolvedValue(new Set());
@@ -132,7 +135,7 @@ describe("runInteractionPreflight cleanup", () => {
       ["home", undefined], ["login", undefined], ["account-home", undefined],
       ["project", undefined], ["account-project", undefined], ["composer", undefined],
       ["connector", undefined], ["connector", "connector"], ["cleanup-escape", "connector"],
-      ["cleanup-home", "connector"], ["cleanup-home", "connector"], ["cleanup-composer", "connector"],
+      ["cleanup-home", "connector"], ["cleanup-home", "connector"],
     ]);
     expect(JSON.stringify(onPhase.mock.calls)).not.toContain("private");
   });
@@ -149,13 +152,13 @@ describe("runInteractionPreflight cleanup", () => {
     expect(onPhase).toHaveBeenLastCalledWith("cleanup-composer", "model-slider-focus", { code: "browser_operation_timeout" });
   });
 
-  it("reports the first cleanup failure separately from the following cleanup step", async () => {
+  it("stops cleanup after navigation failure", async () => {
     const onPhase = vi.fn();
     goHome.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("cleanup failed"));
     await expect(runInteractionPreflight(options, preflightSession(), onPhase)).rejects.toThrow(
       "interaction preflight cleanup failed",
     );
-    expect(onPhase).toHaveBeenLastCalledWith("cleanup-composer", "cleanup-home", { code: "unclassified_error" });
+    expect(onPhase).toHaveBeenLastCalledWith("cleanup-home", "cleanup-home", { code: "unclassified_error" });
   });
 });
 
@@ -353,7 +356,7 @@ describe("runAskOnSession connector contract", () => {
       "11111111-1111-1111-1111-111111111111",
       "p035-low-risk-workstation",
       10_000,
-      true,
+      false,
     );
     expect(events).toContainEqual({
       type: "tool", name: "search_context",
@@ -722,5 +725,93 @@ describe("account and Project filing contract", () => {
     expect(result.finalText).toBe("completed answer");
     expect(result.filing).toMatchObject({ status: "unavailable", preSubmitVerified: true });
     expect(sendPrompt).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe("bounded connector HTTP 429 failure", () => {
+  it.each([false, true])("preserves partial output and identity, stops only its page (terminal=%s)", async (terminal) => {
+    const { ensureInterceptorInstalled } = await import("../src/core/stream.js");
+    const bindings: Record<string, (...args: any[]) => void> = {};
+    await ensureInterceptorInstalled({
+      exposeBinding: async (name: string, callback: (...args: any[]) => void) => { bindings[name] = callback; },
+      addInitScript: async () => {},
+    } as unknown as BrowserContext);
+    const active = session();
+    const sibling = session();
+    let finishSibling!: () => void;
+    waitTurnComplete.mockImplementationOnce(() => new Promise<void>(resolve => { finishSibling = resolve; }));
+    const siblingRunner = runAskOnSession({ prompt: "sibling", timeoutSec: 7200, headless: false }, sibling);
+    const siblingEvents = collect(siblingRunner.events);
+    await vi.waitFor(() => expect(waitTurnComplete).toHaveBeenCalledTimes(1));
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    const original = Object.assign(new Error("conversation connector state fetch failed with HTTP 429"), { retryAfterMs: 180_000 });
+    fetchLatestTurnConnectorState.mockRejectedValue(original);
+    waitTurnComplete.mockImplementationOnce(async (_page, _timeout, _prior, _stable, control) => {
+      bindings.__cgproStart({ page: active.page }, "active");
+      bindings.__cgproChunk({ page: active.page }, "active", 'data: {"conversation_id":"active-id","v":"collected partial"}\n\n');
+      // Allow the public event iterator to retain the SSE identity before polling.
+      await new Promise(resolve => setImmediate(resolve));
+      expect(control.conversationId()).toBe("active-id");
+      for (let attempt = 0; attempt < 2; attempt++) {
+        clock.mockReturnValue(1_000_000 + attempt * 180_000);
+        await control.pollEvidence();
+        clock.mockReturnValue(1_000_000 + (attempt + 1) * 180_000 - 1);
+        expect(await control.confirmComplete()).toBe(false);
+        expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(attempt + 1);
+      }
+      clock.mockReturnValue(1_360_000);
+      if (!terminal) await control.pollEvidence();
+    });
+    try {
+      const runner = runAskOnSession({ prompt: "active", connector: "fixture", timeoutSec: 7200, headless: false }, active);
+      const events = collect(runner.events);
+      await expect(runner.result).rejects.toMatchObject({
+        name: "ConnectorEvidenceRateLimitError", httpStatus: 429, consecutiveFailures: 3, cause: original,
+      });
+      const delivered = await events;
+      expect(delivered).toContainEqual(expect.objectContaining({ type: "started", conversationId: "active-id" }));
+      expect(delivered).toContainEqual({ type: "delta", text: "collected partial" });
+      expect(delivered).toContainEqual({ type: "error", message: new ConnectorEvidenceRateLimitError(original).message });
+      expect(delivered.some(e => e.type === "done")).toBe(false);
+      expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(3);
+      expect(fetchLatestTurnConnectorState.mock.calls.every(call => call[4] === false)).toBe(true);
+      expect(stopCurrentTurn).toHaveBeenCalledTimes(1);
+      expect(stopCurrentTurn).toHaveBeenCalledWith(active.page);
+      expect(active.close).not.toHaveBeenCalled();
+      expect(sibling.close).not.toHaveBeenCalled();
+      expect(sendPrompt).toHaveBeenCalledTimes(2);
+    } finally {
+      clock.mockRestore();
+      finishSibling();
+      await siblingRunner.result;
+      expect((await siblingEvents).some(e => e.type === "error")).toBe(false);
+    }
+  });
+
+  it("a successful read resets the streak even when it cannot prove completion", async () => {
+    currentConversationId.mockReturnValue("active-id");
+    const failure = new Error("conversation connector state fetch failed with HTTP 429");
+    fetchLatestTurnConnectorState.mockReset()
+      .mockRejectedValueOnce(failure).mockRejectedValueOnce(failure)
+      .mockResolvedValueOnce({ currentUserNodeId: null, calls: [] })
+      .mockRejectedValue(failure);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    waitTurnComplete.mockImplementationOnce(async (_page, _timeout, _prior, _stable, control) => {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        clock.mockReturnValue(1_000_000 + attempt * 120_000);
+        await control.pollEvidence();
+      }
+      expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(5);
+      clock.mockReturnValue(1_600_000);
+      await control.pollEvidence();
+    });
+    try {
+      const runner = runAskOnSession({ prompt: "active", connector: "fixture", timeoutSec: 7200, headless: false }, session());
+      const events = collect(runner.events);
+      await expect(runner.result).rejects.toBeInstanceOf(ConnectorEvidenceRateLimitError);
+      await events;
+      expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(6);
+    } finally { clock.mockRestore(); }
   });
 });

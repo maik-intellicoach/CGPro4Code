@@ -1,3 +1,4 @@
+import { runInNewContext } from "node:vm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "patchright";
 
@@ -11,7 +12,7 @@ vi.mock("../src/browser/chatgpt.js", () => ({
   requireSelector: (...args: unknown[]) => requireSelector(...args),
   requireSelectorPatient: (...args: unknown[]) => requireSelector(...args),
 }));
-const { openConversation } = await import("../src/browser/conversation.js");
+const { openConversation, assertPreflightDraftSafe } = await import("../src/browser/conversation.js");
 const target = { id: "g-p-target", shortUrl: "g-p-target-work", name: "Work" };
 
 function pageFor(
@@ -39,7 +40,13 @@ function pageFor(
 ) {
   let currentUrl = sidebar.startUrl ?? "https://chatgpt.com/";
   let blockerCount = sidebar.blocker?.count ?? 0;
-  const rowClick = vi.fn(async () => {});
+  // The row's LABEL click is a CLIENT navigation to the project destination,
+  // so the page URL must move with it: a guard that runs after the click (for
+  // example the preflight's post-navigation composer admission) sees the
+  // destination, not the directory it left behind.
+  const rowClick = vi.fn(async () => {
+    currentUrl = new URL(destination, "https://chatgpt.com").toString();
+  });
   // The row's LABEL is what gets clicked, and it carries its own waitFor: the
   // row being visible never made the text node inside it clickable, which is
   // what turned this line into 21 timeouts in seven days (P-035 2026-09-18).
@@ -296,5 +303,117 @@ describe("Project directory sidebar click", () => {
     await expect(openConversation(page, { gizmoId: target.id })).rejects.toThrow(
       /could not be clicked after 3 attempts/,
     );
+  });
+});
+
+
+it("preflight preserves a persisted draft after nested home navigation", async () => {
+  const { page, rowClick } = pageFor();
+  let empty = true;
+  page.evaluate = vi.fn(async () => empty) as typeof page.evaluate;
+  goHome.mockImplementationOnce(async () => { empty = false; });
+  await expect(openConversation(page, { gizmoId: target.id }, undefined, true)).rejects.toMatchObject({ code: "preflight_draft_protected" });
+  expect(goHome).toHaveBeenCalledTimes(1);
+  expect(page.goto).not.toHaveBeenCalled();
+  expect(rowClick).not.toHaveBeenCalled();
+});
+
+// Planner regression: exercise the actual guard across the directory transition.
+it("planner: clean preflight crosses a composer-free Projects directory", async () => {
+  const { page, rowClick } = pageFor();
+  const originalEvaluate = page.evaluate;
+  page.evaluate = vi.fn(async (fn: Function, arg: any) => {
+    if (!arg?.selector) return originalEvaluate(fn as any, arg);
+    const form = { querySelector: () => null, querySelectorAll: () => [] };
+    const composer = {
+      isConnected: true, getClientRects: () => [{}], innerText: "",
+      closest: () => form, contains: () => false,
+      cloneNode: () => ({ textContent: "", querySelectorAll: () => [] }),
+    };
+    const directory = new URL(page.url()).pathname === "/projects";
+    const document = {
+      querySelectorAll: (selector: string) => selector === 'input[type="file"]' || directory ? [] : [composer],
+      createTreeWalker: () => ({ nextNode: () => false }),
+    };
+    return runInNewContext(`(${fn.toString()})(arg)`, {
+      arg, document, location: new URL(page.url()), HTMLTextAreaElement: class {}, NodeFilter: { SHOW_TEXT: 4 },
+    });
+  }) as typeof page.evaluate;
+  await expect(openConversation(page, { gizmoId: target.id }, undefined, true)).resolves.toBeUndefined();
+  expect(rowClick).toHaveBeenCalledTimes(1);
+});
+
+/**
+ * Runs the real in-page admission closure against a synthetic DOM at the Page
+ * boundary, so the directory transition exercises the actual decision instead
+ * of a mocked boolean. `directory` describes the composer-free Projects
+ * surface the guarded navigation reaches; a draft, an attachment marker, or an
+ * unreadable page must all refuse before the row click.
+ */
+function installAdmissionDom(
+  page: Page,
+  directory: { draft?: boolean; attachment?: boolean; unreadable?: boolean } = {},
+) {
+  const originalEvaluate = page.evaluate;
+  page.evaluate = vi.fn(async (fn: Function, arg: any) => {
+    if (!arg?.selector) return originalEvaluate(fn as any, arg);
+    const onDirectory = new URL(page.url()).pathname === "/projects";
+    if (onDirectory && directory.unreadable) throw new Error("synthetic directory state is unreadable");
+    const form = { querySelector: () => null, querySelectorAll: () => [] };
+    const composer = {
+      isConnected: true, getClientRects: () => [{}], innerText: "",
+      closest: () => form, contains: () => false,
+      cloneNode: () => ({ textContent: "", querySelectorAll: () => [] }),
+    };
+    const risky = directory.draft || directory.attachment ? [{ tagName: "DIV" }] : [];
+    const document = {
+      querySelectorAll: (selector: string) => {
+        if (selector === 'input[type="file"]') return [];
+        if (!onDirectory) return [composer];
+        // The directory's first probe is the combined editor/attachment
+        // selector; every other read is empty on a clean directory.
+        return selector.startsWith("textarea,") ? risky : [];
+      },
+      createTreeWalker: () => ({ nextNode: () => false }),
+    };
+    return runInNewContext(`(${fn.toString()})(arg)`, {
+      arg, document, location: new URL(page.url()), HTMLTextAreaElement: class {}, NodeFilter: { SHOW_TEXT: 4 },
+    });
+  }) as typeof page.evaluate;
+}
+
+describe("Projects directory draft admission", () => {
+  it("admits a composer-free directory only for the known phase after an empty source", async () => {
+    const { page } = pageFor(undefined, { matches: 1, startUrl: "https://chatgpt.com/projects" });
+    installAdmissionDom(page);
+    await expect(assertPreflightDraftSafe(page, { directory: true, sourceProvenEmpty: true })).resolves.toBeUndefined();
+  });
+
+  it("never treats a composer-free URL alone as a safe condition", async () => {
+    const { page } = pageFor(undefined, { matches: 1, startUrl: "https://chatgpt.com/projects" });
+    installAdmissionDom(page);
+    // No known directory phase, and no preceding surface proven empty.
+    await expect(assertPreflightDraftSafe(page)).rejects.toMatchObject({ code: "preflight_draft_protected" });
+    await expect(assertPreflightDraftSafe(page, { directory: true, sourceProvenEmpty: false }))
+      .rejects.toMatchObject({ code: "preflight_draft_protected" });
+  });
+
+  it.each([
+    { draft: true },
+    { attachment: true },
+    { unreadable: true },
+  ])("refuses a directory draft/attachment/unreadable state before the row click: %j", async state => {
+    const { page, rowClick } = pageFor();
+    installAdmissionDom(page, state);
+    await expect(openConversation(page, { gizmoId: target.id }, undefined, true))
+      .rejects.toMatchObject({ code: "preflight_draft_protected" });
+    expect(rowClick).not.toHaveBeenCalled();
+  });
+
+  it("admits the integrated home -> directory -> project-composer path", async () => {
+    const { page, rowClick } = pageFor();
+    installAdmissionDom(page);
+    await expect(openConversation(page, { gizmoId: target.id }, undefined, true)).resolves.toBeUndefined();
+    expect(rowClick).toHaveBeenCalledTimes(1);
   });
 });

@@ -119,6 +119,46 @@ describe("composer paste delivery", () => {
     await sendPrompt(page, prompt);
     expect(page.keyboard.insertText).toHaveBeenCalledTimes(3);
   });
+  describe("preflight probe draft ownership", () => {
+    function guardedPage() {
+      const page = fakePage("all");
+      let attachment = false;
+      // Browser admission is tested with actual in-page fixtures separately;
+      // here state changes exercise the probe's destructive clear boundaries.
+      vi.mocked(page.evaluate).mockImplementation(async (_fn, arg: any) => {
+        if (arg?.selector) return !attachment && composed === (arg.owned.text ?? "");
+        return '{"stub":true}';
+      });
+      return { page, attach: () => { attachment = true; } };
+    }
+
+    it("retains full delivery metrics and clears its own complete probe", async () => {
+      const { page } = guardedPage();
+      await expect(probePromptDelivery(page, prompt, "paste", "fixture")).resolves.toMatchObject({ complete: true, deliveredBy: "paste" });
+      expect(composed).toBe("");
+    });
+
+    it("does not clear an attachment introduced while delivery is settling", async () => {
+      const { page, attach } = guardedPage();
+      vi.mocked(page.waitForTimeout).mockImplementation(async () => { if (composed) attach(); });
+      await expect(probePromptDelivery(page, prompt, "paste", "fixture")).rejects.toMatchObject({ code: "preflight_draft_protected" });
+      expect(composed).toBe(prompt);
+      expect(vi.mocked(page.keyboard.press).mock.calls.filter(([key]) => key === "Backspace")).toHaveLength(1);
+    });
+
+    it("does not erase new text that appears between selecting and clearing", async () => {
+      const { page } = guardedPage();
+      const press = vi.mocked(page.keyboard.press).getMockImplementation()!;
+      vi.mocked(page.keyboard.press).mockImplementation(async (key, options) => {
+        await press(key, options);
+        if (key === "Meta+A") composed = "new private draft";
+      });
+      await expect(probePromptDelivery(page, prompt, "paste", "fixture")).rejects.toMatchObject({ code: "preflight_draft_protected" });
+      expect(composed).toBe("new private draft");
+      expect(page.keyboard.press).not.toHaveBeenCalledWith("Backspace");
+    });
+  });
+
   describe("forced delivery and probe contracts", () => {
       it("reports paste when forced paste succeeds and never types", async () => {
         const page = fakePage("all");

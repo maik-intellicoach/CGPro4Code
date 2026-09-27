@@ -2,6 +2,7 @@ import type { Page } from "patchright";
 import { openSession, type Session } from "../browser/session.js";
 import { goHome, isLoggedIn, requireSelector } from "../browser/chatgpt.js";
 import {
+  assertPreflightDraftSafe,
   clearComposer,
   currentConversationId,
   latestAssistantModelSlug,
@@ -25,7 +26,7 @@ import {
   StreamEmitter,
   type StreamEvent,
 } from "./stream.js";
-import { classifyInteractionFailure, type InteractionFailure, NotLoggedInError, PreSubmitInteractionError, TurnTimeoutError } from "../errors.js";
+import { classifyInteractionFailure, ConnectorEvidenceRateLimitError, type InteractionFailure, NotLoggedInError, PreflightDraftProtectedError, PreSubmitInteractionError, TurnTimeoutError } from "../errors.js";
 import { requireAccount, verifyFiling, type FilingProof } from "../api/conversation-filing.js";
 import { joinSelectors, SELECTORS as SELECTORS_DUMP } from "../browser/selectors.js";
 import { fetchLatestTurnConnectorState, type LatestTurnConnectorState, fetchLatestNativeResearchReport, fetchNativeResearchUserNodes, type NativeResearchReport } from "../api/conversations.js";
@@ -116,6 +117,13 @@ export async function runInteractionPreflight(
 ): Promise<InteractionPreflightResult> {
   const page = session.page;
   let verificationError: unknown;
+  let admitted = false;
+  let protectedDraft = false;
+  let ownedConnector: string | undefined;
+  const guard = async (): Promise<void> => {
+    try { await assertPreflightDraftSafe(page, { connector: ownedConnector }); }
+    catch (error) { protectedDraft = true; throw error; }
+  };
   let phase: InteractionPreflightPhase = "home";
   let failedPhase: InteractionPreflightPhase | undefined;
   let failure: InteractionFailure | undefined;
@@ -124,24 +132,31 @@ export async function runInteractionPreflight(
     onPhase?.(phase, failedPhase, failure);
   };
   try {
+    await guard();
+    admitted = true;
     mark("home");
     await goHome(page);
+    await guard();
     mark("login");
     if (!(await isLoggedIn(page, 10_000))) throw new NotLoggedInError();
     mark("account-home");
     await requireAccount(page, opts.expectedAccountEmail);
+    await guard();
     mark("project");
     await openConversation(page, {
       model: opts.model,
       gizmoId: opts.gizmoId,
       gizmoShortUrl: opts.gizmoShortUrl,
-    }, mark);
+    }, mark, true);
     mark("account-project");
     await requireAccount(page, opts.expectedAccountEmail);
     mark("composer");
-    await clearComposer(page);
+    await clearComposer(page, guard);
     mark("connector");
-    await setConnector(page, opts.connector);
+    await guard();
+    await setConnector(page, opts.connector, true);
+    ownedConnector = opts.connector.trim();
+    await guard();
     mark("model");
     const selection = await ensureProSixMaximum(page, (next, failed, originalFailure) => {
       failedPhase ??= failed;
@@ -153,7 +168,8 @@ export async function runInteractionPreflight(
     if (opts.probePrompt !== undefined) mark("prompt-delivery");
     const promptDelivery = opts.probePrompt === undefined
       ? undefined
-      : await probePromptDelivery(page, opts.probePrompt, opts.probeDeliveryPath);
+      : await probePromptDelivery(page, opts.probePrompt, opts.probeDeliveryPath, ownedConnector);
+    await guard();
     return {
       accountVerified: true,
       projectVerified: true,
@@ -163,37 +179,37 @@ export async function runInteractionPreflight(
       ...(promptDelivery === undefined ? {} : { promptDelivery }),
     };
   } catch (error) {
+    if (error instanceof PreflightDraftProtectedError) protectedDraft = true;
     failedPhase ??= phase;
     failure ??= classifyInteractionFailure(error);
     onPhase?.(phase, failedPhase, failure);
     verificationError = error;
     throw error;
   } finally {
-    mark("cleanup-escape");
-    await page.keyboard.press("Escape").catch(() => undefined);
-    // A fresh home composer prevents connector state from leaking into a
-    // later connector-off route on this persistent browser session.
-    let cleanupError: unknown;
-    try {
-      mark("cleanup-home");
-      await goHome(page, { model: opts.model });
-    } catch (error) {
-      failedPhase ??= phase;
-      failure ??= classifyInteractionFailure(error);
-      onPhase?.(phase, failedPhase, failure);
-      cleanupError = error;
-    }
-    try {
-      mark("cleanup-composer");
-      await clearComposer(page);
-    } catch (error) {
-      failedPhase ??= phase;
-      failure ??= classifyInteractionFailure(error);
-      onPhase?.(phase, failedPhase, failure);
-      cleanupError ??= error;
-    }
-    if (verificationError === undefined && cleanupError !== undefined) {
-      throw new Error("interaction preflight cleanup failed", { cause: cleanupError });
+    // Never let finally undo the guard's refusal. A second read also catches
+    // drafts that arrived while a model/account operation failed.
+    if (admitted && !protectedDraft) {
+      try {
+        await guard();
+        mark("cleanup-escape");
+        await page.keyboard.press("Escape").catch(() => undefined);
+        await guard();
+        mark("cleanup-home");
+        await goHome(page, { model: opts.model });
+        ownedConnector = undefined;
+        await guard();
+        mark("cleanup-composer");
+        await clearComposer(page, guard);
+        await guard();
+      } catch (error) {
+        failedPhase ??= phase;
+        failure ??= classifyInteractionFailure(error);
+        onPhase?.(phase, failedPhase, failure);
+        if (verificationError === undefined) {
+          if (error instanceof PreflightDraftProtectedError) throw error;
+          throw new Error("interaction preflight cleanup failed", { cause: error });
+        }
+      }
     }
   }
 }
@@ -233,6 +249,7 @@ function runAskInner(
   let connectorSnapshot: LatestTurnConnectorState | null = null;
   let connectorCompletionConfirmed = false;
   let connectorEvidenceBackoffUntil = 0;
+  let consecutiveConnector429s = 0;
   let connectorNotFoundSince: number | null = null;
   let connectorNotFoundError: Error | null = null;
   let connectorEvidencePollInFlight: Promise<void> | null = null;
@@ -370,10 +387,9 @@ function runAskInner(
             opts.connector,
             // Completion shares this read, so retain its original 10s budget.
             10_000,
-            // Only the forced terminal read retries a 429: a failure there
-            // discards the finished turn. The mid-turn poll is best-effort
-            // and already has its own CONNECTOR_EVIDENCE_RATE_LIMIT_BACKOFF_MS.
-            force,
+            // All attempts share the streak and Retry-After budget here,
+            // including terminal reads. Hidden API retries would bypass both.
+            false,
           );
         } catch (err) {
           const status = err instanceof Error ? Number(/\bHTTP (\d{3})\b/.exec(err.message)?.[1] ?? 0) : 0;
@@ -398,16 +414,19 @@ function runAskInner(
           }
           // Other denials cannot recover through progress polling; surface them
           // and preserve partial output. 429 has its own backoff below.
-          if (force || (status >= 400 && status < 500 && status !== 429)) throw err;
-          if (err instanceof Error && err.message.includes("HTTP 429")) {
+          if (status === 429) {
+            consecutiveConnector429s += 1;
+            if (consecutiveConnector429s >= 3) throw new ConnectorEvidenceRateLimitError(err);
             const retryAfterMs = (err as Error & { retryAfterMs?: number }).retryAfterMs;
             connectorEvidenceBackoffUntil = Date.now() + Math.max(
               CONNECTOR_EVIDENCE_RATE_LIMIT_BACKOFF_MS,
               typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) ? retryAfterMs : 0,
             );
           }
+          if (force || (status >= 400 && status < 500 && status !== 429)) throw err;
           return;
         }
+        consecutiveConnector429s = 0;
         connectorNotFoundSince = null;
         connectorNotFoundError = null;
         // A resumed conversation GET can lag Send and still expose an old turn.
@@ -626,6 +645,11 @@ function runAskInner(
       if (filing) filing.preSubmitVerified = true;
       return { conversationId, finalText, events: collected, filing };
     } catch (err) {
+      if (err instanceof ConnectorEvidenceRateLimitError && session && !cancelled) {
+        // Stop this page's exact turn without turning the failure into a
+        // successful cancellation or disturbing another daemon slot.
+        await stopCurrentTurn(session.page).catch(() => "");
+      }
       const message = (err as Error).message ?? String(err);
       emitter.push(err instanceof PreSubmitInteractionError
         ? {

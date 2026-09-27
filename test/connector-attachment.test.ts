@@ -543,3 +543,21 @@ describe("picker reads are bounded (P-035 2026-09-23)", () => {
     expect(reads).toEqual([1_000]);
   });
 });
+
+
+it("preflight connector selection refuses before its first destructive input", async () => {
+  const { page } = makePage();
+  page.evaluate = vi.fn(async () => false) as typeof page.evaluate;
+  await expect(setConnector(page, "connector", true)).rejects.toMatchObject({ code: "preflight_draft_protected" });
+  expect(page.keyboard.press).not.toHaveBeenCalled();
+  expect(page.keyboard.type).not.toHaveBeenCalled();
+});
+
+it("preflight connector fallback preserves a draft arriving during the picker wait", async () => {
+  const { page } = makePage();
+  let readableEmpty = true;
+  page.evaluate = vi.fn(async () => readableEmpty) as typeof page.evaluate;
+  vi.mocked(page.waitForTimeout).mockImplementation(async () => { readableEmpty = false; });
+  await expect(setConnector(page, "connector", true)).rejects.toMatchObject({ code: "preflight_draft_protected" });
+  expect(vi.mocked(page.keyboard.press).mock.calls.filter(([key]) => key === "Backspace")).toHaveLength(1);
+});

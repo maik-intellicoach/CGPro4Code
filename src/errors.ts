@@ -62,6 +62,17 @@ export class TurnTimeoutError extends CgproError {
   }
 }
 
+/** Evidence reads failed repeatedly; this is an HTTP status, not a quota diagnosis. */
+export class ConnectorEvidenceRateLimitError extends Error {
+  readonly httpStatus = 429;
+  readonly consecutiveFailures = 3;
+
+  constructor(cause: unknown) {
+    super("conversation connector state fetch failed with HTTP 429 (3 consecutive evidence reads)", { cause });
+    this.name = "ConnectorEvidenceRateLimitError";
+  }
+}
+
 export class BotChallengeError extends CgproError {
   constructor() {
     super(
@@ -78,7 +89,8 @@ export type PreSubmitInteractionCode =
   | "model_control_unresolved"
   | "chat_surface_unconfirmed"
   | "connector_control_activation_timeout"
-  | "prompt_delivery_incomplete";
+  | "prompt_delivery_incomplete"
+  | "preflight_draft_protected";
 
 export type PreSubmitInteractionPhase =
   | "model_verification"
@@ -100,6 +112,14 @@ export class PreSubmitInteractionError extends Error {
   }
 }
 
+
+/** Content-free refusal: the page must be left exactly as found. */
+export class PreflightDraftProtectedError extends PreSubmitInteractionError {
+  constructor() {
+    super("preflight_draft_protected", "prompt_delivery", "Interaction preflight cannot establish safe draft ownership");
+    this.name = "PreflightDraftProtectedError";
+  }
+}
 
 export type AccountDiagnosticCode =
   | "account_identity_mismatch"
