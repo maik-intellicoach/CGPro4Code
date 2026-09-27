@@ -658,6 +658,13 @@ function runAskInner(
             code: err.code,
             phase: err.phase,
             promptSubmitted: err.promptSubmitted,
+            // P-035 2026-09-27. The facade reads the reset date from THIS streamed
+            // event, not from the daemon's later one, so a Pro usage limit carries
+            // when Pro returns and the capped tooltip it read. Every other
+            // pre-submit code keeps exactly today's event shape -- no new fields.
+            ...(err.code === "pro_usage_limit_reached"
+              ? { availableAfter: err.availableAfter ?? null, limitText: err.limitText ?? null }
+              : {}),
           }
         : { type: "error", message });
       throw err;

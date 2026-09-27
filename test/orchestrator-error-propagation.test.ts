@@ -203,6 +203,52 @@ describe("runAskOnSession native Deep Research contract", () => {
       promptSubmitted: false,
     });
   });
+
+  // P-035 2026-09-27. A live ask reaches the facade through the daemon relaying
+  // THESE emitter events, so the reset date has to ride the streamed error event
+  // itself -- the daemon's later catch emits a second event the facade does not
+  // reliably read. The Pro code carries availableAfter + limitText; every other
+  // pre-submit code keeps exactly today's shape.
+  it("carries the Pro reset date and tooltip on the streamed error event, and leaves other codes unchanged", async () => {
+    ensureProSixMaximum.mockRejectedValueOnce(new PreSubmitInteractionError(
+      "pro_usage_limit_reached",
+      "model_verification",
+      "ChatGPT Pro usage limit reached before submission: Limit reached. Try again after Sep 30, 2026.",
+      { availableAfter: "2026-09-30T00:00:00+08:00", limitText: "Limit reached. Try again after Sep 30, 2026." },
+    ));
+    const limited = runAskOnSession({ prompt: "research", model: "gpt-6-pro", timeoutSec: 1200, headless: false }, session());
+    const limitedEvents = await collect(limited.events);
+    await expect(limited.result).rejects.toThrow("Pro usage limit reached before submission");
+    expect(limitedEvents).toContainEqual({
+      type: "error",
+      message: "ChatGPT Pro usage limit reached before submission: Limit reached. Try again after Sep 30, 2026.",
+      code: "pro_usage_limit_reached",
+      phase: "model_verification",
+      promptSubmitted: false,
+      availableAfter: "2026-09-30T00:00:00+08:00",
+      limitText: "Limit reached. Try again after Sep 30, 2026.",
+    });
+
+    // A different pre-submit code keeps exactly the pre-existing event shape.
+    ensureProSixMaximum.mockRejectedValueOnce(new PreSubmitInteractionError(
+      "model_control_activation_timeout",
+      "model_verification",
+      "control did not activate",
+    ));
+    const other = runAskOnSession({ prompt: "research", model: "gpt-6-pro", timeoutSec: 1200, headless: false }, session());
+    const otherEvents = await collect(other.events);
+    await expect(other.result).rejects.toThrow("control did not activate");
+    const otherError = otherEvents.find((event) => event.type === "error");
+    expect(otherError).toEqual({
+      type: "error",
+      message: "control did not activate",
+      code: "model_control_activation_timeout",
+      phase: "model_verification",
+      promptSubmitted: false,
+    });
+    expect(otherError).not.toHaveProperty("availableAfter");
+    expect(otherError).not.toHaveProperty("limitText");
+  });
   it("retains the ordinary planning non-Pro model guard", async () => {
     latestAssistantModelSlug.mockResolvedValue("gpt-5-thinking");
     const runner = runAskOnSession({ prompt: "plan", model: "gpt-6-pro", timeoutSec: 1200, headless: false }, session());
