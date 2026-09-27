@@ -1593,6 +1593,10 @@ export async function handleAsk(
               code: err.code,
               phase: err.phase,
               promptSubmitted: err.promptSubmitted,
+              // P-035 2026-09-27. `pro_usage_limit_reached` carries when Pro
+              // returns and the capped tooltip it read, alongside the closed code.
+              ...(err.availableAfter !== undefined ? { availableAfter: err.availableAfter } : {}),
+              ...(err.limitText !== undefined ? { limitText: err.limitText } : {}),
             }
           : { message: (err as Error).message });
         res.end();

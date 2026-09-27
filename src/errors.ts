@@ -90,6 +90,7 @@ export type PreSubmitInteractionCode =
   | "chat_surface_unconfirmed"
   | "connector_control_activation_timeout"
   | "prompt_delivery_incomplete"
+  | "pro_usage_limit_reached"
   | "preflight_draft_protected";
 
 export type PreSubmitInteractionPhase =
@@ -97,18 +98,35 @@ export type PreSubmitInteractionPhase =
   | "connector_selection"
   | "prompt_delivery";
 
+/**
+ * Optional extra evidence a pre-submit refusal may carry. Only set on the codes
+ * that have it; `pro_usage_limit_reached` is the first, and it carries when the
+ * account's Pro tier becomes available again plus the capped tooltip it read.
+ */
+export interface PreSubmitInteractionDetails extends ErrorOptions {
+  /** ISO 8601 local instant Pro becomes available, or null when not parsed. */
+  availableAfter?: string | null;
+  /** The capped `[role="tooltip"]` text behind a disabled Pro item. */
+  limitText?: string | null;
+}
+
 /** A browser-control failure that is proven to occur before Send. */
 export class PreSubmitInteractionError extends Error {
   readonly promptSubmitted = false;
+  /** Set only for `pro_usage_limit_reached`; omitted on every other code. */
+  readonly availableAfter?: string | null;
+  readonly limitText?: string | null;
 
   constructor(
     readonly code: PreSubmitInteractionCode,
     readonly phase: PreSubmitInteractionPhase,
     message: string,
-    options?: ErrorOptions,
+    options?: PreSubmitInteractionDetails,
   ) {
     super(message, options);
     this.name = "PreSubmitInteractionError";
+    if (options?.availableAfter !== undefined) this.availableAfter = options.availableAfter;
+    if (options?.limitText !== undefined) this.limitText = options.limitText;
   }
 }
 

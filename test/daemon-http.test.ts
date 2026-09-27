@@ -1307,3 +1307,55 @@ describe("a failed turn never lets its own telemetry hold the lane", () => {
     expect(slotsOf(state)[0].leasedBy).toBeNull();
   });
 });
+
+// P-035 2026-09-27. The typed pre-submit refusal has to reach the wire with the
+// one fact the caller needs to wait on: when Pro returns. The daemon's own error
+// event carries `availableAfter` and `limitText` beside the closed code.
+it("carries the Pro usage limit fields on the daemon error event", async () => {
+  const page = {
+    isClosed: () => false,
+    url: () => "https://chatgpt.com/",
+    screenshot: vi.fn(async () => {}),
+    evaluate: vi.fn(async () => "url=\"https://chatgpt.com/\" viewport=1512x944 overlay=0"),
+    keyboard: { press: vi.fn(async () => {}) },
+    locator: () => ({ count: () => 0, first: () => ({ isVisible: () => false }) }),
+  };
+  const state = fakeState({ session: { page } as unknown as Session });
+  slotsOf(state)[0].page = page as unknown as import("patchright").Page;
+
+  // A terminal event ends the async iteration; the rejection then takes the
+  // daemon's own error-event path under test.
+  const emitter = new StreamEmitter();
+  emitter.push({
+    type: "error",
+    message: "pro usage limit",
+    promptSubmitted: false,
+    code: "pro_usage_limit_reached",
+  });
+  const limited = new PreSubmitInteractionError(
+    "pro_usage_limit_reached",
+    "model_verification",
+    "ChatGPT Pro usage limit reached before submission: Limit reached. Try again after Sep 30, 2026.",
+    { availableAfter: "2026-09-30T00:00:00+08:00", limitText: "Limit reached. Try again after Sep 30, 2026." },
+  );
+  const result = Promise.resolve().then(() => {
+    throw limited;
+  });
+  result.catch(() => undefined);
+  runAskOnSession.mockReturnValue({ events: emitter, result, cancel: async () => {} });
+
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST" });
+  const pending = handleAsk(req, res as unknown as ServerResponse, state);
+  sendBody(req, { prompt: "hi" });
+  await pending;
+
+  const sse = (res as unknown as FakeRes).writes.join("");
+  expect(sse).toContain("event: error");
+  expect(sse).toContain('"code":"pro_usage_limit_reached"');
+  expect(sse).toContain('"phase":"model_verification"');
+  expect(sse).toContain('"promptSubmitted":false');
+  expect(sse).toContain('"availableAfter":"2026-09-30T00:00:00+08:00"');
+  expect(sse).toContain('"limitText":"Limit reached. Try again after Sep 30, 2026."');
+});

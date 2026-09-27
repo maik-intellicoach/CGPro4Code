@@ -513,6 +513,143 @@ async function readPickerModel(page: Page, row: Locator): Promise<PickedModel> {
   };
 }
 
+/** The picker rows this Pro-limit check inspects. Same query `readPickerModel` uses. */
+const MODEL_MENU_ITEM_SELECTOR = '[role="menuitem"],[role="menuitemradio"]';
+/** Playwright's own hover is the only pointer this check uses; OS input is never involved. */
+const PRO_TOOLTIP_SELECTOR = '[role="tooltip"]';
+/** The disabled row's visible label, matched trimmed and case-sensitive. */
+const PRO_ITEM_LABEL = "Pro";
+/** Cap on the tooltip text carried on the error and the event. */
+const PRO_LIMIT_TEXT_MAX = 200;
+/** How long the hover is given to surface its tooltip. */
+const PRO_TOOLTIP_WAIT_MS = 3_000;
+
+/** Month names as ChatGPT spells them in the limit tooltip. */
+const PRO_MONTHS: Record<string, number> = {
+  jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3,
+  may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7, sep: 8, sept: 8,
+  september: 8, oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11,
+};
+
+/** ISO 8601 for a local instant, carrying the local UTC offset (`...T00:00:00+08:00`). */
+function formatLocalIso(date: Date): string {
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes < 0 ? "-" : "+";
+  const absolute = Math.abs(offsetMinutes);
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:00` +
+    `${sign}${pad(Math.floor(absolute / 60))}:${pad(absolute % 60)}`
+  );
+}
+
+/**
+ * `Try again after <date>` -> ISO 8601 local instant.
+ *
+ * A named date with no time is the START of that local day (`T00:00:00` plus the
+ * local offset); a date WITH a time is that local time. Anything the tooltip does
+ * not spell unambiguously returns null, which the caller reports as no known
+ * availability rather than inventing one.
+ */
+export function parseProAvailableAfter(text: string): string | null {
+  const match =
+    /try again after\s+([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})(?:[,\s]+(\d{1,2}):(\d{2})\s*([AaPp][Mm]))?/i.exec(text);
+  if (!match) return null;
+  const month = PRO_MONTHS[match[1].toLowerCase()];
+  if (month === undefined) return null;
+  const day = Number(match[2]);
+  const year = Number(match[3]);
+  let hour = 0;
+  let minute = 0;
+  if (match[4] !== undefined) {
+    hour = Number(match[4]);
+    minute = Number(match[5]);
+    if (hour < 1 || hour > 12 || minute < 0 || minute > 59) return null;
+    if (match[6].toLowerCase() === "pm" && hour !== 12) hour += 12;
+    if (match[6].toLowerCase() === "am" && hour === 12) hour = 0;
+  }
+  const date = new Date(year, month, day, hour, minute, 0, 0);
+  // Reject a rolled-over day (Feb 30 -> Mar 2): the tooltip must name a real date.
+  if (date.getFullYear() !== year || date.getMonth() !== month || date.getDate() !== day) return null;
+  return formatLocalIso(date);
+}
+
+/**
+ * Index of the disabled `Pro` picker row, or -1 when it is absent or enabled.
+ *
+ * Reads only the row labels and their disabled attributes; never throws.
+ */
+async function findDisabledProItemIndex(page: Page): Promise<number> {
+  try {
+    const found = await page.evaluate(
+      ({ proLimitProbe, label }: { proLimitProbe: boolean; label: string }) => {
+        void proLimitProbe;
+        const items = Array.from(
+          document.querySelectorAll('[role="menuitem"],[role="menuitemradio"]'),
+        );
+        for (let index = 0; index < items.length; index++) {
+          const element = items[index];
+          const text = (element.textContent ?? "").trim();
+          if (text !== label) continue;
+          const disabled =
+            element.getAttribute("aria-disabled") === "true" ||
+            element.hasAttribute("data-disabled") ||
+            element.hasAttribute("disabled") ||
+            element.getAttribute("data-state") === "disabled";
+          return disabled ? index : -1;
+        }
+        return -1;
+      },
+      { proLimitProbe: true, label: PRO_ITEM_LABEL },
+    );
+    // Only a numeric index is evidence; anything else means "not found", so a
+    // page (or a fixture) that answers with the wrong shape can never make this
+    // check reach for a locator it does not have.
+    return typeof found === "number" && Number.isInteger(found) ? found : -1;
+  } catch {
+    return -1;
+  }
+}
+
+interface ProUsageLimit {
+  availableAfter: string | null;
+  limitText: string | null;
+}
+
+/**
+ * Is the picker's `Pro` row disabled, and if so when does Pro return?
+ *
+ * P-035 2026-09-27. Maik's intelli screenshot showed the live shape: the picker
+ * lists `Latest` (checked), `GPT-5.6 Sol`, `GPT-5.5 Leaving on October 14` and a
+ * greyed `Pro`, whose tooltip reads `Limit reached. Try again after Sep 30, 2026.`
+ * The composer still names `Latest`, so nothing the model checks look at changes
+ * -- which is why the limit has to be read off the row itself. Absent or enabled
+ * `Pro` returns null and the caller behaves exactly as before. The hover uses the
+ * page's own Playwright API; the tooltip text is the only page content read, and
+ * it is capped before it leaves this function.
+ */
+async function detectProUsageLimit(page: Page): Promise<ProUsageLimit | null> {
+  const index = await findDisabledProItemIndex(page);
+  if (index < 0) return null;
+  const item = page.locator(MODEL_MENU_ITEM_SELECTOR).nth(index);
+  await item.hover({ timeout: PRO_TOOLTIP_WAIT_MS }).catch(() => undefined);
+  let limitText: string | null = null;
+  try {
+    const tooltip = page.locator(PRO_TOOLTIP_SELECTOR).first();
+    await tooltip.waitFor({ state: "visible", timeout: PRO_TOOLTIP_WAIT_MS });
+    const trimmed = ((await tooltip.textContent()) ?? "").trim();
+    if (trimmed.length > 0) limitText = trimmed.slice(0, PRO_LIMIT_TEXT_MAX);
+  } catch {
+    // A disabled Pro row with no readable tooltip is still sufficient evidence.
+    limitText = null;
+  }
+  // Dismiss the hover the way the existing menu cleanup does, so the popover is
+  // left as found before the typed refusal is thrown.
+  await page.keyboard.press("Escape").catch(() => undefined);
+  return { availableAfter: limitText ? parseProAvailableAfter(limitText) : null, limitText };
+}
+
 /** Verify the current Pro effort at maximum on the newest model, before any prompt is submitted. */
 export async function ensureProSixMaximum(
   page: Page,
@@ -673,6 +810,28 @@ export async function ensureProSixMaximum(
     // "6Pro" and "6 Pro" are the same Pro level in three rollout spellings) is no
     // opinion about the model at all, so it is recorded and never compared.
     const picked = await readPickerModel(page, model);
+    // P-035 2026-09-27. A greyed-out `Pro` row is not UI drift and not a model
+    // choice: it is the account's Pro usage limit. It is read HERE -- the picker
+    // items are already enumerated, before the newest-model check and before
+    // anything is typed or sent -- so the lane reports the real cause instead of
+    // the "selector no longer resolves" misreport that a later failure produced.
+    const proLimit = await detectProUsageLimit(page);
+    if (proLimit) {
+      console.error(
+        `[cgpro:model] pro usage limit: availableAfter=${proLimit.availableAfter ?? "null"}`,
+      );
+      const limited = new PreSubmitInteractionError(
+        "pro_usage_limit_reached",
+        "model_verification",
+        proLimit.limitText
+          ? `ChatGPT Pro usage limit reached before submission: ${proLimit.limitText}`
+          : "ChatGPT Pro usage limit reached before submission",
+        { availableAfter: proLimit.availableAfter, limitText: proLimit.limitText },
+      );
+      failedPhase = phase;
+      failure = classifyInteractionFailure(limited);
+      throw limited;
+    }
     // Two conditions, because position alone is not evidence of recency (see
     // NEWEST_MODEL_SENTINELS): the checked entry must be the picker's own
     // newest-model affordance, and it must be the entry the picker puts first.

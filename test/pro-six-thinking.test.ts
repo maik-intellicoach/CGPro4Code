@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "patchright";
-import { SelectorBrokenError } from "../src/errors.js";
+import { PreSubmitInteractionError, SelectorBrokenError } from "../src/errors.js";
 
 const requireSelector = vi.fn();
 const firstResolved = vi.fn();
@@ -42,6 +42,12 @@ function setup(options: {
   pickerCheckedIndex?: number;
   /** The picker names no selected model at all. */
   pickerEmpty?: boolean;
+  /** Index of a DISABLED `Pro` row in the picker; undefined means absent/enabled. */
+  proIndex?: number;
+  /** The disabled row's tooltip text; the live sentence is the default. */
+  tooltipText?: string | null;
+  /** The tooltip never becomes visible. */
+  tooltipVisible?: boolean;
 } = {}) {
   let value = "1";
   const model = {
@@ -73,11 +79,36 @@ function setup(options: {
   // real assertion. openMenus counts what is still open after each Escape.
   let openMenus = options.openMenus ?? 1;
   const page = {
-    keyboard: { press: vi.fn(async (key: string) => {
-      if (key === "End" && options.sticks !== false) value = options.max ?? "4";
-      if (key === "Escape" && !options.menuStaysOpen) openMenus = 0;
-    }) },
+    keyboard: {
+      press: vi.fn(async (key: string) => {
+        if (key === "End" && options.sticks !== false) value = options.max ?? "4";
+        if (key === "Escape" && !options.menuStaysOpen) openMenus = 0;
+      }),
+      // Present so a test can prove nothing is typed before the refusal.
+      type: vi.fn(async () => {}),
+    },
     waitForTimeout: vi.fn(async () => {}),
+    // Hover and tooltip reads go through the page's own locator API, never OS
+    // input. The disabled-Pro check uses `nth(index).hover()` for the row and
+    // `first().waitFor/textContent()` for the tooltip.
+    locator: vi.fn((selector: string) => {
+      if (selector.includes("tooltip")) {
+        return {
+          first: () => ({
+            waitFor: options.tooltipVisible === false
+              ? vi.fn(async () => {
+                  throw new Error("locator.waitFor: Timeout 3000ms exceeded.");
+                })
+              : vi.fn(async () => {}),
+            textContent: vi.fn(async () =>
+              options.tooltipText === undefined
+                ? "Limit reached. Try again after Sep 30, 2026."
+                : options.tooltipText),
+          }),
+        };
+      }
+      return { nth: () => ({ hover: vi.fn(async () => {}) }) };
+    }),
     // Three probes share this entry point on the real page, told apart by
     // argument shape: the pointer-blocker count takes a selector string, the
     // picker read takes `{ max }`, and the menu dump takes
@@ -85,6 +116,7 @@ function setup(options: {
     evaluate: vi.fn(async (_fn: unknown, arg: unknown) => {
       if (typeof arg === "string") return openMenus;
       const keys = arg && typeof arg === "object" ? Object.keys(arg) : [];
+      if (keys.includes("proLimitProbe")) return options.proIndex ?? -1;
       if (keys.includes("selectedSelector")) return "row=\"6 Pro\" menus=1 menuItems=[] sliders=[4/4]";
       if (options.pickerEmpty) return { entries: [], checkedIndex: -1 };
       return {
@@ -369,4 +401,92 @@ describe("6 Pro maximum thinking admission", () => {
     await rejected;
   });
 
+});
+
+// P-035 2026-09-27. Live: the intelli account's picker listed `Latest` (checked),
+// `GPT-5.6 Sol`, `GPT-5.5 Leaving on October 14` and a greyed `Pro` whose tooltip
+// read `Limit reached. Try again after Sep 30, 2026.` The composer still named
+// `Latest`, so nothing the newest-model gate reads changed and the turn died later
+// as a false "selector no longer resolves". These are the tests for reading the
+// limit off the disabled row itself, before anything is typed or sent.
+describe("Pro usage limit in the model picker", () => {
+  async function rejection(page: Page): Promise<PreSubmitInteractionError> {
+    return ensureProSixMaximum(page).then(
+      () => {
+        throw new Error("ensureProSixMaximum was expected to refuse");
+      },
+      (error: unknown) => error as PreSubmitInteractionError,
+    );
+  }
+
+  it("refuses with a typed pre-submit error and the parsed local availability", async () => {
+    const s = setup({
+      effortLabel: "Extra High",
+      pickerEntries: ["Latest", "GPT-5.6 Sol", "GPT-5.5", "Pro"],
+      proIndex: 3,
+    });
+    const error = await rejection(s.page);
+    expect(error).toBeInstanceOf(PreSubmitInteractionError);
+    expect(error).toMatchObject({
+      code: "pro_usage_limit_reached",
+      phase: "model_verification",
+      promptSubmitted: false,
+    });
+    // Date only -> local midnight of Sep 30, carried with the local UTC offset.
+    expect(error.availableAfter).toMatch(/^2026-09-30T00:00:00[+-]\d{2}:\d{2}$/);
+    expect(Date.parse(error.availableAfter!)).toBe(new Date(2026, 8, 30, 0, 0, 0, 0).getTime());
+    expect(error.limitText).toBe("Limit reached. Try again after Sep 30, 2026.");
+    // Nothing is typed or submitted before the throw.
+    expect(s.page.keyboard.type).not.toHaveBeenCalled();
+    expect(s.page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+  });
+
+  it("parses a long month name and a date-with-time variant as that local time", async () => {
+    const s = setup({
+      pickerEntries: ["Latest", "Pro"],
+      proIndex: 1,
+      tooltipText: "Limit reached. Try again after September 30, 2026, 3:45 PM.",
+    });
+    const error = await rejection(s.page);
+    expect(error.code).toBe("pro_usage_limit_reached");
+    expect(error.availableAfter).toMatch(/^2026-09-30T15:45:00[+-]\d{2}:\d{2}$/);
+    expect(Date.parse(error.availableAfter!)).toBe(new Date(2026, 8, 30, 15, 45, 0, 0).getTime());
+  });
+
+  it("still refuses with null availability when the tooltip never appears", async () => {
+    const s = setup({ pickerEntries: ["Latest", "Pro"], proIndex: 1, tooltipVisible: false });
+    const error = await rejection(s.page);
+    expect(error).toMatchObject({
+      code: "pro_usage_limit_reached",
+      phase: "model_verification",
+      promptSubmitted: false,
+    });
+    // A disabled Pro row alone is sufficient evidence; availability stays unknown.
+    expect(error.availableAfter).toBeNull();
+    expect(error.limitText).toBeNull();
+  });
+
+  it("leaves the existing path untouched when the Pro row is present but enabled", async () => {
+    // proIndex undefined -> the probe reports the row is not disabled.
+    const s = setup({ pickerEntries: ["Latest", "GPT-5.6 Sol", "GPT-5.5", "Pro"] });
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "Latest", power: 4 });
+  });
+
+  it("leaves the existing path untouched when the Pro row is absent", async () => {
+    const s = setup();
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "Latest", power: 4 });
+  });
+
+  it("reports the limit ahead of the newest-model check it runs before", async () => {
+    // The picker is on an older model AND Pro is limited. The limit is the real
+    // cause, and it is read with the items already enumerated but before the
+    // newest-model refusal, so that refusal can never mask it.
+    const s = setup({
+      pickerEntries: ["Latest", "GPT-5.5", "Pro"],
+      pickerCheckedIndex: 1,
+      proIndex: 2,
+    });
+    const error = await rejection(s.page);
+    expect(error.code).toBe("pro_usage_limit_reached");
+  });
 });
