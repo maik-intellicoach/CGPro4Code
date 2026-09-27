@@ -1,6 +1,7 @@
 import { runInNewContext } from "node:vm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "patchright";
+import { joinSelectors, SELECTORS } from "../src/browser/selectors.js";
 
 const projects = vi.fn();
 const goHome = vi.fn();
@@ -414,6 +415,117 @@ describe("Projects directory draft admission", () => {
     const { page, rowClick } = pageFor();
     installAdmissionDom(page);
     await expect(openConversation(page, { gizmoId: target.id }, undefined, true)).resolves.toBeUndefined();
+    expect(rowClick).toHaveBeenCalledTimes(1);
+  });
+});
+
+// P-035 2026-09-28 r13. Live ms1980 (vendor afbea7c): with r11's home wait in
+// place the interaction preflight passed `home` and then refused at
+// `failedPhase=project-chat-surface` with `reason=composer_count:0` -- the same
+// race one navigation later, because `openConversation` judged the Chat surface
+// immediately after its own `goHome`. These cases pin the same bounded wait at
+// that surface guard: the guard must judge a hydrated composer, a composer that
+// never arrives must still refuse exactly as before, and an unprotected
+// navigation must add no wait at all.
+describe("Project-flow composer hydration wait", () => {
+  const composerSelector = joinSelectors(SELECTORS.composer);
+
+  /**
+   * A Project-flow page whose composer is gone from the moment `goHome` lands
+   * (a fresh navigation returns the pre-hydration shell) and returns only
+   * inside the bounded wait. `events` records navigation, waits and guard reads
+   * in the order they happened.
+   */
+  function hydrationPage(hydration: { hydrationMs?: number; neverHydrates?: boolean } = {}) {
+    const { page, rowClick } = pageFor();
+    const events: string[] = [];
+    const waitOptions: Array<{ state?: string; timeout?: number }> = [];
+    let composerPresent = true; // the page the first guarded navigation starts from
+    goHome.mockImplementation(async () => {
+      events.push("goHome");
+      composerPresent = false;
+    });
+
+    const originalLocator = page.locator as unknown as (selector: string) => unknown;
+    (page as { locator: unknown }).locator = vi.fn((selector: string) => {
+      if (selector !== composerSelector) return originalLocator(selector);
+      return {
+        first: () => ({
+          waitFor: async (options: { state?: string; timeout?: number }) => {
+            events.push("composer-wait");
+            waitOptions.push(options);
+            if (hydration.neverHydrates) {
+              throw Object.assign(
+                new Error(`locator.waitFor: Timeout ${options.timeout}ms exceeded`), { name: "TimeoutError" });
+            }
+            await new Promise(resolve => setTimeout(resolve, hydration.hydrationMs ?? 0));
+            composerPresent = true;
+          },
+        }),
+      };
+    });
+
+    const originalEvaluate = page.evaluate as unknown as (fn: Function, arg: unknown) => Promise<unknown>;
+    page.evaluate = vi.fn(async (fn: Function, arg: { selector?: string }) => {
+      // The sidebar overlay probe passes a selector string or an options
+      // object; only the draft guard's read carries `.selector`.
+      if (typeof arg === "string" || !arg?.selector) return originalEvaluate(fn as never, arg);
+      events.push(`guard:${composerPresent ? "composer" : "no-composer"}`);
+      const onDirectory = new URL(page.url()).pathname === "/projects";
+      const form = { querySelector: () => null, querySelectorAll: () => [] };
+      const composer = {
+        isConnected: true, getClientRects: () => [{}], innerText: "",
+        closest: () => form, contains: () => false,
+        cloneNode: () => ({ textContent: "", querySelectorAll: () => [] }),
+      };
+      const document = {
+        body: { childNodes: composerPresent ? [composer] : [] },
+        querySelectorAll: (selector: string) => selector === 'input[type="file"]' || onDirectory
+          ? [] : composerPresent ? [composer] : [],
+        createTreeWalker: () => ({ nextNode: () => false }),
+      };
+      return runInNewContext(`(${fn.toString()})(arg)`, {
+        arg, document, location: new URL(page.url()), HTMLTextAreaElement: class {}, NodeFilter: { SHOW_TEXT: 4 },
+      });
+    }) as typeof page.evaluate;
+
+    return { page, rowClick, events, waitOptions };
+  }
+
+  it("waits for the hydrated composer before the Project surface guard, then proceeds", async () => {
+    const { page, rowClick, events, waitOptions } = hydrationPage({ hydrationMs: 30 });
+    const onPhase = vi.fn();
+    await expect(openConversation(page, { gizmoId: target.id }, onPhase, true)).resolves.toBeUndefined();
+    // The bounded wait ran between goHome and the surface guard, and that guard
+    // read the composer the wait had just brought in.
+    const home = events.indexOf("goHome");
+    expect(events.slice(home, home + 3)).toEqual(["goHome", "composer-wait", "guard:composer"]);
+    expect(waitOptions[0]).toEqual({ state: "visible", timeout: 20_000 });
+    expect(onPhase.mock.calls.map(([phase]) => phase)).toContain("project-chat-surface");
+    // Past the surface: the Project flow ran to its destination row.
+    expect(rowClick).toHaveBeenCalledTimes(1);
+  });
+
+  it("swallows a never-hydrating wait and still refuses the Project surface as today", async () => {
+    const { page, rowClick, events, waitOptions } = hydrationPage({ neverHydrates: true });
+    const error = await openConversation(page, { gizmoId: target.id }, undefined, true).catch(caught => caught);
+    // The wait is not an error: the guard, not the wait, refused, with the
+    // unchanged code and reason.
+    expect(error).toMatchObject({ code: "preflight_draft_protected", reason: "composer_count:0" });
+    const home = events.indexOf("goHome");
+    expect(events.slice(home, home + 3)).toEqual(["goHome", "composer-wait", "guard:no-composer"]);
+    expect(waitOptions[0]).toEqual({ state: "visible", timeout: 20_000 });
+    // Refused at the surface guard: no Project row was clicked and no cold
+    // Project navigation was attempted.
+    expect(rowClick).not.toHaveBeenCalled();
+    expect(page.goto).not.toHaveBeenCalled();
+  });
+
+  it("adds no wait at all when the navigation is not draft-protected", async () => {
+    const { page, rowClick, events } = hydrationPage({ neverHydrates: true });
+    await expect(openConversation(page, { gizmoId: target.id })).resolves.toBeUndefined();
+    expect(events).not.toContain("composer-wait");
+    expect(events.filter(event => event.startsWith("guard:"))).toEqual([]);
     expect(rowClick).toHaveBeenCalledTimes(1);
   });
 });

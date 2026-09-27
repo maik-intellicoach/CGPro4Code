@@ -30,6 +30,46 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * P-035 2026-09-27 r11. Bound on the composer hydration wait that sits between
+ * a home navigation and the protected-draft guard that judges its surface.
+ */
+export const COMPOSER_HYDRATION_TIMEOUT_MS = 20_000;
+
+/**
+ * Bounded wait for the composer to become visible.
+ *
+ * P-035 2026-09-27 r11. Live ms1980 (vendor 9af999b, two fresh daemons): the
+ * home guard judged a half-loaded page about 1.4 s after `goHome` and refused
+ * `composer_count:0` on a composer that had simply not hydrated yet -- the
+ * selector diagnostic read `ready=interactive`, heading "Ready when you are.",
+ * `composer=false`, every composer candidate count 0, and the capture showed
+ * the pre-hydration shell. The login wait that already covers this ran only
+ * AFTER that guard, so the guard came first against an unhydrated surface.
+ *
+ * This wait never admits or refuses anything: a failure to observe the
+ * composer -- its own timeout, a page that cannot answer the visibility
+ * question yet, a closed target -- is swallowed, and the draft guard that runs
+ * immediately after stays the only admission authority. An absent composer
+ * therefore still refuses with exactly the error and reason it refused with
+ * before this wait existed (fail closed).
+ *
+ * P-035 2026-09-28 r13. The same race then surfaced one navigation later: live
+ * ms1980 (vendor afbea7c) passed the `home` phase and refused at
+ * `failedPhase=project-chat-surface` with `reason=composer_count:0`, because
+ * `openConversation` judged the surface immediately after its own `goHome`.
+ * The wait now lives here, beside every caller that judges a just-navigated
+ * surface, and `runInteractionPreflight` imports it for its home guard.
+ */
+export async function waitForComposerHydrated(page: Page, timeoutMs = COMPOSER_HYDRATION_TIMEOUT_MS): Promise<void> {
+  try {
+    await page.locator(joinSelectors(SELECTORS.composer)).first()
+      .waitFor({ state: "visible", timeout: timeoutMs });
+  } catch {
+    // Absence is not a verdict here; the following guard is.
+  }
+}
+
 export async function openConversation(
   page: Page,
   opts: { model?: string; conversationId?: string; gizmoId?: string; gizmoShortUrl?: string } = {},
@@ -57,6 +97,12 @@ export async function openConversation(
     onPhase?.("project-home");
     if (protectDraft) await guard();
     await goHome(page, { model: opts.model });
+    // P-035 2026-09-28 r13. `goHome` resolves on `domcontentloaded`, so the
+    // guard below judged a half-loaded page and refused `composer_count:0` on
+    // a composer that had simply not hydrated yet (live ms1980, vendor
+    // afbea7c: preflight passed `home`, then refused at this phase). Bounded,
+    // and never itself a verdict: the guard still decides, exactly as today.
+    if (protectDraft) await waitForComposerHydrated(page);
     // The Project directory row below is this branch's real readiness gate;
     // the home composer was a surface-dependent proxy for the same thing, and
     // it was required BEFORE the Chat surface was selected -- so a profile
@@ -183,6 +229,12 @@ export async function openConversation(
   // own model set with no Pro tier. cgpro only ever drives classic
   // chat, so force the Chat surface before touching the model picker.
   onPhase?.("project-chat-surface");
+  // P-035 2026-09-28 r13. The second branch of the same shape: the plain
+  // Recents branch navigates to the home URL by hand (the `goHome` equivalent)
+  // and lands here, so it gets the same bounded hydration wait before the
+  // guard judges the surface. Inert wherever the composer patient wait above
+  // has already proven the composer visible.
+  if (protectDraft) await waitForComposerHydrated(page);
   if (protectDraft) await guard();
   await ensureChatTab(page);
 

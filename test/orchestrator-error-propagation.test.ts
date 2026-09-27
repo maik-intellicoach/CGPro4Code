@@ -24,6 +24,7 @@ const ensureProSixMaximum = vi.fn();
 const setDeepResearch = vi.fn();
 const setWebSearch = vi.fn();
 const stopCurrentTurn = vi.fn();
+const waitForComposerHydrated = vi.fn();
 const waitTurnComplete = vi.fn();
 const fetchLatestTurnConnectorState = vi.fn();
 const fetchLatestNativeResearchReport = vi.fn();
@@ -47,6 +48,9 @@ vi.mock("../src/browser/conversation.js", () => ({
   setDeepResearch: (...args: unknown[]) => setDeepResearch(...args),
   setWebSearch: (...args: unknown[]) => setWebSearch(...args),
   stopCurrentTurn: (...args: unknown[]) => stopCurrentTurn(...args),
+  // r13 moved the bounded composer-hydration wait into conversation.ts; the
+  // preflight still calls it, so the mock factory must name it.
+  waitForComposerHydrated: (...args: unknown[]) => waitForComposerHydrated(...args),
   waitTurnComplete: (...args: unknown[]) => waitTurnComplete(...args),
 }));
 vi.mock("../src/api/conversations.js", () => ({
