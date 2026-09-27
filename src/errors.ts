@@ -131,11 +131,25 @@ export class PreSubmitInteractionError extends Error {
 }
 
 
-/** Content-free refusal: the page must be left exactly as found. */
+/**
+ * Content-free refusal: the page must be left exactly as found.
+ *
+ * P-035 2026-09-27. The guard admits or refuses through a single boolean, so a
+ * live refusal (`daemonCode=preflight_draft_protected failedPhase=home`) named
+ * no check. The first refusing check now reports a closed reason code on
+ * `reason`, so the lane's own log line says which branch refused. The code
+ * names UI chrome only -- a selector kind, a tag, or a sanitized `data-testid`/
+ * `aria-label` -- and never composer text, typed values, file names or page text.
+ * Message and code are unchanged, and `reason` is absent when the guard could not
+ * compute one (an evaluation failure is unknown, never empty).
+ */
 export class PreflightDraftProtectedError extends PreSubmitInteractionError {
-  constructor() {
+  readonly reason?: string;
+
+  constructor(reason?: string) {
     super("preflight_draft_protected", "prompt_delivery", "Interaction preflight cannot establish safe draft ownership");
     this.name = "PreflightDraftProtectedError";
+    if (reason !== undefined) this.reason = reason;
   }
 }
 

@@ -27,7 +27,7 @@ const { runInteractionPreflight } = await import("../src/core/orchestrator.js");
 // return content only inside this VM; the Page boundary returns a boolean.
 function fixture(initial: Partial<State> = {}) {
   const state: State = { text: "", attachment: false, file: false, mention: "", unknown: false,
-    readable: true, count: 1, form: true, unknownButton: false, url: "https://chatgpt.com/", ...initial };
+    readable: true, count: 1, form: true, unknownButton: false, unknownTestId: "", url: "https://chatgpt.com/", ...initial };
   const page = {
     url: () => state.url,
     keyboard: { press: vi.fn(async () => {}) },
@@ -38,7 +38,11 @@ function fixture(initial: Partial<State> = {}) {
         ? (state.unknown ? [{ tagName: "CUSTOM-TOKEN", attributes: [] }] : []) : tokens };
       const form = {
         querySelector: () => state.attachment ? {} : null,
-        querySelectorAll: () => state.unknownButton ? [{ closest: () => null, matches: () => false }] : [],
+        querySelectorAll: () => state.unknownButton
+          ? [{ closest: () => null, matches: () => false,
+              getAttribute: (name: string) => name === "data-testid" ? state.unknownTestId : null,
+              tagName: "BUTTON" }]
+          : [],
       };
       const composer = { isConnected: true, getClientRects: () => [{}], innerText: state.text || state.mention, cloneNode: () => copy,
         closest: () => state.form ? form : null, contains: () => false };
@@ -57,7 +61,7 @@ function fixture(initial: Partial<State> = {}) {
 }
 interface State {
   text: string; attachment: boolean; file: boolean; mention: string; unknown: boolean;
-  readable: boolean; count: number; form: boolean; unknownButton: boolean; url: string;
+  readable: boolean; count: number; form: boolean; unknownButton: boolean; unknownTestId: string; url: string;
 }
 const options = { model: "gpt-6-pro" as const, connector: "fixture", gizmoId: "project", expectedAccountEmail: "fixture@example.com" };
 
@@ -137,5 +141,59 @@ describe("draft-safe interaction preflight", () => {
     expect(error).toMatchObject({ code: "preflight_draft_protected", promptSubmitted: false });
     expect(JSON.stringify(error)).not.toContain("sensitive");
     expect(error.message).not.toContain("sensitive");
+  });
+
+  // P-035 2026-09-27. `assertPreflightDraftSafe` answered only true/false, so a
+  // live home-lane refusal named no check. The FIRST refusing branch now reports
+  // a closed, content-free reason code on the error and in exactly one log line.
+  it("names an unlisted control by its own testid, content-free", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { page } = fixture({ unknownButton: true, unknownTestId: "voice-mode-btn" });
+      const error = await assertPreflightDraftSafe(page).catch(error => error);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("unknown_control:voice-mode-btn");
+      const refusals = spy.mock.calls.map(call => String(call[0]))
+        .filter(line => line.includes("draft guard refused"));
+      expect(refusals).toHaveLength(1);
+      expect(refusals[0]).toContain("reason=unknown_control:voice-mode-btn");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("names a typed-text refusal text_present without leaking the draft", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { page } = fixture({ text: "private user draft" });
+      const error = await assertPreflightDraftSafe(page).catch(error => error);
+      expect(error.reason).toBe("text_present");
+      const logged = spy.mock.calls.map(call => String(call[0])).join("\n");
+      expect(logged).toContain("reason=text_present");
+      expect(logged).not.toContain("private user draft");
+      expect(JSON.stringify(error)).not.toContain("private user draft");
+      expect(error.message).not.toContain("private user draft");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("names a composer-count and an origin refusal by their own codes", async () => {
+    const two = await assertPreflightDraftSafe(fixture({ count: 2 }).page).catch(error => error);
+    expect(two.reason).toBe("composer_count:2");
+    const foreign = await assertPreflightDraftSafe(fixture({ url: "https://example.com/" }).page).catch(error => error);
+    expect(foreign.reason).toBe("foreign_origin");
+  });
+
+  it("logs no refusal line and sets no reason when the draft is admissible", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { page } = fixture({ text: "owned probe" });
+      await expect(assertPreflightDraftSafe(page, { text: "owned probe" })).resolves.toBeUndefined();
+      expect(spy.mock.calls.map(call => String(call[0]))
+        .filter(line => line.includes("draft guard refused"))).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

@@ -535,6 +535,17 @@ const PRO_PASSIVE_ANCESTOR_LEVELS = 4;
 const PRO_TOOLTIP_POLL_MS = 100;
 /** Hard attempt cap, so a mocked (instant) clock cannot spin the poll loop. */
 const PRO_TOOLTIP_POLL_ATTEMPTS = 40;
+/** Stepped pointer move: start this far OUTSIDE the disabled row's left edge. */
+const PRO_STEPPED_APPROACH_PX = 4;
+/** Steps in the final Playwright-mouse move onto the disabled row's centre. */
+const PRO_STEPPED_STEPS = 8;
+/** The popover shapes the content-free `none` evidence line probes, and counts. */
+const PRO_LIMIT_EVIDENCE_PROBES = [
+  PRO_TOOLTIP_SELECTOR,
+  "[data-radix-popper-content-wrapper]",
+  "[data-side]",
+  '[data-state$="open"]',
+];
 
 /** Month names as ChatGPT spells them in the limit tooltip. */
 const PRO_MONTHS: Record<string, number> = {
@@ -634,8 +645,10 @@ type ProLimitTextSource =
   | "passive-title"
   | "passive-aria"
   | "describedby"
+  | "passive-descendant"
   | "hover-row"
   | "hover-ancestor"
+  | "hover-stepped"
   | "none";
 
 /** What one forced hover did. `skipped` means it was never needed. */
@@ -699,6 +712,35 @@ async function readProLimitTextPassive(page: Page, index: number): Promise<ProLi
                 return { source: "describedby" as const, text };
               }
             }
+          }
+        }
+        // P-035 2026-09-27. The sentence can also sit on a chip or label INSIDE
+        // the disabled row, on an element the pointer path never reaches. Scan
+        // the row's descendants LAST, so the existing sources keep the order and
+        // precedence they had: title, aria-label, describedby target, own text,
+        // none of them gated on visibility (a hidden tooltip still names the date).
+        for (const descendant of Array.from(row.querySelectorAll("*"))) {
+          const title = (descendant.getAttribute("title") ?? "").trim();
+          if (title.length > 0 && relevant.test(title)) {
+            return { source: "passive-descendant" as const, text: title };
+          }
+          const aria = (descendant.getAttribute("aria-label") ?? "").trim();
+          if (aria.length > 0 && relevant.test(aria)) {
+            return { source: "passive-descendant" as const, text: aria };
+          }
+          const describedBy = (descendant.getAttribute("aria-describedby") ?? "").trim();
+          if (describedBy.length > 0) {
+            for (const id of describedBy.split(/\s+/)) {
+              const target = document.getElementById(id);
+              const text = (target?.textContent ?? "").trim();
+              if (text.length > 0 && relevant.test(text)) {
+                return { source: "passive-descendant" as const, text };
+              }
+            }
+          }
+          const own = (descendant.textContent ?? "").trim();
+          if (own.length > 0 && relevant.test(own)) {
+            return { source: "passive-descendant" as const, text: own };
           }
         }
         return null;
@@ -770,6 +812,114 @@ async function pollVisibleLimitText(page: Page): Promise<string | null> {
 }
 
 /**
+ * One stepped Playwright-mouse move from just outside the disabled row's left
+ * edge onto its centre.
+ *
+ * P-035 2026-09-27. The live intelli lane answered `source=none` even though both
+ * forced hovers reported `resolved`. A forced `hover()` jumps the pointer straight
+ * onto the target, which some Radix popovers ignore; a pointer that arrives in
+ * steps is the shape a real mouse makes. `page.mouse` is Playwright's own input
+ * layer, never OS input. Returns the same `resolved`/`rejected` vocabulary the
+ * forced hovers use, and never throws.
+ */
+async function steppedRowHover(page: Page, row: Locator): Promise<ProHoverOutcome> {
+  try {
+    const box = await row.boundingBox();
+    if (!box || box.width <= 0 || box.height <= 0) return "rejected";
+    const centreY = box.y + box.height / 2;
+    await page.mouse.move(box.x - PRO_STEPPED_APPROACH_PX, centreY);
+    await page.mouse.move(box.x + box.width / 2, centreY, { steps: PRO_STEPPED_STEPS });
+    return "resolved";
+  } catch {
+    return "rejected";
+  }
+}
+
+/**
+ * The content-free evidence line for a `none` result.
+ *
+ * P-035 2026-09-27. When every source fails, the probe line says only `none`.
+ * This reader answers WHY with page SHAPE, never page content: the disabled row's
+ * tagName/role/attribute NAMES and only the four state attributes' values, its
+ * descendant count, whether the document has focus, what element sits at the row
+ * centre, how many popover-shaped elements exist and how many are visible, and
+ * the count, tags and attribute NAMES of every element whose text or any
+ * attribute VALUE matches the limit wording. No text, typed value or attribute
+ * value of a page element is ever carried -- only the four state values named
+ * above. Never throws; a page that cannot answer yields no line.
+ */
+async function readProLimitEvidence(page: Page, index: number): Promise<Record<string, unknown> | null> {
+  try {
+    return await page.evaluate(
+      ({ proLimitEvidence, at, probes }: { proLimitEvidence: boolean; at: number; probes: string[] }) => {
+        void proLimitEvidence;
+        const relevant = /Limit reached|Try again after/i;
+        const items = Array.from(document.querySelectorAll<HTMLElement>(
+          '[role="menuitem"],[role="menuitemradio"]',
+        ));
+        const row = items[at];
+        if (!row) return null;
+        const visible = (element: Element): boolean => {
+          const style = window.getComputedStyle(element);
+          if (style.visibility === "hidden" || style.display === "none") return false;
+          if (Number.parseFloat(style.opacity || "1") === 0) return false;
+          const rect = element.getBoundingClientRect();
+          return !(rect.width === 0 && rect.height === 0);
+        };
+        const stateNames = ["data-state", "data-disabled", "aria-disabled", "disabled"];
+        const stateValues: Record<string, string | null> = {};
+        for (const name of stateNames) stateValues[name] = row.getAttribute(name);
+        const rect = row.getBoundingClientRect();
+        const point = document.elementFromPoint(
+          rect.x + rect.width / 2,
+          rect.y + rect.height / 2,
+        );
+        const popovers: Record<string, { total: number; visible: number }> = {};
+        for (const selector of probes) {
+          const all = Array.from(document.querySelectorAll(selector));
+          popovers[selector] = { total: all.length, visible: all.filter(visible).length };
+        }
+        // Every element, visible or hidden, whose own text or any attribute value
+        // carries the wording: the sentence, each ancestor of it, and any element
+        // whose attribute names the date. Only tags and attribute NAMES are kept.
+        const matching = Array.from(document.querySelectorAll("body *"))
+          .filter((element) =>
+            relevant.test(element.textContent ?? "") ||
+            Array.from(element.attributes).some((attribute) => relevant.test(attribute.value ?? "")),
+          )
+          .map((element) => ({
+            tag: element.tagName,
+            attributes: Array.from(element.attributes).map((attribute) => attribute.name),
+          }));
+        return {
+          row: {
+            tag: row.tagName,
+            role: row.getAttribute("role"),
+            attributeNames: Array.from(row.attributes).map((attribute) => attribute.name),
+            stateValues,
+          },
+          rowDescendants: row.querySelectorAll("*").length,
+          hasFocus: document.hasFocus(),
+          elementFromPoint: point
+            ? {
+              tag: point.tagName,
+              role: point.getAttribute("role"),
+              testId: point.getAttribute("data-testid"),
+            }
+            : null,
+          popovers,
+          matchingCount: matching.length,
+          matching,
+        };
+      },
+      { proLimitEvidence: true, at: index, probes: [...PRO_LIMIT_EVIDENCE_PROBES] },
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Is the picker's `Pro` row disabled, and if so when does Pro return?
  *
  * P-035 2026-09-27. Maik's intelli screenshot showed the live shape: the picker
@@ -779,13 +929,16 @@ async function pollVisibleLimitText(page: Page): Promise<string | null> {
  * -- which is why the limit has to be read off the row itself. Absent or enabled
  * `Pro` returns null and the caller behaves exactly as before.
  *
- * The sentence is read in three widening steps, because a real pointer showed a
- * tooltip that a plain `hover()` could not reach: the passive attributes first,
- * then a forced hover on the row, then a forced hover on the nearest ancestor
- * that is not the menu itself. Every source uses the page's own Playwright API;
- * the sentence is the only page content read, and it is capped before it leaves
- * this function. Exactly one content-free diagnostic line is logged per
- * detection, naming the source and each hover outcome but never the page text.
+ * The sentence is read in four widening steps, because a real pointer showed a
+ * tooltip that a plain `hover()` could not reach: the passive attributes (now
+ * including the row's descendants) first, then a forced hover on the row, then a
+ * forced hover on the nearest ancestor that is not the menu itself, then one
+ * stepped Playwright-mouse move onto the row's centre. Every source uses the
+ * page's own Playwright API; the sentence is the only page content read, and it
+ * is capped before it leaves this function. Exactly one content-free diagnostic
+ * line is logged per detection, naming the source and each hover or move outcome
+ * but never the page text; when nothing answered, one further content-free line
+ * describes the page SHAPE around the row and still carries no page text.
  */
 async function detectProUsageLimit(page: Page): Promise<ProUsageLimit | null> {
   const index = await findDisabledProItemIndex(page);
@@ -796,6 +949,7 @@ async function detectProUsageLimit(page: Page): Promise<ProUsageLimit | null> {
   let limitText: string | null = null;
   let rowHover: ProHoverOutcome = "skipped";
   let ancestorHover: ProHoverOutcome = "skipped";
+  let steppedMove: ProHoverOutcome = "skipped";
 
   // 1. Passive sources: no pointer needed, and nothing is left hovered behind.
   const passive = await readProLimitTextPassive(page, index);
@@ -828,12 +982,37 @@ async function detectProUsageLimit(page: Page): Promise<ProUsageLimit | null> {
     }
   }
 
-  // 4. One content-free line per detection: which source answered and whether
-  // each hover resolved or rejected. The page's own text never appears here.
+  // 4. Still nothing: a forced `hover()` lands the pointer in one jump, which a
+  // Radix popover can ignore. One stepped Playwright-mouse move from outside the
+  // row's left edge onto its centre is the shape a real pointer makes.
+  if (limitText === null) {
+    steppedMove = await steppedRowHover(page, item);
+    if (steppedMove === "resolved") {
+      const text = await pollVisibleLimitText(page);
+      if (text) {
+        source = "hover-stepped";
+        limitText = text.slice(0, PRO_LIMIT_TEXT_MAX);
+      }
+    }
+  }
+
+  // 5. One content-free line per detection: which source answered and whether
+  // each hover or stepped move resolved or rejected. The page's own text never
+  // appears here.
   console.error(
     `[cgpro:model] pro usage limit probe: source=${source} ` +
-      `rowHover=${rowHover} ancestorHover=${ancestorHover}`,
+      `rowHover=${rowHover} ancestorHover=${ancestorHover} steppedMove=${steppedMove}`,
   );
+
+  // 6. Nothing answered at all: one extra content-free line describing the page
+  // SHAPE around the disabled row, so the next session can tell a missing
+  // popover from a popover the pointer never reaches. No page text in that line.
+  if (source === "none") {
+    const evidence = await readProLimitEvidence(page, index);
+    if (evidence) {
+      console.error(`[cgpro:model] pro usage limit evidence: ${JSON.stringify(evidence)}`);
+    }
+  }
 
   // Dismiss the hover the way the existing menu cleanup does, so the popover is
   // left as found before the typed refusal is thrown.
@@ -1941,17 +2120,43 @@ export async function assertPreflightDraftSafe(
   owned: { text?: string; connector?: string; directory?: boolean; sourceProvenEmpty?: boolean } = {},
 ): Promise<void> {
   let safe = false;
+  let reason: string | null = null;
   try {
-    safe = await page.evaluate(({ selector, owned }) => {
+    const outcome = await page.evaluate(({ selector, owned }) => {
+      // P-035 2026-09-27. The guard still answers a single bit: `true` admits,
+      // a string is the FIRST check that refused, named by a closed, content-free
+      // reason code. The branch order and every condition are exactly as before,
+      // so admission is unchanged; only the refusal now says which branch it was.
+      /** Keep a code to UI chrome: [A-Za-z0-9 _.:-], trimmed, capped at 60. */
+      const chrome = (value: string): string =>
+        value.replace(/[^A-Za-z0-9 _.:-]/g, "").trim().slice(0, 60);
+      /** UI chrome only for a control: data-testid, else aria-label, else tag name. */
+      const identify = (element: { getAttribute?: (name: string) => string | null; tagName?: string }): string => {
+        let raw = "";
+        try { raw = element.getAttribute?.("data-testid") ?? ""; } catch { /* not a DOM element */ }
+        if (!raw) { try { raw = element.getAttribute?.("aria-label") ?? ""; } catch { /* not a DOM element */ } }
+        if (!raw) raw = element.tagName ?? "";
+        return chrome(raw) || "unknown";
+      };
+      /** The selector kinds the one combined media query used, for the reason code. */
+      const mediaKinds: Array<[string, string]> = [
+        ["img", "img"], ["video", "video"], ["audio", "audio"], ["canvas", "canvas"],
+        ["object", "object"], ["iframe", "iframe"],
+        ["attachment", '[data-testid*="attachment" i]'],
+        ["upload", '[data-testid*="upload" i]:not(input)'],
+        ["data-type", "[data-type]"],
+        ["remove", '[aria-label*="remove" i]'],
+      ];
       const composers = Array.from(document.querySelectorAll<HTMLElement>(selector));
       if (location.href === "about:blank") {
-        return composers.length === 0 && document.body?.childNodes.length === 0;
+        return composers.length === 0 && document.body?.childNodes.length === 0
+          ? true : "blank_page_not_empty";
       }
-      if (location.origin !== "https://chatgpt.com") return false;
+      if (location.origin !== "https://chatgpt.com") return "foreign_origin";
       // Uploads can be outside the editable document, and an empty text value
       // says nothing about files, pending uploads, or non-text tokens.
       if (Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'))
-        .some(input => input.files === null || input.files.length > 0)) return false;
+        .some(input => input.files === null || input.files.length > 0)) return "file_input_has_files";
       if (composers.length !== 1) {
         // The Projects directory is the single composer-free surface the
         // vendor flow is known to visit. Admit it ONLY when the caller names
@@ -1959,55 +2164,59 @@ export async function assertPreflightDraftSafe(
         // navigation, the route is exactly /projects, and read-only DOM checks
         // find no editor, attachment/upload marker, unknown nested surface or
         // typed value. A missing composer alone is never a safe condition.
-        if (!owned.directory || !owned.sourceProvenEmpty) return false;
-        if (location.pathname !== "/projects") return false;
+        if (!owned.directory || !owned.sourceProvenEmpty) return `composer_count:${composers.length}`;
+        if (location.pathname !== "/projects") return "directory_path_not_projects";
         if (document.querySelectorAll(
           'textarea, [contenteditable]:not([contenteditable="false"]), [role="textbox"], ' +
           '[data-type], [data-testid*="attachment" i], [data-testid*="upload" i]:not(input), ' +
           '[aria-label*="remove" i], img[src^="blob:"], iframe, object, embed, canvas, video, audio',
-        ).length > 0) return false;
+        ).length > 0) return "directory_forbidden_node";
         for (const field of Array.from(document.querySelectorAll<HTMLInputElement>(
           'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])' +
           ':not([type="button"]):not([type="submit"]):not([type="file"])',
         ))) {
           // A typed search/value on the directory is a draft like any other.
-          if ((field.value ?? "").length > 0) return false;
+          if ((field.value ?? "").length > 0) return "directory_typed_value";
         }
         return true;
       }
       const composer = composers[0];
       const form = composer.closest("form");
-      if (!form || !composer.isConnected || composer.getClientRects().length === 0) return false;
-      if (form.querySelector('img, video, audio, canvas, object, iframe, [data-testid*="attachment" i], [data-testid*="upload" i]:not(input), [data-type], [aria-label*="remove" i]')) return false;
+      if (!form || !composer.isConnected || composer.getClientRects().length === 0) return "composer_not_rendered";
+      for (const [kind, mediaSelector] of mediaKinds) {
+        if (form.querySelector(mediaSelector)) return `form_media:${kind}`;
+      }
       for (const control of Array.from(form.querySelectorAll('button, [role="button"]'))) {
         if (composer.contains(control) || control.closest('[role="menu"], [role="listbox"]')) continue;
-        if (!control.matches('button[data-testid="composer-plus-btn"], button[data-testid="send-button"], button[data-testid="composer-send-button"], button[aria-label="Select ChatGPT model"], button.__composer-pill[aria-haspopup="menu"], button[data-testid="model-switcher-dropdown-button"]')) return false;
+        if (!control.matches('button[data-testid="composer-plus-btn"], button[data-testid="send-button"], button[data-testid="composer-send-button"], button[aria-label="Select ChatGPT model"], button.__composer-pill[aria-haspopup="menu"], button[data-testid="model-switcher-dropdown-button"]')) return `unknown_control:${identify(control)}`;
       }
       const copy = composer.cloneNode(true) as HTMLElement;
       const tokens = Array.from(copy.querySelectorAll<HTMLElement>('[contenteditable="false"]'));
       if (tokens.length) {
         if (!owned.connector || tokens.length !== 1 || tokens[0].tagName !== "A" ||
-            tokens[0].textContent?.trim() !== owned.connector) return false;
+            tokens[0].textContent?.trim() !== owned.connector) return "connector_token_mismatch";
         tokens[0].remove();
       }
       // Only familiar text formatting is admissible. Unrecognised rich nodes
       // (including empty mentions) fail closed even when their text is empty.
       for (const child of Array.from(copy.querySelectorAll("*"))) {
-        if (!/^(P|BR|SPAN|STRONG|EM|B|I|CODE|PRE|UL|OL|LI)$/.test(child.tagName)) return false;
-        if (Array.from(child.attributes).some(a => /^(data-|contenteditable|role|aria-|hidden|style)/.test(a.name))) return false;
+        if (!/^(P|BR|SPAN|STRONG|EM|B|I|CODE|PRE|UL|OL|LI)$/.test(child.tagName)) return `rich_node:${chrome(child.tagName) || "unknown"}`;
+        const badAttribute = Array.from(child.attributes)
+          .find(a => /^(data-|contenteditable|role|aria-|hidden|style)/.test(a.name));
+        if (badAttribute) return `rich_attr:${chrome(badAttribute.name) || "unknown"}`;
       }
       let text = composer instanceof HTMLTextAreaElement ? composer.value : composer.innerText;
       if (tokens.length) {
         // A sole owned connector token is admissible, not arbitrary text that
         // happens to contain the connector name.
-        if (text.trim() !== owned.connector) return false;
+        if (text.trim() !== owned.connector) return "connector_token_mismatch";
         text = "";
       }
       if (owned.text !== undefined) {
-        if (text !== owned.text) return false;
+        if (text !== owned.text) return "owned_text_mismatch";
       } else {
-        if (text.trim() || (copy.textContent ?? "").length > 0) return false;
-        if (composer instanceof HTMLTextAreaElement && text.length > 0) return false;
+        if (text.trim() || (copy.textContent ?? "").length > 0) return "text_present";
+        if (composer instanceof HTMLTextAreaElement && text.length > 0) return "text_present";
       }
       // Non-control text outside the editable region may be a rich draft chip.
       const walker = document.createTreeWalker(form, NodeFilter.SHOW_TEXT);
@@ -2015,12 +2224,20 @@ export async function assertPreflightDraftSafe(
         const node = walker.currentNode;
         if (!node.textContent?.trim() || composer.contains(node)) continue;
         const parent = node.parentElement;
-        if (!parent?.closest('button, [role="button"], [role="menu"], [role="listbox"]')) return false;
+        if (!parent?.closest('button, [role="button"], [role="menu"], [role="listbox"]')) return "foreign_text";
       }
       return true;
     }, { selector: joinSelectors(SELECTORS.composer), owned });
+    if (outcome === true) safe = true;
+    else if (typeof outcome === "string") reason = outcome;
   } catch { /* Evaluation failure is unknown, never empty. */ }
-  if (safe !== true) throw new PreflightDraftProtectedError();
+  if (safe !== true) {
+    // Exactly one content-free line per refusal. No branch answered means the
+    // evaluation itself failed, which is unknown, never empty: still a refusal.
+    if (reason === null) reason = "evaluation_failed";
+    console.error(`[cgpro:preflight] draft guard refused: reason=${reason}`);
+    throw new PreflightDraftProtectedError(reason);
+  }
 }
 
 export async function clearComposer(page: Page, guard?: () => Promise<void>): Promise<void> {
