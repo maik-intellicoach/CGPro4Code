@@ -321,3 +321,136 @@ describe("the long-draft Expand control", () => {
     expect(refused.reason).toBe("owned_text_mismatch");
   });
 });
+
+// P-035 2026-09-28 r26. The second, mutually exclusive body mode:
+// `{ connector, prefix, marker }` proves the stranded draft by the planning
+// facade's own composed shape (header + hidden marker + invocation id) rather
+// than by its text. The flow is the text flow exactly -- proof before any
+// keystroke, the same proof inside `clearComposer`, and the empty re-proof
+// after a fresh home -- so these cases pin the acceptance, every refusal, and
+// the new content-free log mode.
+describe("POST /discard-owned-draft provenance mode", () => {
+  const HEADER = "planning system header v1\nlane=intelli facade=planning";
+  const MARKER = "[cgpro:composed-invocation]";
+  const UUID = "0f8fad5b-d9cb-469f-a165-70867728950e";
+  const composed = (request = "the different planning request"): string =>
+    `${HEADER}\nUSER: ${request}\n${MARKER}\ninvocation_id="${UUID}"`;
+
+  it("clears a composed draft proven by header, marker and invocation id", async () => {
+    const { page, presses, click } = fixture({ text: composed() });
+    const result = await discard(stateFor(page), { connector: CONNECTOR, prefix: HEADER, marker: MARKER });
+    expect(result.status).toBe(200);
+    expect(JSON.parse(result.body)).toEqual({ cleared: true });
+    // Proof before the clear, and one clear only.
+    expect(presses).toEqual(["Meta+A", "Backspace"]);
+    expect(click).toHaveBeenCalledTimes(1);
+    // The lane was re-proven empty after a fresh home.
+    expect(goHome).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears a marked paste under the provenance proof", async () => {
+    const text = composed();
+    const { page, presses } = fixture({ text, rich: [{
+      tagName: "P", attributes: [{ name: "data-prompt-literal-paste", value: "" }], textContent: text,
+    }] });
+    const result = await discard(stateFor(page), { connector: CONNECTOR, prefix: HEADER, marker: MARKER });
+    expect(result.status).toBe(200);
+    expect(presses).toEqual(["Meta+A", "Backspace"]);
+  });
+
+  it("refuses a missing marker as provenance_mismatch and touches nothing", async () => {
+    const { page, click, presses } = fixture({ text: `${HEADER}\nUSER: x\ninvocation_id="${UUID}"` });
+    const result = await discard(stateFor(page), { connector: CONNECTOR, prefix: HEADER, marker: MARKER });
+    expect(result.status).toBe(409);
+    expect(JSON.parse(result.body)).toEqual({ error: "draft_not_owned", reason: "provenance_mismatch" });
+    expect(presses).toEqual([]);
+    expect(click).not.toHaveBeenCalled();
+    expect(goHome).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a changed header word and a missing invocation id", async () => {
+    const changed = await discard(
+      stateFor(fixture({ text: `${HEADER.replace("v1", "v2")}\nUSER: x\n${MARKER}\ninvocation_id="${UUID}"` }).page),
+      { connector: CONNECTOR, prefix: HEADER, marker: MARKER },
+    );
+    expect(JSON.parse(changed.body)).toEqual({ error: "draft_not_owned", reason: "provenance_mismatch" });
+
+    const noId = await discard(
+      stateFor(fixture({ text: `${HEADER}\nUSER: x\n${MARKER}` }).page),
+      { connector: CONNECTOR, prefix: HEADER, marker: MARKER },
+    );
+    expect(JSON.parse(noId.body)).toEqual({ error: "draft_not_owned", reason: "provenance_mismatch" });
+  });
+
+  it("refuses a chip that is not the named connector exactly as text mode does", async () => {
+    const result = await discard(
+      stateFor(fixture({ chip: "some-other-connector", text: composed() }).page),
+      { connector: CONNECTOR, prefix: HEADER, marker: MARKER },
+    );
+    expect(result.status).toBe(409);
+    expect(JSON.parse(result.body)).toEqual({ error: "draft_not_owned", reason: "connector_token_text" });
+  });
+
+  it("logs the provenance mode on every outcome line, content-free", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await discard(stateFor(fixture({ text: composed() }).page),
+        { connector: CONNECTOR, prefix: HEADER, marker: MARKER });
+      const cleared = spy.mock.calls.map(call => String(call[0]))
+        .find(line => line.includes("outcome=cleared"));
+      expect(cleared).toContain("[cgpro:discard] mode=provenance outcome=cleared reason=-");
+      const logged = spy.mock.calls.map(call => String(call[0])).join("\n");
+      expect(logged).not.toContain("planning request");
+
+      spy.mockClear();
+      await discard(stateFor(fixture({ text: TEXT }).page),
+        { connector: CONNECTOR, prefix: HEADER, marker: MARKER });
+      const refused = spy.mock.calls.map(call => String(call[0]))
+        .find(line => line.includes("outcome=not_owned"));
+      expect(refused).toContain("[cgpro:discard] mode=provenance outcome=not_owned reason=provenance_mismatch");
+
+      spy.mockClear();
+      await discard(stateFor(fixture({ text: TEXT }).page), { connector: CONNECTOR, text: TEXT });
+      const textMode = spy.mock.calls.map(call => String(call[0]))
+        .find(line => line.includes("outcome=cleared"));
+      expect(textMode).toContain("[cgpro:discard] mode=text outcome=cleared reason=-");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it.each([
+    // Both modes at once: text beside a prefix (or marker) is a 400.
+    { connector: CONNECTOR, text: TEXT, prefix: HEADER },
+    { connector: CONNECTOR, text: TEXT, marker: MARKER },
+    { connector: CONNECTOR, text: TEXT, prefix: HEADER, marker: MARKER },
+    // Provenance needs BOTH halves inside their bounds.
+    { connector: CONNECTOR, prefix: HEADER },
+    { connector: CONNECTOR, marker: MARKER },
+    { connector: CONNECTOR, prefix: "", marker: MARKER },
+    { connector: CONNECTOR, prefix: HEADER, marker: "" },
+    { connector: CONNECTOR, prefix: "p".repeat(4_001), marker: MARKER },
+    { connector: CONNECTOR, prefix: HEADER, marker: "m".repeat(201) },
+    { connector: CONNECTOR, prefix: 5, marker: MARKER },
+    { connector: CONNECTOR, prefix: HEADER, marker: 5 },
+  ])("rejects a provenance body outside its shape: %j", async body => {
+    const s = stateFor(fixture({ text: composed() }).page);
+    const result = await discard(s, body);
+    expect(result.status).toBe(400);
+    expect(JSON.parse(result.body)).toEqual({ error: "invalid_request" });
+    expect(goHome).not.toHaveBeenCalled();
+    expect(s.queue.tryAcquire()).toBe(true);
+    s.queue.release();
+  });
+
+  it("accepts a provenance prefix and marker at their exact upper bounds", async () => {
+    const head = "h".repeat(4_000);
+    const text = `${head} ${MARKER} invocation_id="${UUID}"`;
+    const result = await discard(stateFor(fixture({ text }).page),
+      { connector: CONNECTOR, prefix: head, marker: "m".repeat(200) });
+    // `marker` here is not in the draft, so the proof refuses -- but the body
+    // was ACCEPTED (409 provenance_mismatch), never 400 invalid_request.
+    expect(result.status).toBe(409);
+    expect(JSON.parse(result.body)).toEqual({ error: "draft_not_owned", reason: "provenance_mismatch" });
+  });
+});

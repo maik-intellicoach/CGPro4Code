@@ -1290,7 +1290,16 @@ export async function handleRequest(
     // refusal touches nothing. It never waits and never interrupts a turn, and
     // every response and log line is content-free -- connector, text and page
     // are never echoed.
-    let body: { connector?: unknown; text?: unknown } | null;
+    //
+    // P-035 2026-09-28 r26. A second, mutually exclusive body proves the draft
+    // by provenance instead of by text: `{ connector, prefix, marker }`. The
+    // prefix is the facade's planning header (1..4000 chars), the marker its
+    // hidden invocation marker (1..200 chars). The flow below is identical in
+    // both modes -- the guard must admit before any keystroke, `clearComposer`
+    // re-proves with the same owned proof, and the empty re-proof after a fresh
+    // `goHome` must admit -- so the two modes differ only in the owned proof
+    // they pass. Every log line names the mode.
+    let body: { connector?: unknown; text?: unknown; prefix?: unknown; marker?: unknown } | null;
     try {
       state.readerBudget.acquire();
     } catch {
@@ -1301,22 +1310,40 @@ export async function handleRequest(
     try {
       body = await readJsonBody(req);
     } catch {
-      console.error("[cgpro:discard] outcome=invalid reason=-");
+      console.error("[cgpro:discard] mode=text outcome=invalid reason=-");
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "invalid_request" }));
       return;
     } finally { state.readerBudget.release(); }
     const connector = typeof body?.connector === "string" ? body.connector : "";
     const text = typeof body?.text === "string" ? body.text : "";
+    const prefix = typeof body?.prefix === "string" ? body.prefix : "";
+    const marker = typeof body?.marker === "string" ? body.marker : "";
+    // The mode follows the body's own shape: naming a prefix or a marker is the
+    // provenance proof. A body that names neither is judged as an exact-text
+    // request and refused below, exactly as before.
+    const provenanceRequested = body !== null
+      && (body.prefix !== undefined || body.marker !== undefined) && body.text === undefined;
+    const mode = provenanceRequested ? "provenance" : "text";
+    // Exact-text mode is unchanged: a text string of 1..20000 chars, and no
+    // prefix or marker beside it. Both text and prefix (or marker) -> 400.
+    const textBodyValid = body !== null && body.text !== undefined
+      && body.prefix === undefined && body.marker === undefined
+      && typeof body.text === "string" && text.length >= 1 && text.length <= 20_000;
+    // Provenance mode: a prefix string of 1..4000 chars AND a marker string of
+    // 1..200 chars, with no text beside them.
+    const provenanceBodyValid = body !== null && provenanceRequested
+      && typeof body.prefix === "string" && prefix.length >= 1 && prefix.length <= 4_000
+      && typeof body.marker === "string" && marker.length >= 1 && marker.length <= 200;
     if (!body || typeof body.connector !== "string" || connector.length < 1 || connector.length > 120 ||
-        typeof body.text !== "string" || text.length < 1 || text.length > 20_000) {
-      console.error("[cgpro:discard] outcome=invalid reason=-");
+        !(textBodyValid || provenanceBodyValid)) {
+      console.error(`[cgpro:discard] mode=${mode} outcome=invalid reason=-`);
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "invalid_request" }));
       return;
     }
     if (!state.queue.tryAcquire()) {
-      console.error("[cgpro:discard] outcome=busy reason=-");
+      console.error(`[cgpro:discard] mode=${mode} outcome=busy reason=-`);
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "lane_busy" }));
       return;
@@ -1330,38 +1357,43 @@ export async function handleRequest(
     // ISSUED an unexpected failure is a possible persistence, never a clean
     // unowned refusal.
     let clearIssued = false;
+    // The owned proof this call enforces, in whichever mode the body named:
+    // the exact text, or the provenance triple. Both are the SAME guard input
+    // shape `assertPreflightDraftSafe` already takes, so every step below runs
+    // one code path.
+    const owned = mode === "provenance" ? { connector, provenance: { prefix, marker } } : { connector, text };
     try {
       const page = await slotPage(state, slot);
       await goHome(page);
       await waitForComposerHydrated(page);
       try {
-        await assertPreflightDraftSafe(page, { connector, text });
+        await assertPreflightDraftSafe(page, owned);
       } catch (error) {
         const reason = guardReason(error);
-        console.error(`[cgpro:discard] outcome=not_owned reason=${reason}`);
+        console.error(`[cgpro:discard] mode=${mode} outcome=not_owned reason=${reason}`);
         res.writeHead(409, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "draft_not_owned", reason }));
         return;
       }
       clearIssued = true;
-      await clearComposer(page, () => assertPreflightDraftSafe(page, { connector, text }));
+      await clearComposer(page, () => assertPreflightDraftSafe(page, owned));
       await goHome(page);
       await waitForComposerHydrated(page);
       try {
         await assertPreflightDraftSafe(page);
       } catch (error) {
         const reason = guardReason(error);
-        console.error(`[cgpro:discard] outcome=persisted reason=${reason}`);
+        console.error(`[cgpro:discard] mode=${mode} outcome=persisted reason=${reason}`);
         res.writeHead(409, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "draft_persisted", reason }));
         return;
       }
-      console.error("[cgpro:discard] outcome=cleared reason=-");
+      console.error(`[cgpro:discard] mode=${mode} outcome=cleared reason=-`);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ cleared: true }));
     } catch (error) {
       const reason = guardReason(error);
-      console.error(`[cgpro:discard] outcome=${clearIssued ? "persisted" : "not_owned"} reason=${reason}`);
+      console.error(`[cgpro:discard] mode=${mode} outcome=${clearIssued ? "persisted" : "not_owned"} reason=${reason}`);
       if (!res.headersSent) {
         res.writeHead(409, { "Content-Type": "application/json" });
         res.end(JSON.stringify({

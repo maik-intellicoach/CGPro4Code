@@ -2217,14 +2217,30 @@ interface OwnedTextShape {
   commonPrefix: number;
 }
 
+/**
+ * P-035 2026-09-28 r26. The provenance mode admits a draft this facade composed
+ * without naming its text, so a refusal must say which of the three provenance
+ * conditions failed. Booleans and one length only: never a character.
+ */
+interface ProvenanceShape {
+  prefix: boolean;
+  marker: boolean;
+  invocation: boolean;
+  len: number;
+}
+
 /** The content-free diagnostics a single refusal may carry beside its reason. */
 type PreflightDiagnostic =
   | {
     reason: string; chipRemainder: { len: number; ws: number; cf: number; other: number };
-    foreignShape?: undefined; ownedTextShape?: undefined;
+    foreignShape?: undefined; ownedTextShape?: undefined; provenanceShape?: undefined;
   }
-  | { reason: string; foreignShape: ForeignTextShape; chipRemainder?: undefined; ownedTextShape?: undefined }
-  | { reason: string; ownedTextShape: OwnedTextShape; chipRemainder?: undefined; foreignShape?: undefined };
+  | { reason: string; foreignShape: ForeignTextShape; chipRemainder?: undefined; ownedTextShape?: undefined;
+    provenanceShape?: undefined }
+  | { reason: string; ownedTextShape: OwnedTextShape; chipRemainder?: undefined; foreignShape?: undefined;
+    provenanceShape?: undefined }
+  | { reason: string; provenanceShape: ProvenanceShape; chipRemainder?: undefined; foreignShape?: undefined;
+    ownedTextShape?: undefined };
 
 /**
  * Read-only, content-free admission for the no-submit preflight. Unknown rich
@@ -2240,7 +2256,11 @@ type PreflightDiagnostic =
  */
 export async function assertPreflightDraftSafe(
   page: Page,
-  owned: { text?: string; connector?: string; directory?: boolean; sourceProvenEmpty?: boolean } = {},
+  owned: {
+    text?: string; connector?: string; directory?: boolean; sourceProvenEmpty?: boolean;
+    /** r26: prove a composed draft by its planning header, marker and invocation id, never by its text. */
+    provenance?: { prefix: string; marker: string };
+  } = {},
 ): Promise<void> {
   let safe = false;
   let reason: string | null = null;
@@ -2260,6 +2280,12 @@ export async function assertPreflightDraftSafe(
       // must still match exactly and in order; only the whitespace between them
       // is forgiven.
       const norm = (value: string): string => value.replace(/\s+/g, " ").trim();
+      // P-035 2026-09-28 r26. Two ownership proofs can be in force: the exact
+      // owned text (r23/r24) and, mutually exclusive with it, the provenance
+      // triple. Both name the whole draft this call introduced, so the `Expand`
+      // and paste-marker exemptions below key off this one flag instead of the
+      // text alone.
+      const combinedProof = owned.text !== undefined || owned.provenance !== undefined;
       // The length of the longest common prefix of two strings, code unit by
       // code unit. A count only: never any character.
       const commonPrefixLength = (a: string, b: string): number => {
@@ -2363,11 +2389,14 @@ export async function assertPreflightDraftSafe(
         // proof is in force (`owned.text !== undefined`, the same condition the
         // token branch below uses): the caller has then named the full owned
         // draft, so the expander is chrome over content this call introduced.
+        // r26 extends that same condition to the provenance proof
+        // (`combinedProof`): a caller that named its planning header, marker and
+        // invocation id has named the whole draft just as exactly.
         // Any other caller -- and every `[role="button"]` -- still refuses
         // `unknown_control:Expand` exactly as before.
         if (control.tagName === "BUTTON"
           && (id === "Dictate" || id === "Start Voice" || id === "Send"
-            || (id === "Expand" && owned.text !== undefined))) continue;
+            || (id === "Expand" && combinedProof))) continue;
         if (unknownControls.length < 5 && !unknownControls.includes(id)) unknownControls.push(id);
       }
       if (unknownControls.length > 0) return `unknown_control:${unknownControls.join("|")}`.slice(0, 200);
@@ -2431,7 +2460,7 @@ export async function assertPreflightDraftSafe(
           // the text comparison still decides admission, so a foreign draft
           // beside it refuses exactly as before. Every other attribute on the
           // node -- and this attribute without an owned text -- refuse unchanged.
-          if (owned.text !== undefined && attribute.name === "data-prompt-literal-paste") continue;
+          if (combinedProof && attribute.name === "data-prompt-literal-paste") continue;
           if (!/^(data-|contenteditable|role|aria-|hidden|style)/.test(attribute.name)) continue;
           const name = chrome(attribute.name) || "unknown";
           if (refusedAttributes.length < 5 && !refusedAttributes.includes(name)) refusedAttributes.push(name);
@@ -2444,7 +2473,32 @@ export async function assertPreflightDraftSafe(
       // admission.
       let textAdmitted = false;
       if (ownedToken) {
-        if (owned.text !== undefined) {
+        if (owned.provenance !== undefined) {
+          // P-035 2026-09-28 r26. Provenance mode: the draft this facade
+          // composed is proven by its own shape, never by its text. Remove the
+          // token's rendered text exactly as the exact-text branch does, then
+          // require ALL THREE on the normalised remainder: it starts with the
+          // normalised planning header, it carries the hidden invocation marker
+          // as a literal substring, and it carries one `invocation_id="<uuid>"`.
+          // The header alone is shared by every planning request, so the marker
+          // and the invocation id are what make this draft ours; the remainder
+          // may hold a different request after the header and still admit.
+          // `provenance` and `text` are mutually exclusive, and this branch is
+          // only reachable with an owned token: without one, text refuses
+          // exactly as before.
+          const tokenName = ownedToken.textContent?.trim() ?? "";
+          const remainder = norm(text.replace(tokenName, ""));
+          const prefixOk = remainder.startsWith(norm(owned.provenance.prefix));
+          const markerOk = remainder.includes(owned.provenance.marker);
+          const invocationOk = /invocation_id="[0-9a-f-]{36}"/.test(remainder);
+          if (!(prefixOk && markerOk && invocationOk)) {
+            return {
+              reason: "provenance_mismatch",
+              provenanceShape: { prefix: prefixOk, marker: markerOk, invocation: invocationOk, len: remainder.length },
+            };
+          }
+          textAdmitted = true;
+        } else if (owned.text !== undefined) {
           // P-035 2026-09-27. Combined ownership: a connector turn places the
           // owned token AND this call's prompt in one inline flow, so neither
           // half alone can prove the draft. Remove the token's own rendered
@@ -2679,6 +2733,17 @@ export async function assertPreflightDraftSafe(
         const { haveLen, wantLen, commonPrefix } = outcome.ownedTextShape;
         console.error(
           `[cgpro:preflight] owned text shape: have_len=${haveLen} want_len=${wantLen} common_prefix=${commonPrefix}`,
+        );
+      }
+      // P-035 2026-09-28 r26. Exactly one content-free shape line for the
+      // provenance refusal, so one live round names which of the three
+      // conditions failed without naming any character of the draft. The
+      // booleans are `yes`/`no`; `len` is the normalised remainder length.
+      if (outcome.provenanceShape) {
+        const { prefix, marker, invocation, len } = outcome.provenanceShape;
+        console.error(
+          `[cgpro:preflight] provenance shape: prefix=${prefix ? "yes" : "no"} `
+          + `marker=${marker ? "yes" : "no"} invocation=${invocation ? "yes" : "no"} len=${len}`,
         );
       }
     }

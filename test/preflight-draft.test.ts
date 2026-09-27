@@ -1484,3 +1484,153 @@ describe("hidden single-token mirror of the owned chip (r19)", () => {
     }
   });
 });
+
+// P-035 2026-09-28 r26. Maik approved (option f) clearing the Intelli lane's
+// stranded draft ONCE when it is proven to be text our planning facade composed:
+// the lane's own connector chip, the facade's full planning system header, and
+// the hidden invocation marker plus one `invocation_id="<uuid>"`. The live
+// refusal `have_len=2982 want_len=906 common_prefix=354` showed the draft is
+// exactly that header followed by a DIFFERENT planning request, so the text can
+// never match: provenance mode proves the composed shape without naming the
+// text. These cases pin the new admission and every neighbouring refusal.
+describe("composed-draft provenance proof (r26)", () => {
+  const HEADER = "planning system header v1\nlane=intelli facade=planning";
+  const MARKER = "[cgpro:composed-invocation]";
+  const UUID = "0f8fad5b-d9cb-469f-a165-70867728950e";
+  const composed = (request = "the different planning request"): string =>
+    `${HEADER}\nUSER: ${request}\n${MARKER}\ninvocation_id="${UUID}"`;
+
+  it("admits the owned chip plus the full planning header, an arbitrary request, the marker and an invocation id", async () => {
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: "fixture", text: composed() }).page,
+      { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } },
+    )).resolves.toBeUndefined();
+
+    // The request after the header is NOT this call's text and is never named:
+    // any request admits, which is exactly what exact-text mode cannot do.
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: "fixture", text: composed("a completely different ask") }).page,
+      { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } },
+    )).resolves.toBeUndefined();
+
+    // The header comparison normalises whitespace on both sides, like r25.
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: "fixture", text: `planning system header v1\n\nlane=intelli   facade=planning\nUSER: x\n${MARKER} invocation_id="${UUID}"` }).page,
+      { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } },
+    )).resolves.toBeUndefined();
+  });
+
+  it("refuses a missing marker as provenance_mismatch and names the failing condition", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const body = `${HEADER}\nUSER: the different planning request\ninvocation_id="${UUID}"`;
+      const error = await assertPreflightDraftSafe(
+        fixture({ mention: "fixture", text: body }).page,
+        { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } },
+      ).catch(caught => caught);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("provenance_mismatch");
+      const shape = spy.mock.calls.map(call => String(call[0]))
+        .find(line => line.includes("provenance shape"));
+      expect(shape).toContain("provenance shape: prefix=yes marker=no invocation=yes len=");
+      // Exactly one shape line, and it never carries any character of the draft.
+      expect(spy.mock.calls.map(call => String(call[0]))
+        .filter(line => line.includes("provenance shape"))).toHaveLength(1);
+      expect(shape).not.toContain("the different planning request");
+      expect(JSON.stringify(error)).not.toContain("planning");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("refuses a header with one changed word as prefix=no", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const changed = `${HEADER.replace("v1", "v2")}\nUSER: x\n${MARKER}\ninvocation_id="${UUID}"`;
+      const error = await assertPreflightDraftSafe(
+        fixture({ mention: "fixture", text: changed }).page,
+        { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } },
+      ).catch(caught => caught);
+      expect(error.reason).toBe("provenance_mismatch");
+      const shape = spy.mock.calls.map(call => String(call[0]))
+        .find(line => line.includes("provenance shape"));
+      expect(shape).toContain("prefix=no");
+      expect(shape).toContain("marker=yes");
+      expect(shape).toContain("invocation=yes");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("refuses a draft with no invocation id as invocation=no", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const noId = `${HEADER}\nUSER: x\n${MARKER}`;
+      const error = await assertPreflightDraftSafe(
+        fixture({ mention: "fixture", text: noId }).page,
+        { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } },
+      ).catch(caught => caught);
+      expect(error.reason).toBe("provenance_mismatch");
+      const shape = spy.mock.calls.map(call => String(call[0]))
+        .find(line => line.includes("provenance shape"));
+      expect(shape).toContain("prefix=yes");
+      expect(shape).toContain("marker=yes");
+      expect(shape).toContain("invocation=no");
+
+      spy.mockClear();
+      // A malformed invocation id (not a 36-character uuid) is the same refusal.
+      const shortId = `${HEADER}\nUSER: x\n${MARKER}\ninvocation_id="not-a-uuid"`;
+      const second = await assertPreflightDraftSafe(
+        fixture({ mention: "fixture", text: shortId }).page,
+        { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } },
+      ).catch(caught => caught);
+      expect(second.reason).toBe("provenance_mismatch");
+      expect(spy.mock.calls.map(call => String(call[0]))
+        .find(line => line.includes("provenance shape"))).toContain("invocation=no");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("still refuses a differently named chip as connector_token_text", async () => {
+    const error = await assertPreflightDraftSafe(
+      fixture({ mention: "some-other-connector", text: composed() }).page,
+      { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } },
+    ).catch(caught => caught);
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.reason).toBe("connector_token_text");
+  });
+
+  it("never admits text without an owned token, and refuses it as text_present", async () => {
+    // No chip at all: provenance names a shape, not a licence to clear text.
+    const error = await assertPreflightDraftSafe(
+      fixture({ text: composed() }).page,
+      { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } },
+    ).catch(caught => caught);
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.reason).toBe("text_present");
+    expect(JSON.stringify(error)).not.toContain("planning request");
+  });
+
+  it("applies the Expand and paste-marker exemptions under the provenance proof", async () => {
+    // The provenance proof is a combined proof like the owned text, so the
+    // long-draft expander and the paste marker are chrome over content this
+    // call introduced.
+    const { page } = fixture({
+      mention: "fixture", text: composed(),
+      controls: [{ ariaLabel: "Expand" }],
+      rich: [{
+        tagName: "P", attributes: [{ name: "data-prompt-literal-paste", value: "" }], textContent: composed(),
+      }],
+    });
+    await expect(assertPreflightDraftSafe(page, { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } }))
+      .resolves.toBeUndefined();
+
+    // Without the provenance proof both still refuse exactly as before.
+    const noProof = await assertPreflightDraftSafe(
+      fixture({ mention: "fixture", text: composed(), controls: [{ ariaLabel: "Expand" }] }).page,
+      { connector: "fixture" },
+    ).catch(caught => caught);
+    expect(noProof.reason).toBe("unknown_control:Expand");
+  });
+});
