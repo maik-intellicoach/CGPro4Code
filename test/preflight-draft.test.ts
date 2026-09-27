@@ -47,11 +47,12 @@ function fixture(initial: Partial<State> = {}) {
         querySelector: () => state.attachment ? {} : null,
         querySelectorAll: () => controls.map(control => ({
           closest: () => null,
-          matches: (selector: string) => (!!control.testid && selector.includes(`data-testid="${control.testid}"`))
-            || (!!control.ariaLabel && selector.includes(`aria-label="${control.ariaLabel}"`)),
+          matches: (selector: string) => (control.tagName ?? "BUTTON") !== "BUTTON" ? false
+            : (!!control.testid && selector.includes(`data-testid="${control.testid}"`))
+              || (!!control.ariaLabel && selector.includes(`aria-label="${control.ariaLabel}"`)),
           getAttribute: (name: string) => name === "data-testid" ? (control.testid ?? "")
             : name === "aria-label" ? (control.ariaLabel ?? null) : null,
-          tagName: "BUTTON",
+          tagName: control.tagName ?? "BUTTON",
         })),
       };
       const composer = { isConnected: true, getClientRects: () => [{}], innerText: tokenTexts.join("") + state.text, cloneNode: () => copy,
@@ -72,7 +73,7 @@ function fixture(initial: Partial<State> = {}) {
 interface State {
   text: string; attachment: boolean; file: boolean; mention: string; mentions?: string[]; unknown: boolean;
   readable: boolean; count: number; form: boolean; unknownButton: boolean; unknownTestId: string;
-  controls: Array<{ testid?: string; ariaLabel?: string }>; url: string;
+  controls: Array<{ testid?: string; ariaLabel?: string; tagName?: string }>; url: string;
 }
 const options = { model: "gpt-6-pro" as const, connector: "fixture", gizmoId: "project", expectedAccountEmail: "fixture@example.com" };
 
@@ -222,6 +223,53 @@ describe("draft-safe interaction preflight", () => {
       { ariaLabel: "Select ChatGPT model" },
     ] });
     await expect(assertPreflightDraftSafe(page)).resolves.toBeUndefined();
+  });
+
+  // P-035 2026-09-27. The same empty home composer also shows the dictation
+  // (microphone) and voice-mode buttons; with the `+` admitted the lane refused
+  // `unknown_control:Dictate|Start Voice`. Both are UI chrome with no draft
+  // content, admitted here by the exact identifier the refusal names.
+  it("admits an empty composer holding Dictate and Start Voice alongside the allowlisted controls", async () => {
+    const { page } = fixture({ controls: [
+      { ariaLabel: "Add files and more" },
+      { ariaLabel: "Dictate" },
+      { ariaLabel: "Start Voice" },
+      { testid: "send-button" },
+      { ariaLabel: "Select ChatGPT model" },
+    ] });
+    await expect(assertPreflightDraftSafe(page)).resolves.toBeUndefined();
+  });
+
+  it("admits a Dictate or Start Voice button identified by testid as well as aria-label", async () => {
+    const byTestid = fixture({ controls: [{ testid: "Dictate" }, { testid: "Start Voice" }] });
+    await expect(assertPreflightDraftSafe(byTestid.page)).resolves.toBeUndefined();
+  });
+
+  it("still refuses a Dictate control that is not a button, or is not an exact identifier match", async () => {
+    const notAButton = await assertPreflightDraftSafe(
+      fixture({ controls: [{ ariaLabel: "Dictate", tagName: "DIV" }] }).page,
+    ).catch(error => error);
+    expect(notAButton).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(notAButton.reason).toBe("unknown_control:Dictate");
+
+    const dictationSuffix = await assertPreflightDraftSafe(
+      fixture({ controls: [{ ariaLabel: "Dictate now" }] }).page,
+    ).catch(error => error);
+    expect(dictationSuffix.reason).toBe("unknown_control:Dictate now");
+
+    const voiceSuffix = await assertPreflightDraftSafe(
+      fixture({ controls: [{ ariaLabel: "Start Voice Recording X" }] }).page,
+    ).catch(error => error);
+    expect(voiceSuffix.reason).toBe("unknown_control:Start Voice Recording X");
+  });
+
+  it("still refuses typed text with the Dictate and Start Voice controls present", async () => {
+    const { page } = fixture({ text: "private user draft",
+      controls: [{ ariaLabel: "Dictate" }, { ariaLabel: "Start Voice" }] });
+    const error = await assertPreflightDraftSafe(page).catch(error => error);
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.reason).toBe("text_present");
+    expect(JSON.stringify(error)).not.toContain("private user draft");
   });
 
   it("names every unknown control at once, de-duplicated in DOM order", async () => {

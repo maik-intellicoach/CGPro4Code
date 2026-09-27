@@ -2202,6 +2202,14 @@ export async function assertPreflightDraftSafe(
         if (composer.contains(control) || control.closest('[role="menu"], [role="listbox"]')) continue;
         if (control.matches('button[data-testid="composer-plus-btn"], button[aria-label="Add files and more"], button[data-testid="send-button"], button[data-testid="composer-send-button"], button[aria-label="Select ChatGPT model"], button.__composer-pill[aria-haspopup="menu"], button[data-testid="model-switcher-dropdown-button"]')) continue;
         const id = identify(control);
+        // P-035 2026-09-27. The empty home composer also carries its dictation
+        // (microphone) and voice-mode buttons, so the same lane refused
+        // `unknown_control:Dictate|Start Voice`. Both are UI chrome with no
+        // draft content. Admit a `button` whose OWN sanitized identifier -- the
+        // exact string the refusal names -- is `Dictate` or `Start Voice`;
+        // nothing else, exact match only, and never `[role="button"]` on
+        // another tag. Checked after `matches` so the allowlist is unchanged.
+        if (control.tagName === "BUTTON" && (id === "Dictate" || id === "Start Voice")) continue;
         if (unknownControls.length < 5 && !unknownControls.includes(id)) unknownControls.push(id);
       }
       if (unknownControls.length > 0) return `unknown_control:${unknownControls.join("|")}`.slice(0, 200);
