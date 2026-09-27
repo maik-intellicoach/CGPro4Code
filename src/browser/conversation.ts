@@ -3546,6 +3546,110 @@ export function currentConversationId(page: Page): string | null {
 }
 
 /**
+ * P-035 G2 r22 (2026-09-28). Content-free heartbeat for the silent turn wait.
+ *
+ * Live ms1980 (vendor 1dbb6bf): a routed acceptance (invocation 5f46e486)
+ * passed preflight, connector selection and `prompt_submitted`, then produced
+ * `connector_tool_count 0` and `response_bytes 0` for 3000 s until the client
+ * cancelled it. The daemon log showed nothing after submission: this loop
+ * waits silently, so a page error, a limit screen and an endless thinking
+ * state are indistinguishable from outside. One bounded diagnostic line per
+ * minute makes the next turn readable without another paid probe.
+ *
+ * Observation only: it never admits, refuses, navigates, reloads, cancels or
+ * extends the wait, and every page read is swallowed on failure, so a page
+ * that cannot answer any of these questions leaves the pre-existing behaviour
+ * exactly as it was. It never prints page text, an attribute value, a
+ * conversation id or a URL -- only counts and yes/no flags.
+ */
+const TURN_HEARTBEAT_INTERVAL_MS = 60_000;
+const TURN_ALERT_SELECTOR = '[role="alert"], [role="status"], [data-testid*="toast"]';
+const TURN_ERROR_HINT_RE = /something went wrong|error|network|try again|regenerate/i;
+const TURN_LIMIT_HINT_RE = /limit|usage|reached|upgrade|try again after/i;
+
+/**
+ * Visible alert/status/toast elements on the page, plus their concatenated
+ * text. The text stays local: only the visible count and two hint booleans
+ * derived from it ever leave this function. Hidden matches are skipped for
+ * both the count and the text, so the count and the hints describe the same
+ * set of elements.
+ */
+async function readTurnAlerts(page: Page): Promise<{ count: number; text: string }> {
+  const alerts = page.locator(TURN_ALERT_SELECTOR);
+  const total = await alerts.count();
+  let visible = 0;
+  let text = "";
+  for (let i = 0; i < total; i++) {
+    const el = alerts.nth(i);
+    if (!(await el.isVisible())) continue;
+    visible++;
+    text += `${(await el.innerText().catch(() => "")) ?? ""}\n`;
+  }
+  return { count: visible, text };
+}
+
+/**
+ * Build the single diagnostic line from counts and flags only. Any read that a
+ * page cannot answer propagates to the caller, which owns the try/catch.
+ */
+async function readTurnHeartbeatLine(
+  page: Page,
+  elapsedMs: number,
+  priorAssistantCount: number,
+): Promise<string> {
+  const count = await page.locator(SELECTORS.assistantMessages.join(", ")).count();
+  const stop = (await firstResolved(page, SELECTORS.stopButton)) !== null;
+  const bubble = await latestAssistantBubble(page);
+  const streaming =
+    bubble === null
+      ? null
+      : await bubble.getAttribute("data-message-streaming").catch(() => null);
+  const bubbleText = bubble === null ? "" : ((await bubble.innerText().catch(() => "")) ?? "");
+  const alerts = await readTurnAlerts(page);
+  const composer = (await firstResolved(page, SELECTORS.composer)) !== null;
+  const conversation = currentConversationId(page) !== null;
+  // Hints come from the alert/status/toast text and the latest assistant
+  // bubble only, and leave this function as booleans.
+  const haystack = `${alerts.text}\n${bubbleText}`;
+  const yesNo = (value: boolean): string => (value ? "yes" : "no");
+  return [
+    "[cgpro:turn]",
+    `t=${Math.floor(elapsedMs / 1_000)}`,
+    `assistant=${count}/${priorAssistantCount}`,
+    `working=${yesNo(stop || streaming === "true")}`,
+    `stop=${yesNo(stop)}`,
+    `bubble_len=${count > priorAssistantCount ? bubbleText.trim().length : 0}`,
+    `conv=${yesNo(conversation)}`,
+    `composer=${yesNo(composer)}`,
+    `alerts=${alerts.count}`,
+    `error_hint=${yesNo(TURN_ERROR_HINT_RE.test(haystack))}`,
+    `limit_hint=${yesNo(TURN_LIMIT_HINT_RE.test(haystack))}`,
+  ].join(" ");
+}
+
+/**
+ * At most one heartbeat line per 60 s of the wait, the first one 60 s after
+ * entry. Errors are swallowed here so the heartbeat can never change the turn.
+ */
+function turnHeartbeat(page: Page, priorAssistantCount: number): () => Promise<void> {
+  const startedAt = Date.now();
+  let lastEmittedAt: number | null = null;
+  return async (): Promise<void> => {
+    try {
+      const now = Date.now();
+      const elapsed = now - startedAt;
+      if (elapsed < TURN_HEARTBEAT_INTERVAL_MS) return;
+      if (lastEmittedAt !== null && now - lastEmittedAt < TURN_HEARTBEAT_INTERVAL_MS) return;
+      lastEmittedAt = now;
+      console.error(await readTurnHeartbeatLine(page, elapsed, priorAssistantCount));
+    } catch {
+      // Diagnostic only: a page that cannot answer the heartbeat's reads must
+      // not change the wait it observes.
+    }
+  };
+}
+
+/**
  * Wait until the assistant has produced and completed a new response.
  *
  *  1. Wait for a NEW assistant bubble (count > priorAssistantCount).
@@ -3578,9 +3682,11 @@ export async function waitTurnComplete(
   let deadline = Date.now() + timeoutMs;
   let lastText = "";
   let lastChangedAt = Date.now();
+  const heartbeat = turnHeartbeat(page, priorAssistantCount);
 
   for (;;) {
     if (control.cancelled?.()) return;
+    await heartbeat();
     await control.pollEvidence?.(Date.now() >= deadline);
     if (control.cancelled?.()) return;
     if (control.externalComplete?.()) return;
