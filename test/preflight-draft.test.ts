@@ -1173,12 +1173,15 @@ describe("foreign text refusal shape", () => {
       // The whole line, so the shape is proved to carry nothing else: a visible
       // div, no role or testid, not hidden, the trimmed length, no connector
       // match, and -- r18 -- the six appended features for the same one word.
-      // The refused text itself never appears.
+      // The refused text itself never appears. r29 appends the six header
+      // fields; with no provenance proof in force every one of them is `n/a`.
       expect(shapeLineOf(spy)).toBe(
         "[cgpro:preflight] foreign text shape: tag=DIV role=- testid=- hidden=no len=1 "
         + "equals_connector=no contains_connector=no equals_placeholder=none "
         + "equals_composer_text=no words=1 path=DIV labels=0 "
-        + "contains_prefix=n/a contains_marker=n/a contains_text=n/a",
+        + "contains_prefix=n/a contains_marker=n/a contains_text=n/a "
+        + "header_at=n/a header_run=n/a have_char=n/a want_char=n/a "
+        + "alnum_contains=n/a alnum_header_at=n/a",
       );
 
       spy.mockClear();
@@ -1894,5 +1897,154 @@ describe("Markdown-escaped hidden mirror of the proven draft (r28)", () => {
       fixture({ mention: CONNECTOR, ...mirrorOf(escapedComposed()) }).page,
       { connector: CONNECTOR },
     )).toBe("foreign_text");
+  });
+});
+
+// P-035 2026-09-28 r29. Live evidence 05:26 (vendor b95141e, Intelli pid 74466):
+// the single provenance discard passed the full proof on the VISIBLE composer,
+// yet the hidden mirror (`tag=SPAN hidden=aria len=3141 path=SPAN<FORM`) still
+// reported `contains_connector=yes contains_marker=yes contains_prefix=no` even
+// after r28 unescaped it. The header is present in words but not as a literal
+// substring, so the planner needs to know exactly how it differs inside the
+// mirror without a character of it: where the header sits, how far it agrees,
+// the CLASS of the first divergence, and the same question with every
+// non-letter and non-digit removed. These cases prove each new field and that
+// admission is unchanged: the new fields are diagnostic only.
+describe("hidden-mirror header divergence shape (r29)", () => {
+  const CONNECTOR = "fixture";
+  const MARKER = "<!-- CGPRO-PLANNING-INVOCATION-V1 -->";
+  const UUID = "0f8fad5b-d9cb-469f-a165-70867728950e";
+  // A header whose Markdown list item sits beyond character 40, so the first-40
+  // anchor is present inside a starred mirror even though the full header is not.
+  const HEADER = "planning system header v1 lane=intelli facade=planning - item one";
+  const composed = (header = HEADER, request = "the different planning request"): string =>
+    `${header}\nUSER: ${request}\n${MARKER}\ninvocation_id="${UUID}"`;
+  const mirrorOf = (body: string) =>
+    ({ foreignText: body, foreignParent: { tagName: "SPAN", ariaHidden: true } });
+  const shapeLineOf = (spy: { mock: { calls: unknown[][] } }): string =>
+    spy.mock.calls.map(call => String(call[0])).find(line => line.includes("foreign text shape")) ?? "";
+  const headerAtOf = (line: string): number => Number(/header_at=(-?\d+)/.exec(line)?.[1]);
+
+  it("names a Markdown list star rendered for the header's hyphen as have_char=P:2a want_char=P:2d", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // The composer holds the header with a Markdown hyphen; the hidden mirror
+      // serialises that same list item with a star, so the header is present in
+      // words but not as a literal substring and the mirror refuses.
+      const starred = composed(HEADER.replace(" - item one", " * item one"));
+      const error = await assertPreflightDraftSafe(
+        fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(`${CONNECTOR} ${starred}`) }).page,
+        { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+      ).catch(caught => caught);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("foreign_text");
+      const line = shapeLineOf(spy);
+      expect(line).toContain("contains_prefix=no");
+      expect(line).toContain("alnum_contains=yes");
+      expect(line).toContain("have_char=P:2a");
+      expect(line).toContain("want_char=P:2d");
+      expect(headerAtOf(line)).toBeGreaterThan(0);
+      expect(line).toContain("header_run=55");
+      // Content-free: neither the header word nor a character of the page text.
+      expect(line).not.toContain("item");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("reports alnum_contains=no when the mirror's header changes a word", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const changed = composed(HEADER.replace("planning system header v1", "planning system header changed"));
+      const error = await assertPreflightDraftSafe(
+        fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(`${CONNECTOR} ${changed}`) }).page,
+        { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+      ).catch(caught => caught);
+      expect(error.reason).toBe("foreign_text");
+      const line = shapeLineOf(spy);
+      expect(line).toContain("contains_prefix=no");
+      expect(line).toContain("alnum_contains=no");
+      expect(line).toContain("contains_marker=yes");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("reports header_at>0 when the mirror starts with extra wrapper text", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // The header's first 40 characters sit AFTER the wrapper, so the anchor is
+      // found at a positive index even though the starred tail still refuses.
+      const starred = composed(HEADER.replace(" - item one", " * item one"));
+      const error = await assertPreflightDraftSafe(
+        fixture({
+          mention: CONNECTOR, text: composed(),
+          ...mirrorOf(`extra wrapper text ${CONNECTOR} ${starred}`),
+        }).page,
+        { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+      ).catch(caught => caught);
+      expect(error.reason).toBe("foreign_text");
+      const line = shapeLineOf(spy);
+      expect(headerAtOf(line)).toBeGreaterThan(0);
+      expect(line).toContain("alnum_contains=yes");
+      expect(line).toContain("alnum_header_at=");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("prints n/a for every new field without a provenance proof", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // A chip-only composer, so admission reaches the foreign-text walk; the
+      // call names only its connector, so no provenance proof is in force and
+      // every header field is `n/a`.
+      const error = await assertPreflightDraftSafe(
+        fixture({ mention: CONNECTOR, ...mirrorOf("fixture outside draft") }).page,
+        { connector: CONNECTOR },
+      ).catch(caught => caught);
+      expect(error.reason).toBe("foreign_text");
+      const line = shapeLineOf(spy);
+      expect(line).toContain("contains_prefix=n/a");
+      expect(line).toContain("header_at=n/a");
+      expect(line).toContain("header_run=n/a");
+      expect(line).toContain("have_char=n/a");
+      expect(line).toContain("want_char=n/a");
+      expect(line).toContain("alnum_contains=n/a");
+      expect(line).toContain("alnum_header_at=n/a");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("never logs a letter or digit from the page text", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // A fixture whose page text carries a unique word and a unique digit-bearing
+      // token; if any new field printed a character of the page, one would appear.
+      const uniqueWord = "zqxwvuk";
+      const uniqueToken = "q7z9";
+      const changed = composed(HEADER.replace("planning system header v1", "planning system header changed"));
+      const error = await assertPreflightDraftSafe(
+        fixture({
+          mention: CONNECTOR, text: composed(),
+          ...mirrorOf(`${CONNECTOR} ${uniqueWord} ${uniqueToken} ${changed}`),
+        }).page,
+        { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+      ).catch(caught => caught);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("foreign_text");
+      const line = shapeLineOf(spy);
+      expect(line).toContain("foreign text shape:");
+      expect(line).not.toContain(uniqueWord);
+      expect(line).not.toContain(uniqueToken);
+      // Every new field prints only a fixed class/number vocabulary.
+      expect(line).toMatch(/header_at=(-?\d+|n\/a) header_run=(\d+|n\/a) /);
+      expect(line).toMatch(/have_char=(ws|P:[0-9a-f]+|L|N|O:[A-Za-z]{2}|end|n\/a) /);
+      expect(line).toMatch(/want_char=(ws|P:[0-9a-f]+|L|N|O:[A-Za-z]{2}|end|n\/a) /);
+      expect(line).toMatch(/alnum_contains=(yes|no|n\/a) alnum_header_at=(-?\d+|n\/a)$/);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

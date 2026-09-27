@@ -2207,6 +2207,25 @@ interface ForeignTextShape {
   containsPrefix: string;
   containsMarker: string;
   containsText: string;
+  /**
+   * P-035 2026-09-28 r29. The refused node passed chip identity and (under a
+   * provenance proof) still failed the mirror rule, so the planner needs to
+   * know HOW the header differs inside the mirror without a character of it.
+   * With `m = norm(unescape(nodeText))` and `p = norm(provenance.prefix)`:
+   * `header_at` is where `p`'s first 40 characters sit in `m` (`-1` when
+   * absent), `header_run` is the common run from there, and `have_char` /
+   * `want_char` classify the first position after that run (`end` when a side
+   * ran out). `alnum_contains` and `alnum_header_at` repeat the question with
+   * every non-letter and non-digit removed, so a punctuation-only divergence
+   * shows as `yes` with the header found. All six are `n/a` without a
+   * provenance proof. Never a character from the page: classes and counts only.
+   */
+  headerAt: string;
+  headerRun: string;
+  haveChar: string;
+  wantChar: string;
+  alnumContains: string;
+  alnumHeaderAt: string;
   equalsPlaceholder: string;
   equalsComposerText: string;
   words: number;
@@ -2320,6 +2339,33 @@ export async function assertPreflightDraftSafe(
         let index = 0;
         while (index < max && a[index] === b[index]) index += 1;
         return index;
+      };
+      // P-035 2026-09-28 r29. The content-free CLASS of one code point, so a
+      // header divergence can be named in a live line without ever printing a
+      // character from the page: `ws` for whitespace, `P:<hex code point>` for
+      // ASCII punctuation or symbol (e.g. `P:2a` for `*`, `P:2d` for `-`),
+      // `L` for any letter, `N` for any digit, and `O:<general category>` for
+      // anything else (`O:Po`, `O:Sm`, `O:Cf`, ...); `end` when a side ran out.
+      // The category is found by testing the property escapes in turn, since JS
+      // exposes no direct general-category accessor; unmatched is `Cn`.
+      const generalCategories: Array<[RegExp, string]> = [
+        [/\p{Mn}/u, "Mn"], [/\p{Mc}/u, "Mc"], [/\p{Me}/u, "Me"],
+        [/\p{Pc}/u, "Pc"], [/\p{Pd}/u, "Pd"], [/\p{Ps}/u, "Ps"], [/\p{Pe}/u, "Pe"],
+        [/\p{Pi}/u, "Pi"], [/\p{Pf}/u, "Pf"], [/\p{Po}/u, "Po"],
+        [/\p{Sm}/u, "Sm"], [/\p{Sc}/u, "Sc"], [/\p{Sk}/u, "Sk"], [/\p{So}/u, "So"],
+        [/\p{Zs}/u, "Zs"], [/\p{Zl}/u, "Zl"], [/\p{Zp}/u, "Zp"],
+        [/\p{Cc}/u, "Cc"], [/\p{Cf}/u, "Cf"], [/\p{Cs}/u, "Cs"], [/\p{Co}/u, "Co"],
+      ];
+      const charClass = (character: string | undefined): string => {
+        if (character === undefined) return "end";
+        if (/\s/u.test(character)) return "ws";
+        if (/[\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E]/.test(character)) {
+          return `P:${(character.codePointAt(0) ?? 0).toString(16)}`;
+        }
+        if (/\p{L}/u.test(character)) return "L";
+        if (/\p{N}/u.test(character)) return "N";
+        const match = generalCategories.find(([pattern]) => pattern.test(character));
+        return `O:${match ? match[1] : "Cn"}`;
       };
       /** UI chrome only for a control: data-testid, else aria-label, else tag name. */
       const identify = (element: { getAttribute?: (name: string) => string | null; tagName?: string }): string => {
@@ -2663,6 +2709,45 @@ export async function assertPreflightDraftSafe(
         // not in force. Booleans only, never any character of the node.
         const unescaped = unescape(text);
         const mirror = norm(unescaped);
+        // P-035 2026-09-28 r29. Where the normalised planning header sits in the
+        // normalised mirror, how far it agrees, and the class of the first
+        // position where it stops agreeing -- all six fields `n/a` without a
+        // provenance proof. Content-free by construction: indexes, counts and
+        // character CLASSES only, never a character of the page.
+        let headerAt = "n/a";
+        let headerRun = "n/a";
+        let haveChar = "n/a";
+        let wantChar = "n/a";
+        let alnumContains = "n/a";
+        let alnumHeaderAt = "n/a";
+        if (owned.provenance !== undefined) {
+          const proof = norm(owned.provenance.prefix);
+          const at = mirror.indexOf(proof.slice(0, 40));
+          headerAt = String(at);
+          if (at === -1) {
+            // The header's leading 40 characters are absent from the mirror, so
+            // no aligned run exists to classify.
+            headerRun = "0";
+          } else {
+            const mirrorTail = Array.from(mirror.slice(at));
+            const proofChars = Array.from(proof);
+            let run = 0;
+            while (run < mirrorTail.length && run < proofChars.length
+              && mirrorTail[run] === proofChars[run]) run += 1;
+            headerRun = String(run);
+            haveChar = charClass(mirrorTail[run]);
+            wantChar = charClass(proofChars[run]);
+          }
+          // The same question with every non-letter and non-digit removed, so a
+          // punctuation-only divergence (Markdown `-` rendered as `*`, say)
+          // still reports the header as present in words.
+          const reduceAlnum = (value: string): string =>
+            value.replace(/[^\p{L}\p{N}]/gu, "").toLowerCase();
+          const mirrorAlnum = reduceAlnum(mirror);
+          const proofAlnum = reduceAlnum(proof);
+          alnumContains = mirrorAlnum.includes(proofAlnum) ? "yes" : "no";
+          alnumHeaderAt = String(mirrorAlnum.indexOf(proofAlnum.slice(0, 40)));
+        }
         // Parent-first tag names of the ancestor chain, form included, capped
         // at 8. Tags only: no attribute value and no descendant text.
         const path = chain.slice(0, 8).map(element => chrome(element.tagName ?? "")).join("<");
@@ -2687,6 +2772,12 @@ export async function assertPreflightDraftSafe(
             ? "n/a" : unescaped.includes(owned.provenance.marker) ? "yes" : "no",
           containsText: owned.text === undefined
             ? "n/a" : mirror.includes(norm(owned.text)) ? "yes" : "no",
+          headerAt,
+          headerRun,
+          haveChar,
+          wantChar,
+          alnumContains,
+          alnumHeaderAt,
           equalsPlaceholder: placeholderValues.length === 0
             ? "none" : placeholderValues.includes(text) ? "yes" : "no",
           equalsComposerText: text === composerText ? "yes" : "no",
@@ -2786,6 +2877,7 @@ export async function assertPreflightDraftSafe(
         const {
           tag, role, testid, hidden, len, equalsConnector, containsConnector,
           containsPrefix, containsMarker, containsText,
+          headerAt, headerRun, haveChar, wantChar, alnumContains, alnumHeaderAt,
           equalsPlaceholder, equalsComposerText, words, path, labels,
         } = outcome.foreignShape;
         console.error(
@@ -2793,7 +2885,9 @@ export async function assertPreflightDraftSafe(
           + `hidden=${hidden} len=${len} equals_connector=${equalsConnector} `
           + `contains_connector=${containsConnector} equals_placeholder=${equalsPlaceholder} `
           + `equals_composer_text=${equalsComposerText} words=${words} path=${path} labels=${labels} `
-          + `contains_prefix=${containsPrefix} contains_marker=${containsMarker} contains_text=${containsText}`,
+          + `contains_prefix=${containsPrefix} contains_marker=${containsMarker} contains_text=${containsText} `
+          + `header_at=${headerAt} header_run=${headerRun} have_char=${haveChar} want_char=${wantChar} `
+          + `alnum_contains=${alnumContains} alnum_header_at=${alnumHeaderAt}`,
         );
       }
       // P-035 2026-09-28 r25. Exactly one content-free shape line for the
