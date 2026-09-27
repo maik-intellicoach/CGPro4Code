@@ -2258,18 +2258,47 @@ interface ProvenanceShape {
   len: number;
 }
 
+/**
+ * P-035 2026-09-28 r31. Live evidence 05:54 (vendor e15e417, Intelli pid 50146):
+ * provenance mode admitted the owned draft on the FIRST provenance call, then
+ * the final empty check refused `rich_attr:data-composer-inline-atom-selected`
+ * -> `draft_persisted`. The token branch above found no outermost
+ * `[contenteditable="false"]` token, so the refusing node is some inline atom
+ * that survived the clear and is not a token. The shape names it without a
+ * character of the page: the sanitised tag, the sanitised `contenteditable`
+ * value, counts of the node and of the composer it sat in, whether its trimmed
+ * text equals the owned connector, and its depth below the composer. Counts and
+ * tag names only, never page text and never any other attribute value.
+ */
+interface RichAttrShape {
+  tag: string;
+  ce: string;
+  textLen: number;
+  children: number;
+  childTags: string;
+  composerLen: number;
+  composerWords: number;
+  tokens: number;
+  atoms: number;
+  equalsConnector: string;
+  depth: number;
+}
+
 /** The content-free diagnostics a single refusal may carry beside its reason. */
 type PreflightDiagnostic =
   | {
     reason: string; chipRemainder: { len: number; ws: number; cf: number; other: number };
     foreignShape?: undefined; ownedTextShape?: undefined; provenanceShape?: undefined;
+    richAttrShape?: undefined;
   }
   | { reason: string; foreignShape: ForeignTextShape; chipRemainder?: undefined; ownedTextShape?: undefined;
-    provenanceShape?: undefined }
+    provenanceShape?: undefined; richAttrShape?: undefined }
   | { reason: string; ownedTextShape: OwnedTextShape; chipRemainder?: undefined; foreignShape?: undefined;
-    provenanceShape?: undefined }
+    provenanceShape?: undefined; richAttrShape?: undefined }
   | { reason: string; provenanceShape: ProvenanceShape; chipRemainder?: undefined; foreignShape?: undefined;
-    ownedTextShape?: undefined };
+    ownedTextShape?: undefined; richAttrShape?: undefined }
+  | { reason: string; richAttrShape: RichAttrShape; chipRemainder?: undefined; foreignShape?: undefined;
+    ownedTextShape?: undefined; provenanceShape?: undefined };
 
 /**
  * Read-only, content-free admission for the no-submit preflight. Unknown rich
@@ -2527,6 +2556,44 @@ export async function assertPreflightDraftSafe(
         element.tagName === "P"
         && (element.textContent ?? "").trim() === ""
         && Array.from(element.children).every(child => child.tagName === "BR");
+      // P-035 2026-09-28 r31. Content-free shape of a `rich_attr` refusal. The
+      // clone already had the owned token removed, so its trimmed text and word
+      // count are what SURVIVED that removal; the token and inline-atom counts
+      // come from the ORIGINAL composer, where the token is still present. Tag
+      // names, counts, the sanitised `contenteditable` value and one
+      // yes/no/n/a only: never page text, never any other attribute value.
+      const richAttrShape = (node: Element): RichAttrShape => {
+        const nodeText = node.textContent?.trim() ?? "";
+        let contentEditable: string | null = null;
+        try { contentEditable = node.getAttribute?.("contenteditable") ?? null; } catch { contentEditable = null; }
+        const editable = contentEditable === null ? "" : chrome(contentEditable);
+        const nodeChildren = Array.from(node.children ?? []);
+        const copyText = (copy.textContent ?? "").trim();
+        const originalTokens = Array.from(composer.querySelectorAll<HTMLElement>('[contenteditable="false"]'))
+          .filter(token => !token.parentElement?.closest('[contenteditable="false"]')).length;
+        const originalAtoms = Array.from(composer.querySelectorAll("*"))
+          .filter(element => Array.from(element.attributes ?? [])
+            .some(attribute => attribute.name.startsWith("data-composer-inline-atom"))).length;
+        // Ancestors from the node up to the composer clone, the composer itself
+        // included, so a node directly under the composer reads depth=1.
+        let depth = 1;
+        for (let element = node.parentElement; element && element !== copy; element = element.parentElement) {
+          depth += 1;
+        }
+        return {
+          tag: chrome(node.tagName ?? "") || "-",
+          ce: editable || "-",
+          textLen: nodeText.length,
+          children: nodeChildren.length,
+          childTags: nodeChildren.slice(0, 5).map(child => chrome(child.tagName ?? "") || "unknown").join(",") || "-",
+          composerLen: copyText.length,
+          composerWords: copyText.split(/\s+/).filter(Boolean).length,
+          tokens: originalTokens,
+          atoms: originalAtoms,
+          equalsConnector: owned.connector === undefined ? "n/a" : nodeText === owned.connector ? "yes" : "no",
+          depth,
+        };
+      };
       for (const child of Array.from(copy.querySelectorAll("*"))) {
         if (!/^(P|BR|SPAN|STRONG|EM|B|I|CODE|PRE|UL|OL|LI)$/.test(child.tagName)) return `rich_node:${chrome(child.tagName) || "unknown"}`;
         if (placeholderParagraph(child)) continue;
@@ -2547,7 +2614,14 @@ export async function assertPreflightDraftSafe(
           const name = chrome(attribute.name) || "unknown";
           if (refusedAttributes.length < 5 && !refusedAttributes.includes(name)) refusedAttributes.push(name);
         }
-        if (refusedAttributes.length > 0) return `rich_attr:${refusedAttributes.join("|")}`.slice(0, 200);
+        if (refusedAttributes.length > 0) {
+          // The reason string is unchanged and admission is unchanged; only the
+          // refusal now carries the content-free shape of the refusing node.
+          return {
+            reason: `rich_attr:${refusedAttributes.join("|")}`.slice(0, 200),
+            richAttrShape: richAttrShape(child),
+          };
+        }
       }
       let text = composer instanceof HTMLTextAreaElement ? composer.value : composer.innerText;
       // The token branch above already proved exactly one outermost token
@@ -2933,6 +3007,21 @@ export async function assertPreflightDraftSafe(
         console.error(
           `[cgpro:preflight] provenance shape: prefix=${prefix ? "yes" : "no"} `
           + `marker=${marker ? "yes" : "no"} invocation=${invocation ? "yes" : "no"} len=${len}`,
+        );
+      }
+      // P-035 2026-09-28 r31. Exactly one content-free shape line for the
+      // rich-attribute refusal, so one live round names what survived the clear
+      // without a character of page text: tag names, counts, the sanitised
+      // `contenteditable` value and one yes/no/n/a only.
+      if (outcome.richAttrShape) {
+        const {
+          tag, ce, textLen, children, childTags, composerLen, composerWords, tokens, atoms, equalsConnector, depth,
+        } = outcome.richAttrShape;
+        console.error(
+          `[cgpro:preflight] rich attr shape: tag=${tag} ce=${ce} text_len=${textLen} `
+          + `children=${children} child_tags=${childTags} composer_len=${composerLen} `
+          + `composer_words=${composerWords} tokens=${tokens} atoms=${atoms} `
+          + `equals_connector=${equalsConnector} depth=${depth}`,
         );
       }
     }

@@ -85,16 +85,30 @@ function fixture(initial: Partial<State> = {}) {
       for (const root of tokenRoots) buildToken(root, null);
       const tokenTopTexts = tokenRoots.map(node => node.textContent ?? "");
       // Synthetic rich nodes carry the real shape the guard reads: tagName,
-      // an attributes list, own textContent, and element children.
-      const materialize = (node: RichNode): object => ({
-        tagName: node.tagName,
-        attributes: (node.attributes ?? []).map(attribute => ({ name: attribute.name, value: attribute.value ?? "" })),
-        textContent: node.textContent ?? "",
-        children: (node.children ?? []).map(materialize),
-      });
+      // an attributes list, own textContent, and element children. r31 adds a
+      // real `parentElement` chain (rooted at the given parent) and a
+      // `getAttribute`, so the content-free rich-attr shape can read the
+      // sanitised `contenteditable` value and the node's depth below the
+      // composer without any test-only branch in the guard.
+      const materialize = (node: RichNode, parent: unknown = null): object => {
+        const element: {
+          tagName: string; attributes: Array<{ name: string; value: string }>; textContent: string;
+          children: object[]; parentElement: unknown; getAttribute: (name: string) => string | null;
+        } = {
+          tagName: node.tagName,
+          attributes: (node.attributes ?? []).map(attribute => ({ name: attribute.name, value: attribute.value ?? "" })),
+          textContent: node.textContent ?? "",
+          children: [],
+          parentElement: parent,
+          getAttribute: (name: string) => (node.attributes ?? [])
+            .find(attribute => attribute.name === name)?.value ?? null,
+        };
+        element.children = (node.children ?? []).map(child => materialize(child, element));
+        return element;
+      };
       const richNodes = state.rich ?? (state.unknown ? [{ tagName: "CUSTOM-TOKEN", attributes: [] }] : []);
       const copy = { textContent: state.text, querySelectorAll: (selector: string) => selector === "*"
-        ? richNodes.map(materialize) : tokens };
+        ? richNodes.map(node => materialize(node, copy)) : tokens };
       // Form controls answer `matches` the way CSS attribute selectors would, so
       // the guard's real allowlist string decides admission, not the fixture.
       const controls = state.controls.length > 0
@@ -146,9 +160,20 @@ function fixture(initial: Partial<State> = {}) {
         // on its descendants, and only ever compares their trimmed values.
         getAttribute: (name: string) => (state.composerAttributes ?? [])
           .find(attribute => attribute.name === name)?.value ?? null,
-        querySelectorAll: () => (state.composerDescendants ?? []).map(attribute => ({
-          getAttribute: (name: string) => name === attribute.name ? attribute.value : null,
-        })) };
+        // r31: the ORIGINAL composer answers the two selectors the rich-attr
+        // shape reads -- its outermost tokens and its inline-atom descendants --
+        // while `*` still carries the r18 placeholder descendants the foreign
+        // shape scans. The rich nodes double as the composer's own contents, so
+        // an inline atom the clone holds is present in the original too.
+        querySelectorAll: (selector: string) => {
+          if (selector === '[contenteditable="false"]') return tokens;
+          return [
+            ...richNodes.map(node => materialize(node, composer)),
+            ...(state.composerDescendants ?? []).map(attribute => ({
+              getAttribute: (name: string) => name === attribute.name ? attribute.value : null,
+            })),
+          ];
+        } };
       const document = {
         body: { childNodes: state.count ? [composer] : [] },
         querySelectorAll: (selector: string) => selector === 'input[type="file"]'
@@ -667,6 +692,104 @@ describe("draft-safe interaction preflight", () => {
     ] });
     const firstError = await assertPreflightDraftSafe(first.page).catch(error => error);
     expect(firstError.reason).toBe("rich_node:DIV");
+  });
+
+  // P-035 2026-09-28 r31. Live evidence 05:54 (vendor e15e417, Intelli pid
+  // 50146): provenance mode admitted the owned draft, then the final empty
+  // check refused `rich_attr:data-composer-inline-atom-selected` ->
+  // `draft_persisted`. The token branch ran BEFORE the rich-node loop and found
+  // no token, so the refusing node is an inline atom, not an outermost
+  // `[contenteditable="false"]` token. The reason string and admission are
+  // unchanged; the refusal now carries one content-free shape line naming the
+  // node and the composer it sat in, so the next live round says what survived
+  // the clear without ever printing page text.
+  it("names a rich-attribute refusal with a content-free shape of the node and composer", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { page } = fixture({ rich: [{
+        tagName: "SPAN", attributes: [{ name: "data-composer-inline-atom-selected", value: "" }],
+        textContent: "x",
+      }] });
+      const error = await assertPreflightDraftSafe(page).catch(error => error);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("rich_attr:data-composer-inline-atom-selected");
+      const line = spy.mock.calls.map(call => String(call[0]))
+        .find(candidate => candidate.includes("rich attr shape"));
+      expect(line).toBe(
+        "[cgpro:preflight] rich attr shape: tag=SPAN ce=- text_len=1 children=0 child_tags=- "
+        + "composer_len=0 composer_words=0 tokens=0 atoms=1 equals_connector=n/a depth=1",
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("reports the rich-attribute shape against the owned connector", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { page } = fixture({ rich: [{
+        tagName: "SPAN", attributes: [{ name: "data-composer-inline-atom-selected", value: "" }],
+        textContent: "x",
+      }] });
+      // The owned connector equals the refusing node's own trimmed text.
+      const error = await assertPreflightDraftSafe(page, { connector: "x" }).catch(error => error);
+      expect(error.reason).toBe("rich_attr:data-composer-inline-atom-selected");
+      const line = spy.mock.calls.map(call => String(call[0]))
+        .find(candidate => candidate.includes("rich attr shape"));
+      expect(line).toContain("equals_connector=yes");
+
+      // Without a connector the same node reads `n/a`.
+      spy.mockClear();
+      const bare = await assertPreflightDraftSafe(page).catch(error => error);
+      expect(bare.reason).toBe("rich_attr:data-composer-inline-atom-selected");
+      const bareLine = spy.mock.calls.map(call => String(call[0]))
+        .find(candidate => candidate.includes("rich attr shape"));
+      expect(bareLine).toContain("equals_connector=n/a");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("reports an empty inline atom as text_len=0 and composer_len=0", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { page } = fixture({ rich: [{
+        tagName: "SPAN", attributes: [{ name: "data-composer-inline-atom-selected", value: "" }],
+      }] });
+      const error = await assertPreflightDraftSafe(page).catch(error => error);
+      expect(error.reason).toBe("rich_attr:data-composer-inline-atom-selected");
+      const line = spy.mock.calls.map(call => String(call[0]))
+        .find(candidate => candidate.includes("rich attr shape"));
+      expect(line).toContain("text_len=0");
+      expect(line).toContain("composer_len=0");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("never puts page text into the rich-attribute shape line", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { page } = fixture({
+        text: "zorblequux",
+        rich: [{
+          tagName: "SPAN", attributes: [{ name: "data-composer-inline-atom-selected", value: "zorblequux" }],
+          textContent: "zorblequux",
+        }],
+      });
+      const error = await assertPreflightDraftSafe(page).catch(error => error);
+      expect(error.reason).toBe("rich_attr:data-composer-inline-atom-selected");
+      const line = spy.mock.calls.map(call => String(call[0]))
+        .find(candidate => candidate.includes("rich attr shape"));
+      expect(line).toContain("rich attr shape:");
+      // The unique word appears in the node text and in the composer, so the
+      // shape must name only counts: not the word, not any fragment of it.
+      expect(line).not.toContain("zorblequux");
+      expect(line).not.toContain("zorb");
+      expect(error.message).not.toContain("zorblequux");
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   // P-035 2026-09-28 r24. ChatGPT tags each paragraph our automation pasted
