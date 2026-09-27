@@ -2609,7 +2609,18 @@ export async function assertPreflightDraftSafe(
           // the text comparison still decides admission, so a foreign draft
           // beside it refuses exactly as before. Every other attribute on the
           // node -- and this attribute without an owned text -- refuse unchanged.
-          if (combinedProof && attribute.name === "data-prompt-literal-paste") continue;
+          // P-035 2026-09-28 r32. Our own `clearComposer` presses `Meta+A`
+          // before `Backspace`, and the editor marks every selected node with
+          // `data-composer-inline-atom-selected`. That attribute is TRANSIENT
+          // SELECTION STATE this call's own keystroke created, not draft
+          // content, so it refuses on the same terms as the r24 paste marker:
+          // skipped only while a combined proof is in force (the text or the
+          // provenance comparison still decides admission), and every other
+          // attribute on the node -- and this attribute without an owned proof
+          // -- refuses unchanged.
+          if (combinedProof
+            && (attribute.name === "data-prompt-literal-paste"
+              || attribute.name === "data-composer-inline-atom-selected")) continue;
           if (!/^(data-|contenteditable|role|aria-|hidden|style)/.test(attribute.name)) continue;
           const name = chrome(attribute.name) || "unknown";
           if (refusedAttributes.length < 5 && !refusedAttributes.includes(name)) refusedAttributes.push(name);

@@ -832,6 +832,74 @@ describe("draft-safe interaction preflight", () => {
     expect(extra.reason).toBe("rich_attr:data-other");
   });
 
+  // P-035 2026-09-28 r32. `clearComposer` presses `Meta+A` before `Backspace`,
+  // and our own Select-All makes the editor mark every selected node with
+  // `data-composer-inline-atom-selected`. Live ms (pid 43491, vendor 5b42230)
+  // admitted the owned draft and then refused
+  // `rich_attr:data-composer-inline-atom-selected` on a `tag=BR` node before
+  // Backspace could run. That attribute is transient selection state our own
+  // keystroke created, so it is skipped on exactly the r24 terms: only while a
+  // combined text-or-provenance proof is in force, and never carrying a
+  // neighbouring attribute past the check.
+  it("admits our own Select-All marker on every node it covers, only while a combined proof is in force", async () => {
+    const SELECTED = "data-composer-inline-atom-selected";
+    // The live shape: a P holding the draft and a BR beside it, each carrying
+    // the marker our Select-All added.
+    const marked = (text: string) => fixture({
+      mention: "fixture", text,
+      rich: [
+        { tagName: "P", attributes: [{ name: SELECTED, value: "" }], textContent: text },
+        { tagName: "BR", attributes: [{ name: SELECTED, value: "" }] },
+      ],
+    });
+    const HEADER = "planning system header v1\nlane=intelli facade=planning";
+    const MARKER = "[cgpro:composed-invocation]";
+    const proved = `${HEADER}\nUSER: the different planning request\n${MARKER}\ninvocation_id="0f8fad5b-d9cb-469f-a165-70867728950e"`;
+
+    // Provenance proof: admitted, marker and all.
+    await expect(assertPreflightDraftSafe(
+      marked(proved).page, { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } },
+    )).resolves.toBeUndefined();
+
+    // Owned exact-text proof: admitted too, and the text check still decides.
+    await expect(assertPreflightDraftSafe(
+      marked("owned probe").page, { connector: "fixture", text: "owned probe" },
+    )).resolves.toBeUndefined();
+
+    // With no owned proof at all the same node still refuses unchanged.
+    const nobody = await assertPreflightDraftSafe(
+      fixture({
+        text: "owned probe",
+        rich: [
+          { tagName: "P", attributes: [{ name: SELECTED, value: "" }], textContent: "owned probe" },
+          { tagName: "BR", attributes: [{ name: SELECTED, value: "" }] },
+        ],
+      }).page,
+    ).catch(error => error);
+    expect(nobody).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(nobody.reason).toBe(`rich_attr:${SELECTED}`);
+
+    // With only the connector -- a chip but no proof of the draft -- the same
+    // attribute refuses exactly as before.
+    const chipOnly = await assertPreflightDraftSafe(
+      marked("owned probe").page, { connector: "fixture" },
+    ).catch(error => error);
+    expect(chipOnly).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(chipOnly.reason).toBe(`rich_attr:${SELECTED}`);
+
+    // A second attribute on the same marked node is still refused, and named.
+    const extra = await assertPreflightDraftSafe(fixture({
+      mention: "fixture", text: proved,
+      rich: [{
+        tagName: "P",
+        attributes: [{ name: SELECTED, value: "" }, { name: "data-foo", value: "" }],
+        textContent: proved,
+      }],
+    }).page, { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } }).catch(error => error);
+    expect(extra).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(extra.reason).toBe("rich_attr:data-foo");
+  });
+
   it("names a typed-text refusal text_present without leaking the draft", async () => {
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
