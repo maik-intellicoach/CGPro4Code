@@ -1177,7 +1177,8 @@ describe("foreign text refusal shape", () => {
       expect(shapeLineOf(spy)).toBe(
         "[cgpro:preflight] foreign text shape: tag=DIV role=- testid=- hidden=no len=1 "
         + "equals_connector=no contains_connector=no equals_placeholder=none "
-        + "equals_composer_text=no words=1 path=DIV labels=0",
+        + "equals_composer_text=no words=1 path=DIV labels=0 "
+        + "contains_prefix=n/a contains_marker=n/a contains_text=n/a",
       );
 
       spy.mockClear();
@@ -1733,6 +1734,165 @@ describe("hidden mirror of the proven draft (r27)", () => {
     expect(await reasonOf(
       fixture({ mention: CONNECTOR, text: TEXT, ...mirrorOf(`${CONNECTOR} the planning prompt this lane`) }).page,
       { connector: CONNECTOR, text: TEXT },
+    )).toBe("foreign_text");
+  });
+});
+
+// P-035 2026-09-28 r28. The live refusal at vendor 26cb6e0: chip identity and
+// the provenance proof both passed, then the foreign-text walk refused
+// `foreign_text` on a hidden span holding a Markdown/HTML SERIALISATION of the
+// whole draft (3141 chars, 435 words). A serialisation escapes the characters
+// the composer renders literally -- backslash escapes (`\-`, `\*`, `\_`) and
+// HTML entities (`&lt;`, `&gt;`, `&amp;`, ...) -- so the r27 substring
+// comparison saw a different string. These cases prove the mirror is unescaped
+// before it is judged, that the shape line now names which part of the proof
+// failed, and that unescaping admits nothing the proof did not already name.
+describe("Markdown-escaped hidden mirror of the proven draft (r28)", () => {
+  const CONNECTOR = "fixture";
+  const OWNED = "the planning prompt with * emphasis and _underscore_";
+  const HEADER = "planning system header v1\nlane=intelli facade=planning";
+  const MARKER = "<!-- CGPRO-PLANNING-INVOCATION-V1 -->";
+  const UUID = "0f8fad5b-d9cb-469f-a165-70867728950e";
+  const composed = (request = "the different planning request"): string =>
+    `${HEADER}\nUSER: ${request}\n${MARKER}\ninvocation_id="${UUID}"`;
+  // A hand-written Markdown/HTML serialisation of the composed draft: the
+  // header's `=` and the marker's characters arrive escaped, exactly the motifs
+  // the r28 vendor live refusal carried.
+  const escapedComposed = (request = "the different planning request"): string =>
+    `${CONNECTOR} planning system header v1\n`
+    + `lane\\=intelli facade\\=planning\n`
+    + `USER: ${request}\n`
+    + `&lt;\\!-- CGPRO-PLANNING-INVOCATION-V1 --&gt;\n`
+    + `invocation_id\\="${UUID}"`;
+  const escapedOwned = (): string => OWNED.replace(/([*_])/g, "\\$1");
+  const mirrorOf = (body: string, ariaHidden = true) =>
+    ({ foreignText: body, foreignParent: { tagName: "SPAN", ariaHidden } });
+  const shapeLineOf = (spy: { mock: { calls: unknown[][] } }): string =>
+    spy.mock.calls.map(call => String(call[0])).find(line => line.includes("foreign text shape")) ?? "";
+  const reasonOf = async (page: Page, owned: { text?: string; connector?: string;
+    provenance?: { prefix: string; marker: string } }) =>
+    (await assertPreflightDraftSafe(page, owned).then(() => undefined).catch(caught => caught))?.reason;
+
+  it("admits a hidden span holding the Markdown-escaped whole serialised draft", async () => {
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(escapedComposed()) }).page,
+      { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+    )).resolves.toBeUndefined();
+
+    // The aria-hidden ancestor need not be the direct parent.
+    await expect(assertPreflightDraftSafe(
+      fixture({
+        mention: CONNECTOR, text: composed(),
+        foreignText: escapedComposed(),
+        foreignParent: { tagName: "SPAN" },
+        foreignAncestors: [{ tagName: "DIV", ariaHidden: true }],
+      }).page,
+      { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+    )).resolves.toBeUndefined();
+  });
+
+  it("admits an escaped mirror of the owned text, and needs every proven part", async () => {
+    // The whole owned text is present (escaped), so the extra non-escaped word
+    // beside it does not matter: every proven part is still required, and all of
+    // them are there.
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: CONNECTOR, text: OWNED,
+        ...mirrorOf(`${CONNECTOR} ${escapedOwned()} and a stranger\\'s aside`) }).page,
+      { connector: CONNECTOR, text: OWNED },
+    )).resolves.toBeUndefined();
+
+    // One proven part missing: the escaped mirror refuses.
+    expect(await reasonOf(
+      fixture({ mention: CONNECTOR, text: OWNED,
+        ...mirrorOf(`${CONNECTOR} the planning prompt with \\* emphasis`) }).page,
+      { connector: CONNECTOR, text: OWNED },
+    )).toBe("foreign_text");
+  });
+
+  it("refuses an escaped mirror that differs by a real word as contains_prefix=no", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const changed = escapedComposed().replace("planning system header v1", "planning system header changed");
+      const error = await assertPreflightDraftSafe(
+        fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(changed) }).page,
+        { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+      ).catch(caught => caught);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("foreign_text");
+      const line = shapeLineOf(spy);
+      expect(line).toContain("contains_prefix=no");
+      expect(line).toContain("contains_marker=yes");
+      expect(line).toContain("contains_text=n/a");
+      // Content-free: neither the refused mirror nor the proof text appears.
+      expect(line).not.toContain("planning system header changed");
+      expect(line).not.toContain(MARKER);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("refuses an escaped mirror without the marker as contains_marker=no", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const noMarker = `${CONNECTOR} planning system header v1\nlane\\=intelli facade\\=planning\n`
+        + `USER: the different planning request\ninvocation_id\\="${UUID}"`;
+      const error = await assertPreflightDraftSafe(
+        fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(noMarker) }).page,
+        { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+      ).catch(caught => caught);
+      expect(error.reason).toBe("foreign_text");
+      const line = shapeLineOf(spy);
+      expect(line).toContain("contains_prefix=yes");
+      expect(line).toContain("contains_marker=no");
+      expect(line).toContain("contains_text=n/a");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("does not decode an entity twice, and names contains_text for the text proof", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // `&amp;lt;` is a single-escaped ampersand, so it decodes to `&lt;`, never
+      // to `<`: the marker does not appear and the mirror refuses.
+      const doubleEscaped = `${CONNECTOR} planning system header v1\nlane\\=intelli facade\\=planning\n`
+        + `USER: the different planning request\n&amp;lt;\!\\-\\- CGPRO-PLANNING-INVOCATION-V1 \\-\\-&amp;gt;\n`
+        + `invocation_id\\="${UUID}"`;
+      const error = await assertPreflightDraftSafe(
+        fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(doubleEscaped) }).page,
+        { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+      ).catch(caught => caught);
+      expect(error.reason).toBe("foreign_text");
+      const line = shapeLineOf(spy);
+      expect(line).toContain("contains_prefix=yes");
+      expect(line).toContain("contains_marker=no");
+
+      spy.mockClear();
+      // Text mode: a refused escaped mirror names the exact-text comparison.
+      await assertPreflightDraftSafe(
+        fixture({ mention: CONNECTOR, text: OWNED, ...mirrorOf(`${CONNECTOR} a wholly different draft`) }).page,
+        { connector: CONNECTOR, text: OWNED },
+      ).catch(caught => caught);
+      const textLine = shapeLineOf(spy);
+      expect(textLine).toContain("contains_text=no");
+      expect(textLine).toContain("contains_prefix=n/a");
+      expect(textLine).toContain("contains_marker=n/a");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("still refuses a visible escaped copy and one with no owned proof", async () => {
+    // Visible (not aria-hidden): the mirror rule needs the aria-hidden ancestor.
+    expect(await reasonOf(
+      fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(escapedComposed(), false) }).page,
+      { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+    )).toBe("foreign_text");
+
+    // Hidden, but this call named neither an owned text nor a provenance triple.
+    expect(await reasonOf(
+      fixture({ mention: CONNECTOR, ...mirrorOf(escapedComposed()) }).page,
+      { connector: CONNECTOR },
     )).toBe("foreign_text");
   });
 });

@@ -530,4 +530,46 @@ describe("POST /discard-owned-draft provenance mode", () => {
       expect(presses).toEqual([]);
     });
   });
+
+  // P-035 2026-09-28 r28. Live 2026-09-28 05:13 SGT (vendor 26cb6e0): the same
+  // hidden mirror is a Markdown/HTML SERIALISATION, so the composer's rendered
+  // characters arrive backslash-escaped (`\-`, `\*`, `\_`) and HTML-escaped
+  // (`&lt;`, `&gt;`). The r27 comparison saw a different string and refused.
+  // Unescaping the mirror first admits exactly the copy of the draft the proof
+  // already named, and still refuses a mirror missing a proven part.
+  describe("Markdown-escaped hidden mirror of the proven draft (r28)", () => {
+    const escaped = (request = "the different planning request with \\* and \\_ marks"): string =>
+      `${CONNECTOR} planning system header v1\n`
+      + `lane\\=intelli facade\\=planning\n`
+      + `USER: ${request}\n`
+      + `\\[cgpro:composed\\-invocation\\]\n`
+      + `invocation_id\\="${UUID}"`;
+
+    it("clears a composed draft whose hidden mirror is a Markdown-escaped copy", async () => {
+      const { page, presses, click } = fixture({
+        text: composed(), mirror: { text: escaped(), ariaHidden: true },
+      });
+      const result = await discard(stateFor(page), { connector: CONNECTOR, prefix: HEADER, marker: MARKER });
+      expect(result.status).toBe(200);
+      expect(JSON.parse(result.body)).toEqual({ cleared: true });
+      // Proof before the clear, one clear only, and the lane re-proven empty
+      // after a fresh home (the escaped mirror went with the draft).
+      expect(presses).toEqual(["Meta+A", "Backspace"]);
+      expect(click).toHaveBeenCalledTimes(1);
+      expect(goHome).toHaveBeenCalledTimes(2);
+    });
+
+    it("refuses a Markdown-escaped mirror missing the marker and touches nothing", async () => {
+      const noMarker = `${CONNECTOR} planning system header v1\nlane\\=intelli facade\\=planning\n`
+        + `USER: the different planning request\ninvocation_id\\="${UUID}"`;
+      const { page, click, presses } = fixture({
+        text: composed(), mirror: { text: noMarker, ariaHidden: true },
+      });
+      const result = await discard(stateFor(page), { connector: CONNECTOR, prefix: HEADER, marker: MARKER });
+      expect(result.status).toBe(409);
+      expect(JSON.parse(result.body)).toEqual({ error: "draft_not_owned", reason: "foreign_text" });
+      expect(presses).toEqual([]);
+      expect(click).not.toHaveBeenCalled();
+    });
+  });
 });

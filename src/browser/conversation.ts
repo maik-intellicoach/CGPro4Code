@@ -2197,6 +2197,16 @@ interface ForeignTextShape {
   len: number;
   equalsConnector: string;
   containsConnector: string;
+  /**
+   * P-035 2026-09-28 r28. Which part of the in-force proof the refused node
+   * agrees with, so a live refusal names it without any character of the node.
+   * `contains_prefix` and `contains_marker` are `yes`/`no` under a provenance
+   * proof and `n/a` without one; `contains_text` is `yes`/`no` under an exact
+   * owned-text proof and `n/a` without one.
+   */
+  containsPrefix: string;
+  containsMarker: string;
+  containsText: string;
   equalsPlaceholder: string;
   equalsComposerText: string;
   words: number;
@@ -2280,6 +2290,23 @@ export async function assertPreflightDraftSafe(
       // must still match exactly and in order; only the whitespace between them
       // is forgiven.
       const norm = (value: string): string => value.replace(/\s+/g, " ").trim();
+      // P-035 2026-09-28 r28. The hidden composer mirror is a Markdown/HTML
+      // serialisation of the draft, so the same content arrives with backslash
+      // escapes (`\-`, `\*`, `\_`) and HTML entities (`&lt;`, `&gt;`, `&amp;`,
+      // `&quot;`, `&#39;`, `&#x27;`, `&nbsp;`) instead of the literal characters
+      // the composer renders. Undo exactly that escaping, in ONE pass, before
+      // the mirror is compared to the proof: first drop the backslash before an
+      // ASCII punctuation character, then decode exactly those seven entities
+      // (`&nbsp;` to a space). Entities are decoded once, so an escaped entity
+      // (`&amp;lt;`) stays an escaped entity rather than being decoded twice.
+      // Only the mirror text is unescaped; the owned proof is never transformed.
+      const entityMap: Record<string, string> = {
+        "&lt;": "<", "&gt;": ">", "&amp;": "&", "&quot;": "\"",
+        "&#39;": "'", "&#x27;": "'", "&nbsp;": " ",
+      };
+      const unescape = (value: string): string => value
+        .replace(/\\([!-\/:-@\[-`{-~])/g, "$1")
+        .replace(/&(?:lt|gt|amp|quot|#39|#x27|nbsp);/g, entity => entityMap[entity] ?? entity);
       // P-035 2026-09-28 r26. Two ownership proofs can be in force: the exact
       // owned text (r23/r24) and, mutually exclusive with it, the provenance
       // triple. Both name the whole draft this call introduced, so the `Expand`
@@ -2629,6 +2656,13 @@ export async function assertPreflightDraftSafe(
         } catch { /* not a DOM element */ }
         const composerText = ((composer instanceof HTMLTextAreaElement
           ? composer.value : composer.innerText) ?? "").trim();
+        // P-035 2026-09-28 r28. Which part of the in-force proof this refused
+        // node agrees with, judged the way the r27 mirror rule judges it: on the
+        // unescaped, normalised text for the prefix and the exact owned text, and
+        // on the unescaped text for the literal marker. `n/a` when that proof is
+        // not in force. Booleans only, never any character of the node.
+        const unescaped = unescape(text);
+        const mirror = norm(unescaped);
         // Parent-first tag names of the ancestor chain, form included, capped
         // at 8. Tags only: no attribute value and no descendant text.
         const path = chain.slice(0, 8).map(element => chrome(element.tagName ?? "")).join("<");
@@ -2647,6 +2681,12 @@ export async function assertPreflightDraftSafe(
             ? "n/a" : text === owned.connector ? "yes" : "no",
           containsConnector: owned.connector === undefined
             ? "n/a" : text.includes(owned.connector) ? "yes" : "no",
+          containsPrefix: owned.provenance === undefined
+            ? "n/a" : mirror.includes(norm(owned.provenance.prefix)) ? "yes" : "no",
+          containsMarker: owned.provenance === undefined
+            ? "n/a" : unescaped.includes(owned.provenance.marker) ? "yes" : "no",
+          containsText: owned.text === undefined
+            ? "n/a" : mirror.includes(norm(owned.text)) ? "yes" : "no",
           equalsPlaceholder: placeholderValues.length === 0
             ? "none" : placeholderValues.includes(text) ? "yes" : "no",
           equalsComposerText: text === composerText ? "yes" : "no",
@@ -2699,12 +2739,19 @@ export async function assertPreflightDraftSafe(
         // text or provenance this rule never applies, so r19 and every other
         // refusal are unchanged.
         if (ownedToken && owned.connector && hiddenByAria(node)) {
-          const mirror = norm(nodeText);
+          // r28: the mirror is a Markdown/HTML serialisation, so it is unescaped
+          // first. The connector, the exact owned text and the planning header
+          // are compared on the unescaped, normalised mirror; the literal marker
+          // is compared on the unescaped mirror (its own spacing is part of the
+          // marker, never normalised away). Nothing else changes: this still
+          // needs an admitted owned token and an owned proof.
+          const unescaped = unescape(nodeText);
+          const mirror = norm(unescaped);
           const mirrorsOwned = owned.text !== undefined
             ? mirror.includes(norm(owned.text))
             : owned.provenance !== undefined
               && mirror.includes(norm(owned.provenance.prefix))
-              && nodeText.includes(owned.provenance.marker);
+              && unescaped.includes(owned.provenance.marker);
           if (mirror.includes(owned.connector) && mirrorsOwned) continue;
         }
         return { reason: "foreign_text", foreignShape: foreignShape(node) };
@@ -2737,14 +2784,16 @@ export async function assertPreflightDraftSafe(
       // as before.
       if (outcome.foreignShape) {
         const {
-          tag, role, testid, hidden, len, equalsConnector,
-          containsConnector, equalsPlaceholder, equalsComposerText, words, path, labels,
+          tag, role, testid, hidden, len, equalsConnector, containsConnector,
+          containsPrefix, containsMarker, containsText,
+          equalsPlaceholder, equalsComposerText, words, path, labels,
         } = outcome.foreignShape;
         console.error(
           `[cgpro:preflight] foreign text shape: tag=${tag} role=${role} testid=${testid} `
           + `hidden=${hidden} len=${len} equals_connector=${equalsConnector} `
           + `contains_connector=${containsConnector} equals_placeholder=${equalsPlaceholder} `
-          + `equals_composer_text=${equalsComposerText} words=${words} path=${path} labels=${labels}`,
+          + `equals_composer_text=${equalsComposerText} words=${words} path=${path} labels=${labels} `
+          + `contains_prefix=${containsPrefix} contains_marker=${containsMarker} contains_text=${containsText}`,
         );
       }
       // P-035 2026-09-28 r25. Exactly one content-free shape line for the
