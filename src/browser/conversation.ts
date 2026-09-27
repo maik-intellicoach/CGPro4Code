@@ -2222,11 +2222,33 @@ export async function assertPreflightDraftSafe(
       }
       // Only familiar text formatting is admissible. Unrecognised rich nodes
       // (including empty mentions) fail closed even when their text is empty.
+      //
+      // P-035 2026-09-27. On this account's empty home composer the editor
+      // renders its placeholder paragraph as `<p data-empty-paragraph="">` --
+      // vendor UI chrome for an empty draft, not content. Admit that ONE
+      // attribute in exactly that shape: only on a P, only while the P's own
+      // trimmed text is empty, and only while its element children are BR
+      // alone. Every other refused attribute on that node still refuses, and
+      // `data-empty-paragraph` on any other tag or on a P with text still
+      // refuses. The refusal now names EVERY refused attribute on the FIRST
+      // refusing node (de-duplicated, DOM attribute order, at most 5, whole
+      // code capped at 200) so any further variant attribute shows up in one
+      // round. Attribute names only, never a value: still content-free.
+      const placeholderParagraph = (element: Element): boolean =>
+        element.tagName === "P"
+        && (element.textContent ?? "").trim() === ""
+        && Array.from(element.children).every(child => child.tagName === "BR");
       for (const child of Array.from(copy.querySelectorAll("*"))) {
         if (!/^(P|BR|SPAN|STRONG|EM|B|I|CODE|PRE|UL|OL|LI)$/.test(child.tagName)) return `rich_node:${chrome(child.tagName) || "unknown"}`;
-        const badAttribute = Array.from(child.attributes)
-          .find(a => /^(data-|contenteditable|role|aria-|hidden|style)/.test(a.name));
-        if (badAttribute) return `rich_attr:${chrome(badAttribute.name) || "unknown"}`;
+        const emptyPlaceholder = placeholderParagraph(child);
+        const refusedAttributes: string[] = [];
+        for (const attribute of Array.from(child.attributes)) {
+          if (!/^(data-|contenteditable|role|aria-|hidden|style)/.test(attribute.name)) continue;
+          if (emptyPlaceholder && attribute.name === "data-empty-paragraph") continue;
+          const name = chrome(attribute.name) || "unknown";
+          if (refusedAttributes.length < 5 && !refusedAttributes.includes(name)) refusedAttributes.push(name);
+        }
+        if (refusedAttributes.length > 0) return `rich_attr:${refusedAttributes.join("|")}`.slice(0, 200);
       }
       let text = composer instanceof HTMLTextAreaElement ? composer.value : composer.innerText;
       // The token branch above already proved exactly one A token carrying the

@@ -36,8 +36,17 @@ function fixture(initial: Partial<State> = {}) {
       if (!state.readable) throw new Error("synthetic evaluation failure with private content");
       const tokenTexts = state.mentions ?? (state.mention ? [state.mention] : []);
       const tokens = tokenTexts.map(textContent => ({ tagName: "A", textContent, remove() {} }));
+      // Synthetic rich nodes carry the real shape the guard reads: tagName,
+      // an attributes list, own textContent, and element children.
+      const materialize = (node: RichNode): object => ({
+        tagName: node.tagName,
+        attributes: (node.attributes ?? []).map(attribute => ({ name: attribute.name, value: attribute.value ?? "" })),
+        textContent: node.textContent ?? "",
+        children: (node.children ?? []).map(materialize),
+      });
+      const richNodes = state.rich ?? (state.unknown ? [{ tagName: "CUSTOM-TOKEN", attributes: [] }] : []);
       const copy = { textContent: state.text, querySelectorAll: (selector: string) => selector === "*"
-        ? (state.unknown ? [{ tagName: "CUSTOM-TOKEN", attributes: [] }] : []) : tokens };
+        ? richNodes.map(materialize) : tokens };
       // Form controls answer `matches` the way CSS attribute selectors would, so
       // the guard's real allowlist string decides admission, not the fixture.
       const controls = state.controls.length > 0
@@ -70,10 +79,16 @@ function fixture(initial: Partial<State> = {}) {
   } as unknown as Page;
   return { state, page, session: { page } as Session };
 }
+interface RichNode {
+  tagName: string;
+  attributes?: Array<{ name: string; value?: string }>;
+  textContent?: string;
+  children?: RichNode[];
+}
 interface State {
   text: string; attachment: boolean; file: boolean; mention: string; mentions?: string[]; unknown: boolean;
   readable: boolean; count: number; form: boolean; unknownButton: boolean; unknownTestId: string;
-  controls: Array<{ testid?: string; ariaLabel?: string; tagName?: string }>; url: string;
+  controls: Array<{ testid?: string; ariaLabel?: string; tagName?: string }>; url: string; rich?: RichNode[];
 }
 const options = { model: "gpt-6-pro" as const, connector: "fixture", gizmoId: "project", expectedAccountEmail: "fixture@example.com" };
 
@@ -318,6 +333,59 @@ describe("draft-safe interaction preflight", () => {
     expect(error.reason).toBe(expected);
     expect(error.reason.length).toBeLessThanOrEqual(200);
     expect(error.reason).not.toContain(`${"f".repeat(60)}`);
+  });
+
+  // P-035 2026-09-27. Live ms1980 (vendor 52e8ed6): with every composer control
+  // admitted, the empty home composer refused
+  // `rich_attr:data-empty-paragraph`. The editor renders its placeholder as
+  // `<p data-empty-paragraph="">`. Admit exactly that shape: a P, that one
+  // attribute, own text empty, element children only BR.
+  it("admits an empty composer whose editor holds the empty placeholder paragraph", async () => {
+    const bare = fixture({
+      rich: [{ tagName: "P", attributes: [{ name: "data-empty-paragraph", value: "" }] }],
+      controls: [{ ariaLabel: "Add files and more" }, { testid: "send-button" }],
+    });
+    await expect(assertPreflightDraftSafe(bare.page)).resolves.toBeUndefined();
+
+    const withBreak = fixture({ rich: [
+      { tagName: "P", attributes: [{ name: "data-empty-paragraph", value: "" }], children: [{ tagName: "BR" }] },
+    ] });
+    await expect(assertPreflightDraftSafe(withBreak.page)).resolves.toBeUndefined();
+  });
+
+  it("still refuses data-empty-paragraph on a P with text, another tag, or a second attribute", async () => {
+    const withText = await assertPreflightDraftSafe(fixture({ text: "private user draft",
+      rich: [{ tagName: "P", attributes: [{ name: "data-empty-paragraph", value: "" }], textContent: "private user draft" }],
+    }).page).catch(error => error);
+    expect(withText.reason).toBe("rich_attr:data-empty-paragraph");
+    expect(JSON.stringify(withText)).not.toContain("private user draft");
+
+    const otherTag = await assertPreflightDraftSafe(fixture({
+      rich: [{ tagName: "SPAN", attributes: [{ name: "data-empty-paragraph", value: "" }] }],
+    }).page).catch(error => error);
+    expect(otherTag.reason).toBe("rich_attr:data-empty-paragraph");
+
+    const extraAttribute = await assertPreflightDraftSafe(fixture({
+      rich: [{ tagName: "P",
+        attributes: [{ name: "data-empty-paragraph", value: "" }, { name: "data-foo", value: "x" }] }],
+    }).page).catch(error => error);
+    expect(extraAttribute.reason).toBe("rich_attr:data-foo");
+  });
+
+  // P-035 2026-09-27. The rich-node refusal now names every refused attribute on
+  // the first refusing node, so a further variant attribute shows up in one round.
+  it("names every refused attribute on the first refusing node, de-duplicated", async () => {
+    const { page } = fixture({ rich: [{ tagName: "P", attributes: [{ name: "data-a" }, { name: "data-b" }] }] });
+    const error = await assertPreflightDraftSafe(page).catch(error => error);
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.reason).toBe("rich_attr:data-a|data-b");
+
+    const first = fixture({ rich: [
+      { tagName: "DIV", attributes: [{ name: "role" }] },
+      { tagName: "P", attributes: [{ name: "data-c" }, { name: "contenteditable" }] },
+    ] });
+    const firstError = await assertPreflightDraftSafe(first.page).catch(error => error);
+    expect(firstError.reason).toBe("rich_node:DIV");
   });
 
   it("names a typed-text refusal text_present without leaking the draft", async () => {
