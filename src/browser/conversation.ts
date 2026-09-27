@@ -2160,6 +2160,26 @@ export async function setConnector(page: Page, name: string, protectDraft = fals
 }
 
 /**
+ * Content-free shape of the text node a `foreign_text` refusal stopped on:
+ * the parent tag, its sanitised role and nearest sanitised `data-testid`, why
+ * it is hidden, the trimmed text length, and whether that text is the owned
+ * connector. Never the text and never any other attribute value.
+ */
+interface ForeignTextShape {
+  tag: string;
+  role: string;
+  testid: string;
+  hidden: string;
+  len: number;
+  equalsConnector: string;
+}
+
+/** The content-free diagnostics a single refusal may carry beside its reason. */
+type PreflightDiagnostic =
+  | { reason: string; chipRemainder: { len: number; ws: number; cf: number; other: number }; foreignShape?: undefined }
+  | { reason: string; foreignShape: ForeignTextShape; chipRemainder?: undefined };
+
+/**
  * Read-only, content-free admission for the no-submit preflight. Unknown rich
  * nodes or controls are protected, not converted into a text backup. Only the
  * exact probe text, the single connector token introduced by this call, or that
@@ -2178,7 +2198,7 @@ export async function assertPreflightDraftSafe(
   let safe = false;
   let reason: string | null = null;
   try {
-    const outcome = await page.evaluate(({ selector, owned }) => {
+    const outcome = await page.evaluate(({ selector, owned }): true | string | PreflightDiagnostic => {
       // P-035 2026-09-27. The guard still answers a single bit: `true` admits,
       // a string is the FIRST check that refused, named by a closed, content-free
       // reason code. The branch order and every condition are exactly as before,
@@ -2395,12 +2415,53 @@ export async function assertPreflightDraftSafe(
         }
       }
       // Non-control text outside the editable region may be a rich draft chip.
+      //
+      // P-035 2026-09-28 r17. This is the one refusal that named no node: live
+      // ms1980 refused `foreign_text` on a composer whose only visible content
+      // was this call's own chip, so the refusing text node is probably UI
+      // chrome (a hidden mirror, tooltip or live region) rather than a draft.
+      // The reason stays `foreign_text` and admission is unchanged; only the
+      // refusal now carries a content-free shape of that node -- parent tag,
+      // sanitised role, the nearest sanitised `data-testid` within the form,
+      // why it is hidden, the trimmed text length, and whether that text is the
+      // owned connector. Never the text, never any other attribute value.
+      const inForm = (element: Element | null): boolean =>
+        !!element && (element === form || form.contains(element));
+      const foreignShape = (node: Node): ForeignTextShape => {
+        const parent = node.parentElement;
+        const text = node.textContent?.trim() ?? "";
+        // Ancestors WITHIN the form only: the walk is over `form`, so the scan
+        // stops at the form element instead of escaping it.
+        const chain: Element[] = [];
+        for (let element = parent; inForm(element); element = element?.parentElement ?? null) {
+          chain.push(element as Element);
+          if (element === form) break;
+        }
+        const hidden = chain.some(element => element.getAttribute("aria-hidden") === "true") ? "aria"
+          : chain.some(element => element.hasAttribute("hidden")) ? "attr"
+            : parent && parent.getClientRects().length === 0 ? "layout"
+              : "no";
+        const testid = chain
+          .map(element => chrome(element.getAttribute("data-testid") ?? ""))
+          .find(candidate => candidate.length > 0) ?? "";
+        return {
+          tag: (parent && chrome(parent.tagName)) || "-",
+          role: (parent && chrome(parent.getAttribute("role") ?? "")) || "-",
+          testid: testid || "-",
+          hidden,
+          len: text.length,
+          equalsConnector: owned.connector === undefined
+            ? "n/a" : text === owned.connector ? "yes" : "no",
+        };
+      };
       const walker = document.createTreeWalker(form, NodeFilter.SHOW_TEXT);
       while (walker.nextNode()) {
         const node = walker.currentNode;
         if (!node.textContent?.trim() || composer.contains(node)) continue;
         const parent = node.parentElement;
-        if (!parent?.closest('button, [role="button"], [role="menu"], [role="listbox"]')) return "foreign_text";
+        if (!parent?.closest('button, [role="button"], [role="menu"], [role="listbox"]')) {
+          return { reason: "foreign_text", foreignShape: foreignShape(node) };
+        }
       }
       return true;
     }, { selector: joinSelectors(SELECTORS.composer), owned });
@@ -2414,6 +2475,17 @@ export async function assertPreflightDraftSafe(
       if (outcome.chipRemainder) {
         const { len, ws, cf, other } = outcome.chipRemainder;
         console.error(`[cgpro:preflight] chip remainder shape: len=${len} ws=${ws} cf=${cf} other=${other}`);
+      }
+      // P-035 2026-09-28 r17. Exactly one content-free shape line for the
+      // foreign-text refusal, so the next live round names the node class. It
+      // carries no text and no attribute value beyond the sanitised role and
+      // testid.
+      if (outcome.foreignShape) {
+        const { tag, role, testid, hidden, len, equalsConnector } = outcome.foreignShape;
+        console.error(
+          `[cgpro:preflight] foreign text shape: tag=${tag} role=${role} testid=${testid} `
+          + `hidden=${hidden} len=${len} equals_connector=${equalsConnector}`,
+        );
       }
     }
   } catch { /* Evaluation failure is unknown, never empty. */ }

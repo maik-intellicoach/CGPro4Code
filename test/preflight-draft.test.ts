@@ -102,6 +102,9 @@ function fixture(initial: Partial<State> = {}) {
         : state.unknownButton ? [{ testid: state.unknownTestId }] : [];
       const form = {
         querySelector: () => state.attachment ? {} : null,
+        // The shape line bounds its ancestor scan to the form, so the walk must
+        // see every synthetic foreign ancestor as inside it.
+        contains: () => true,
         querySelectorAll: () => controls.map(control => ({
           closest: () => null,
           matches: (selector: string) => (control.tagName ?? "BUTTON") !== "BUTTON" ? false
@@ -112,6 +115,27 @@ function fixture(initial: Partial<State> = {}) {
           tagName: control.tagName ?? "BUTTON",
         })),
       };
+      // P-035 2026-09-28 r17. The foreign text node's parent chain, so the
+      // content-free shape line can be proved: tag, role, nearest testid,
+      // hidden class and client rects all come from these synthetic ancestors.
+      const buildForeignAncestor = (node: ForeignAncestor, parent: unknown): unknown => ({
+        tagName: node.tagName ?? "DIV",
+        parentElement: parent,
+        contains: () => false,
+        // Not a button/menu/listbox ancestor: the walk stops here, as it would
+        // on a plain wrapper around a bare text node.
+        closest: () => null,
+        getAttribute: (name: string) => name === "role" ? (node.role ?? null)
+          : name === "data-testid" ? (node.testid ?? null)
+            : name === "aria-hidden" ? (node.ariaHidden ? "true" : null) : null,
+        hasAttribute: (name: string) => name === "hidden" ? !!node.hiddenAttr : false,
+        getClientRects: () => Array.from({ length: node.rects ?? 1 }, () => ({})),
+      });
+      let foreignParent: unknown = null;
+      for (const node of [state.foreignParent, ...(state.foreignAncestors ?? [])]
+        .filter((node): node is ForeignAncestor => !!node).reverse()) {
+        foreignParent = buildForeignAncestor(node, foreignParent);
+      }
       const composer = { isConnected: true, getClientRects: () => [{}],
         innerText: state.composerInnerText ?? (tokenTopTexts.join("") + state.text), cloneNode: () => copy,
         closest: () => state.form ? form : null, contains: () => false };
@@ -120,12 +144,15 @@ function fixture(initial: Partial<State> = {}) {
         querySelectorAll: (selector: string) => selector === 'input[type="file"]'
           ? [{ files: state.file ? [{}] : [] }] : Array.from({ length: state.count }, () => composer),
         // P-035 2026-09-28 r16. Models ONE text node outside the composer so a
-        // test can prove the foreign-text walk still runs after admission.
+        // test can prove the foreign-text walk still runs after admission. r17
+        // gives it a real parent chain, so the refusal's shape line is proved.
         createTreeWalker: () => {
           let served = false;
           return {
             nextNode: () => { if (served || !state.foreignText) return false; served = true; return true; },
-            get currentNode() { return { textContent: state.foreignText ?? "", parentElement: null }; },
+            get currentNode() {
+              return { textContent: state.foreignText ?? "", parentElement: foreignParent };
+            },
           };
         },
       };
@@ -156,6 +183,16 @@ interface FixtureToken {
   closest: () => FixtureToken;
   remove: () => void;
 }
+/** One synthetic ancestor of the foreign text node, nearest first. */
+interface ForeignAncestor {
+  tagName?: string;
+  role?: string;
+  testid?: string;
+  ariaHidden?: boolean;
+  hiddenAttr?: boolean;
+  /** Client rect count; `0` models a laid-out-hidden node. */
+  rects?: number;
+}
 interface State {
   text: string; attachment: boolean; file: boolean; mention: string; mentions?: string[]; unknown: boolean;
   readable: boolean; count: number; form: boolean; unknownButton: boolean; unknownTestId: string;
@@ -170,6 +207,10 @@ interface State {
   composerInnerText?: string;
   /** One text node outside the composer, which the foreign-text walk must still reach. */
   foreignText?: string;
+  /** The foreign text node's parent, whose shape the refusal line reports. */
+  foreignParent?: ForeignAncestor;
+  /** Ancestors ABOVE that parent, nearest first, for the hidden/testid scan. */
+  foreignAncestors?: ForeignAncestor[];
 }
 const options = { model: "gpt-6-pro" as const, connector: "fixture", gizmoId: "project", expectedAccountEmail: "fixture@example.com" };
 
@@ -860,5 +901,123 @@ describe("chip-only composer remainder", () => {
     ).catch(caught => caught);
     expect(mismatch).toBeInstanceOf(PreflightDraftProtectedError);
     expect(mismatch.reason).toBe("owned_text_mismatch");
+  });
+});
+
+// P-035 2026-09-28 r17. `foreign_text` was the one preflight refusal that named
+// no node: live ms1980 refused it on a composer whose only visible content was
+// the call's own chip, so the refusing text node is probably UI chrome rather
+// than a draft. The refusal now carries a content-free shape of that node; these
+// cases prove the shape and that admission is unchanged.
+describe("foreign text refusal shape", () => {
+  const shapeLineOf = (spy: ReturnType<typeof vi.spyOn>) => spy.mock.calls
+    .map(call => String(call[0])).find(line => line.includes("foreign text shape"));
+
+  it("names the hidden ancestor and the connector match for an aria-hidden span", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = await assertPreflightDraftSafe(
+        fixture({
+          // A clean composer: the only text node outside it is the hidden span,
+          // which repeats the owned connector's text as UI chrome mirror does.
+          foreignText: "fixture",
+          foreignParent: { tagName: "SPAN", ariaHidden: true },
+        }).page,
+        { connector: "fixture" },
+      ).catch(caught => caught);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("foreign_text");
+      const shapeLine = shapeLineOf(spy);
+      expect(shapeLine).toContain("foreign text shape:");
+      expect(shapeLine).toContain("tag=SPAN");
+      expect(shapeLine).toContain("role=-");
+      expect(shapeLine).toContain("testid=-");
+      expect(shapeLine).toContain("hidden=aria");
+      expect(shapeLine).toContain("len=7");
+      expect(shapeLine).toContain("equals_connector=yes");
+      // Exactly one shape line, and it never carries the refused text.
+      expect(spy.mock.calls.map(call => String(call[0]))
+        .filter(line => line.includes("foreign text shape"))).toHaveLength(1);
+      expect(shapeLine).not.toContain("fixture");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("reports a visible foreign div and its connector comparison", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = await assertPreflightDraftSafe(
+        fixture({ foreignText: "x", foreignParent: { tagName: "DIV" } }).page,
+        { connector: "fixture" },
+      ).catch(caught => caught);
+      expect(error.reason).toBe("foreign_text");
+      // The whole line, so the shape is proved to carry nothing else: a visible
+      // div, no role or testid, not hidden, the trimmed length, and no connector
+      // match. The refused text itself never appears.
+      expect(shapeLineOf(spy)).toBe(
+        "[cgpro:preflight] foreign text shape: tag=DIV role=- testid=- hidden=no len=1 equals_connector=no",
+      );
+
+      spy.mockClear();
+      // Without an owned connector the comparison is not made: `n/a`.
+      const unowned = await assertPreflightDraftSafe(
+        fixture({ foreignText: "x", foreignParent: { tagName: "DIV" } }).page,
+      ).catch(caught => caught);
+      expect(unowned.reason).toBe("foreign_text");
+      expect(shapeLineOf(spy)).toContain("equals_connector=n/a");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("classifies the hidden attribute and layout-hidden ancestors", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await assertPreflightDraftSafe(fixture({
+        foreignText: "x", foreignParent: { tagName: "DIV", hiddenAttr: true },
+      }).page).catch(caught => caught);
+      expect(shapeLineOf(spy)).toContain("hidden=attr");
+
+      spy.mockClear();
+      // A parent that is invisible but neither aria-hidden nor `hidden`: the
+      // nearest testid still comes from the ancestor that has one.
+      await assertPreflightDraftSafe(fixture({
+        foreignText: "x",
+        foreignParent: { tagName: "SPAN", rects: 0 },
+        foreignAncestors: [{ tagName: "DIV", testid: "mirror-node", ariaHidden: true }],
+      }).page).catch(caught => caught);
+      const shapeLine = shapeLineOf(spy);
+      expect(shapeLine).toContain("tag=SPAN");
+      expect(shapeLine).toContain("testid=mirror-node");
+      expect(shapeLine).toContain("hidden=aria");
+
+      spy.mockClear();
+      await assertPreflightDraftSafe(fixture({
+        foreignText: "x", foreignParent: { tagName: "DIV", rects: 0 },
+      }).page).catch(caught => caught);
+      expect(shapeLineOf(spy)).toContain("hidden=layout");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("still refuses foreign text the way the preflight always did", async () => {
+    // The shape is diagnostic only: the reason string and the single refusal
+    // line are unchanged.
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = await assertPreflightDraftSafe(
+        fixture({ foreignText: "outside draft" }).page,
+        { connector: "fixture" },
+      ).catch(caught => caught);
+      expect(error.reason).toBe("foreign_text");
+      const refusals = spy.mock.calls.map(call => String(call[0]))
+        .filter(line => line.includes("draft guard refused"));
+      expect(refusals).toHaveLength(1);
+      expect(refusals[0]).toContain("reason=foreign_text");
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
