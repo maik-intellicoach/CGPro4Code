@@ -2164,6 +2164,14 @@ export async function setConnector(page: Page, name: string, protectDraft = fals
  * the parent tag, its sanitised role and nearest sanitised `data-testid`, why
  * it is hidden, the trimmed text length, and whether that text is the owned
  * connector. Never the text and never any other attribute value.
+ *
+ * P-035 2026-09-28 r18. The planner needs to know whether the refused span is
+ * UI chrome (a chip placeholder/hint) or a mirror of draft text before any
+ * admission rule changes, so the shape carries six more content-free features:
+ * whether the text contains the owned connector, whether it equals any
+ * composer placeholder attribute value, whether it equals the composer's own
+ * text, its word count, the parent-first tag path up to the form (tags only),
+ * and how many elements on that path carry an `aria-label` (count only).
  */
 interface ForeignTextShape {
   tag: string;
@@ -2172,6 +2180,12 @@ interface ForeignTextShape {
   hidden: string;
   len: number;
   equalsConnector: string;
+  containsConnector: string;
+  equalsPlaceholder: string;
+  equalsComposerText: string;
+  words: number;
+  path: string;
+  labels: number;
 }
 
 /** The content-free diagnostics a single refusal may carry beside its reason. */
@@ -2444,6 +2458,35 @@ export async function assertPreflightDraftSafe(
         const testid = chain
           .map(element => chrome(element.getAttribute("data-testid") ?? ""))
           .find(candidate => candidate.length > 0) ?? "";
+        // P-035 2026-09-28 r18. Placeholder attribute values live on the live
+        // composer itself or on a descendant (the editor's placeholder
+        // paragraph, say). Attribute VALUES are only ever compared with the
+        // trimmed text, never logged.
+        const placeholderValues: string[] = [];
+        const readPlaceholder = (element: Element | null): void => {
+          if (!element) return;
+          for (const name of ["data-placeholder", "placeholder"]) {
+            let value: string | null | undefined;
+            try { value = element.getAttribute?.(name); } catch { value = null; }
+            if (value != null) placeholderValues.push(value.trim());
+          }
+        };
+        readPlaceholder(composer);
+        try {
+          for (const descendant of Array.from(composer.querySelectorAll?.("*") ?? [])) {
+            readPlaceholder(descendant);
+          }
+        } catch { /* not a DOM element */ }
+        const composerText = ((composer instanceof HTMLTextAreaElement
+          ? composer.value : composer.innerText) ?? "").trim();
+        // Parent-first tag names of the ancestor chain, form included, capped
+        // at 8. Tags only: no attribute value and no descendant text.
+        const path = chain.slice(0, 8).map(element => chrome(element.tagName ?? "")).join("<");
+        // How many elements on that chain carry an `aria-label`: a count only,
+        // never the value.
+        const labels = chain.filter(element => {
+          try { return element.getAttribute?.("aria-label") != null; } catch { return false; }
+        }).length;
         return {
           tag: (parent && chrome(parent.tagName)) || "-",
           role: (parent && chrome(parent.getAttribute("role") ?? "")) || "-",
@@ -2452,6 +2495,14 @@ export async function assertPreflightDraftSafe(
           len: text.length,
           equalsConnector: owned.connector === undefined
             ? "n/a" : text === owned.connector ? "yes" : "no",
+          containsConnector: owned.connector === undefined
+            ? "n/a" : text.includes(owned.connector) ? "yes" : "no",
+          equalsPlaceholder: placeholderValues.length === 0
+            ? "none" : placeholderValues.includes(text) ? "yes" : "no",
+          equalsComposerText: text === composerText ? "yes" : "no",
+          words: text.split(/\s+/).filter(Boolean).length,
+          path: path || "-",
+          labels,
         };
       };
       const walker = document.createTreeWalker(form, NodeFilter.SHOW_TEXT);
@@ -2480,11 +2531,25 @@ export async function assertPreflightDraftSafe(
       // foreign-text refusal, so the next live round names the node class. It
       // carries no text and no attribute value beyond the sanitised role and
       // testid.
+      //
+      // P-035 2026-09-28 r18. Six more content-free features appended to the
+      // SAME single line, so one live round decides whether the span is UI
+      // chrome (a chip placeholder/hint) or a mirror of draft text: whether the
+      // text contains the owned connector, whether it equals any composer
+      // placeholder value, whether it equals the composer's own text, its word
+      // count, the parent-first tag path to the form, and how many elements on
+      // that path carry an `aria-label`. Admission and the reason stay exactly
+      // as before.
       if (outcome.foreignShape) {
-        const { tag, role, testid, hidden, len, equalsConnector } = outcome.foreignShape;
+        const {
+          tag, role, testid, hidden, len, equalsConnector,
+          containsConnector, equalsPlaceholder, equalsComposerText, words, path, labels,
+        } = outcome.foreignShape;
         console.error(
           `[cgpro:preflight] foreign text shape: tag=${tag} role=${role} testid=${testid} `
-          + `hidden=${hidden} len=${len} equals_connector=${equalsConnector}`,
+          + `hidden=${hidden} len=${len} equals_connector=${equalsConnector} `
+          + `contains_connector=${containsConnector} equals_placeholder=${equalsPlaceholder} `
+          + `equals_composer_text=${equalsComposerText} words=${words} path=${path} labels=${labels}`,
         );
       }
     }

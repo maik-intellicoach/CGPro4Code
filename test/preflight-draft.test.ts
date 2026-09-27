@@ -127,7 +127,10 @@ function fixture(initial: Partial<State> = {}) {
         closest: () => null,
         getAttribute: (name: string) => name === "role" ? (node.role ?? null)
           : name === "data-testid" ? (node.testid ?? null)
-            : name === "aria-hidden" ? (node.ariaHidden ? "true" : null) : null,
+            : name === "aria-hidden" ? (node.ariaHidden ? "true" : null)
+              // r18: the label COUNT comes from these; the value never leaves
+              // the shape, which reports a count only.
+              : name === "aria-label" ? (node.ariaLabel ?? null) : null,
         hasAttribute: (name: string) => name === "hidden" ? !!node.hiddenAttr : false,
         getClientRects: () => Array.from({ length: node.rects ?? 1 }, () => ({})),
       });
@@ -138,7 +141,14 @@ function fixture(initial: Partial<State> = {}) {
       }
       const composer = { isConnected: true, getClientRects: () => [{}],
         innerText: state.composerInnerText ?? (tokenTopTexts.join("") + state.text), cloneNode: () => copy,
-        closest: () => state.form ? form : null, contains: () => false };
+        closest: () => state.form ? form : null, contains: () => false,
+        // r18: the placeholder scan reads attributes on the composer itself and
+        // on its descendants, and only ever compares their trimmed values.
+        getAttribute: (name: string) => (state.composerAttributes ?? [])
+          .find(attribute => attribute.name === name)?.value ?? null,
+        querySelectorAll: () => (state.composerDescendants ?? []).map(attribute => ({
+          getAttribute: (name: string) => name === attribute.name ? attribute.value : null,
+        })) };
       const document = {
         body: { childNodes: state.count ? [composer] : [] },
         querySelectorAll: (selector: string) => selector === 'input[type="file"]'
@@ -188,6 +198,8 @@ interface ForeignAncestor {
   tagName?: string;
   role?: string;
   testid?: string;
+  /** r18: an `aria-label` this ancestor carries; only its presence is counted. */
+  ariaLabel?: string;
   ariaHidden?: boolean;
   hiddenAttr?: boolean;
   /** Client rect count; `0` models a laid-out-hidden node. */
@@ -211,6 +223,10 @@ interface State {
   foreignParent?: ForeignAncestor;
   /** Ancestors ABOVE that parent, nearest first, for the hidden/testid scan. */
   foreignAncestors?: ForeignAncestor[];
+  /** r18: placeholder-bearing attributes on the composer itself. */
+  composerAttributes?: Array<{ name: string; value: string }>;
+  /** r18: one placeholder-bearing synthetic descendant per entry. */
+  composerDescendants?: Array<{ name: string; value: string }>;
 }
 const options = { model: "gpt-6-pro" as const, connector: "fixture", gizmoId: "project", expectedAccountEmail: "fixture@example.com" };
 
@@ -953,10 +969,13 @@ describe("foreign text refusal shape", () => {
       ).catch(caught => caught);
       expect(error.reason).toBe("foreign_text");
       // The whole line, so the shape is proved to carry nothing else: a visible
-      // div, no role or testid, not hidden, the trimmed length, and no connector
-      // match. The refused text itself never appears.
+      // div, no role or testid, not hidden, the trimmed length, no connector
+      // match, and -- r18 -- the six appended features for the same one word.
+      // The refused text itself never appears.
       expect(shapeLineOf(spy)).toBe(
-        "[cgpro:preflight] foreign text shape: tag=DIV role=- testid=- hidden=no len=1 equals_connector=no",
+        "[cgpro:preflight] foreign text shape: tag=DIV role=- testid=- hidden=no len=1 "
+        + "equals_connector=no contains_connector=no equals_placeholder=none "
+        + "equals_composer_text=no words=1 path=DIV labels=0",
       );
 
       spy.mockClear();
@@ -966,6 +985,8 @@ describe("foreign text refusal shape", () => {
       ).catch(caught => caught);
       expect(unowned.reason).toBe("foreign_text");
       expect(shapeLineOf(spy)).toContain("equals_connector=n/a");
+      // r18: the same `n/a` carries to the substring comparison.
+      expect(shapeLineOf(spy)).toContain("contains_connector=n/a");
     } finally {
       spy.mockRestore();
     }
@@ -1016,6 +1037,151 @@ describe("foreign text refusal shape", () => {
         .filter(line => line.includes("draft guard refused"));
       expect(refusals).toHaveLength(1);
       expect(refusals[0]).toContain("reason=foreign_text");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // P-035 2026-09-28 r18. Live ms1980 (vendor 134f45d): the composer held only
+  // the lane's own chip, yet an aria-hidden span inside the form refused
+  // `foreign_text`. Before any admission rule the planner needs to know whether
+  // that span is UI chrome (a placeholder/hint about the chip) or a mirror of
+  // draft text, so the same single line carries six more content-free features.
+  // These cases prove each feature and that admission is unchanged.
+  it("marks a hidden span whose text contains the owned connector, never logs the text", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = await assertPreflightDraftSafe(
+        fixture({
+          // Contains the connector but is not equal to it: the two comparisons
+          // must disagree, so the line distinguishes a chip hint from a mirror.
+          foreignText: "fixture chip",
+          foreignParent: { tagName: "SPAN", ariaHidden: true },
+        }).page,
+        { connector: "fixture" },
+      ).catch(caught => caught);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("foreign_text");
+      const shapeLine = shapeLineOf(spy);
+      expect(shapeLine).toContain("tag=SPAN");
+      expect(shapeLine).toContain("hidden=aria");
+      expect(shapeLine).toContain("contains_connector=yes");
+      expect(shapeLine).toContain("equals_connector=no");
+      expect(shapeLine).toContain("words=2");
+      // Content-free: neither the refused text nor the connector appears.
+      expect(shapeLine).not.toContain("fixture chip");
+      expect(spy.mock.calls.map(call => String(call[0]))
+        .filter(line => line.includes("foreign text shape"))).toHaveLength(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("matches a placeholder on the composer or on one of its descendants", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // The editor's own `data-placeholder`, as the vendor renders it.
+      await assertPreflightDraftSafe(
+        fixture({
+          foreignText: "Ask anything",
+          foreignParent: { tagName: "SPAN" },
+          composerAttributes: [{ name: "data-placeholder", value: "Ask anything" }],
+        }).page,
+        { connector: "fixture" },
+      ).catch(caught => caught);
+      const shapeLine = shapeLineOf(spy);
+      expect(shapeLine).toContain("equals_placeholder=yes");
+      expect(shapeLine).toContain("words=2");
+      expect(shapeLine).not.toContain("Ask anything");
+
+      spy.mockClear();
+      // A native `placeholder` attribute on a descendant counts the same way.
+      await assertPreflightDraftSafe(
+        fixture({
+          foreignText: "Message ChatGPT",
+          foreignParent: { tagName: "DIV" },
+          composerDescendants: [{ name: "placeholder", value: "Message ChatGPT" }],
+        }).page,
+        { connector: "fixture" },
+      ).catch(caught => caught);
+      expect(shapeLineOf(spy)).toContain("equals_placeholder=yes");
+
+      spy.mockClear();
+      // A placeholder that exists but does not match is `no`, not `none`.
+      await assertPreflightDraftSafe(
+        fixture({
+          foreignText: "unrelated chrome",
+          foreignParent: { tagName: "DIV" },
+          composerDescendants: [{ name: "placeholder", value: "Message ChatGPT" }],
+        }).page,
+        { connector: "fixture" },
+      ).catch(caught => caught);
+      const noMatch = shapeLineOf(spy);
+      expect(noMatch).toContain("equals_placeholder=no");
+      expect(noMatch).toContain("contains_connector=no");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("compares the foreign text with the composer's own trimmed text", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // The combined connector turn, whose rendered composer text is this
+      // call's own prompt; the foreign node mirrors exactly that text.
+      await assertPreflightDraftSafe(
+        fixture({
+          mention: "fixture", text: "owned probe", composerInnerText: "owned probe",
+          foreignText: "owned probe", foreignParent: { tagName: "SPAN" },
+        }).page,
+        { connector: "fixture", text: "owned probe" },
+      ).catch(caught => caught);
+      expect(shapeLineOf(spy)).toContain("equals_composer_text=yes");
+
+      spy.mockClear();
+      await assertPreflightDraftSafe(
+        fixture({
+          mention: "fixture", text: "owned probe", composerInnerText: "owned probe",
+          foreignText: "something else", foreignParent: { tagName: "SPAN" },
+        }).page,
+        { connector: "fixture", text: "owned probe" },
+      ).catch(caught => caught);
+      expect(shapeLineOf(spy)).toContain("equals_composer_text=no");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("names the parent-first tag path up to the form and counts its aria-labels", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await assertPreflightDraftSafe(
+        fixture({
+          foreignText: "x",
+          foreignParent: { tagName: "SPAN" },
+          // Nearest first: SPAN's parent is the labelled DIV, then the form.
+          foreignAncestors: [{ tagName: "DIV", ariaLabel: "Mirror" }, { tagName: "FORM" }],
+        }).page,
+      ).catch(caught => caught);
+      const shapeLine = shapeLineOf(spy);
+      expect(shapeLine).toContain("path=SPAN<DIV<FORM");
+      expect(shapeLine).toContain("labels=1");
+      // Count only: the label's own value never leaves the shape.
+      expect(shapeLine).not.toContain("Mirror");
+
+      spy.mockClear();
+      // The path is capped at 8 tags; a deeper chain stops at the eighth.
+      await assertPreflightDraftSafe(
+        fixture({
+          foreignText: "x",
+          foreignParent: { tagName: "SPAN" },
+          foreignAncestors: Array.from({ length: 10 }, (_, index) => ({ tagName: `T${index + 1}` })),
+        }).page,
+      ).catch(caught => caught);
+      const capped = shapeLineOf(spy);
+      expect(capped).toContain("path=SPAN<T1<T2<T3<T4<T5<T6<T7");
+      expect(capped).not.toContain("<T8");
+      expect(capped).toContain("labels=0");
     } finally {
       spy.mockRestore();
     }
