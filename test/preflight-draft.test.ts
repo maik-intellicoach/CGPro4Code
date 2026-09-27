@@ -3,6 +3,7 @@ import { runInNewContext } from "node:vm";
 import type { Page } from "patchright";
 import type { Session } from "../src/browser/session.js";
 import { PreflightDraftProtectedError } from "../src/errors.js";
+import { joinSelectors, SELECTORS } from "../src/browser/selectors.js";
 
 const goHome = vi.fn();
 const openConversation = vi.fn();
@@ -29,9 +30,33 @@ function fixture(initial: Partial<State> = {}) {
   const state: State = { text: "", attachment: false, file: false, mention: "", unknown: false,
     readable: true, count: 1, form: true, unknownButton: false, unknownTestId: "", controls: [],
     url: "https://chatgpt.com/", ...initial };
+  // Records every bounded composer-hydration wait the preflight issues, with the
+  // composer count it saw when the wait began, so a test can prove the home
+  // guard ran after hydration and not before it.
+  const composerWaits: Array<{ selector: string; options: { state?: string; timeout?: number }; countAtStart: number }> = [];
   const page = {
     url: () => state.url,
     keyboard: { press: vi.fn(async () => {}) },
+    // P-035 2026-09-27 r11. Models the bounded composer visibility wait. The
+    // default (composer already present) resolves immediately; hydrationMs
+    // makes the composer appear only during the wait; composerNeverHydrates
+    // rejects the way Playwright's own waitFor timeout does.
+    locator: (selector: string) => ({
+      first: () => ({
+        waitFor: async (options: { state?: string; timeout?: number }) => {
+          composerWaits.push({ selector, options, countAtStart: state.count });
+          if (state.composerNeverHydrates) {
+            await new Promise(resolve => setTimeout(resolve, 5));
+            throw Object.assign(
+              new Error(`locator.waitFor: Timeout ${options.timeout}ms exceeded`), { name: "TimeoutError" });
+          }
+          if (state.composerHydrationMs !== undefined) {
+            await new Promise(resolve => setTimeout(resolve, state.composerHydrationMs));
+            state.count = 1;
+          }
+        },
+      }),
+    }),
     evaluate: vi.fn(async (fn: Function, arg: unknown) => {
       if (!state.readable) throw new Error("synthetic evaluation failure with private content");
       const tokenTexts = state.mentions ?? (state.mention ? [state.mention] : []);
@@ -77,7 +102,7 @@ function fixture(initial: Partial<State> = {}) {
       });
     }),
   } as unknown as Page;
-  return { state, page, session: { page } as Session };
+  return { state, page, session: { page } as Session, composerWaits };
 }
 interface RichNode {
   tagName: string;
@@ -89,6 +114,10 @@ interface State {
   text: string; attachment: boolean; file: boolean; mention: string; mentions?: string[]; unknown: boolean;
   readable: boolean; count: number; form: boolean; unknownButton: boolean; unknownTestId: string;
   controls: Array<{ testid?: string; ariaLabel?: string; tagName?: string }>; url: string; rich?: RichNode[];
+  /** Delays the composer's appearance until this many ms into the hydration wait. */
+  composerHydrationMs?: number;
+  /** Makes the bounded composer wait itself time out, as a never-hydrating page does. */
+  composerNeverHydrates?: boolean;
 }
 const options = { model: "gpt-6-pro" as const, connector: "fixture", gizmoId: "project", expectedAccountEmail: "fixture@example.com" };
 
@@ -452,5 +481,57 @@ describe("draft-safe interaction preflight", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+// P-035 2026-09-27 r11. Live ms1980 (vendor 9af999b, two fresh daemons): the
+// interaction preflight refused `composer_count:0` at phase `home` about 1.4 s
+// after `goHome`, on a page whose composer had simply not hydrated yet. The
+// sequence was `mark("home"); await goHome(page); await guard();` and the login
+// wait that already covers hydration ran only AFTER that guard. These two cases
+// pin the fix: the home guard must judge a hydrated composer, and a composer
+// that never arrives must still refuse exactly as before.
+describe("home composer hydration wait", () => {
+  it("waits for the hydrated composer before the home guard, then proceeds past home", async () => {
+    const { state, session, composerWaits } = fixture({ url: "about:blank", count: 0 });
+    // goHome lands on chatgpt.com but the composer is NOT there yet, exactly as
+    // the live pre-hydration shell was.
+    goHome.mockImplementation(() => { state.url = "https://chatgpt.com/"; state.mention = ""; });
+    setConnector.mockImplementation(() => { state.mention = "fixture"; });
+    state.composerHydrationMs = 30;
+    await expect(runInteractionPreflight(options, session))
+      .resolves.toMatchObject({ connectorVerified: true, power: 4 });
+    // One bounded wait, against the shipped composer selector, at the shipped bound.
+    expect(composerWaits).toHaveLength(1);
+    expect(composerWaits[0].selector).toBe(joinSelectors(SELECTORS.composer));
+    expect(composerWaits[0].options).toEqual({ state: "visible", timeout: 20_000 });
+    // The composer was absent when the wait began and appeared only inside it,
+    // so the guard that admitted the home phase ran after the wait.
+    expect(composerWaits[0].countAtStart).toBe(0);
+    expect(state.count).toBe(1);
+    // Past `home`: the rest of the preflight ran against the hydrated page.
+    expect(openConversation).toHaveBeenCalledTimes(1);
+    expect(setConnector).toHaveBeenCalledWith(session.page, "fixture", true);
+    expect(goHome).toHaveBeenCalledTimes(2);
+  });
+
+  it("swallows the wait's own timeout and still refuses home exactly as today", async () => {
+    const { state, session, composerWaits } = fixture({ url: "about:blank", count: 0 });
+    goHome.mockImplementation(() => { state.url = "https://chatgpt.com/"; });
+    state.composerNeverHydrates = true;
+    const error = await runInteractionPreflight(options, session).catch(caught => caught);
+    // The wait is not an error: the guard, not the wait, refused, and it refused
+    // with the unchanged error, code and reason.
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.code).toBe("preflight_draft_protected");
+    expect(error.reason).toBe("composer_count:0");
+    expect(composerWaits).toHaveLength(1);
+    expect(composerWaits[0].options).toEqual({ state: "visible", timeout: 20_000 });
+    expect(composerWaits[0].countAtStart).toBe(0);
+    // Nothing past the home phase ran, and the refusal happened once goHome had run.
+    expect(goHome).toHaveBeenCalledTimes(1);
+    expect(openConversation).not.toHaveBeenCalled();
+    expect(setConnector).not.toHaveBeenCalled();
+    expect(clearComposer).not.toHaveBeenCalled();
   });
 });

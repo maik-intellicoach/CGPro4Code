@@ -36,6 +36,9 @@ const CONNECTOR_EVIDENCE_RATE_LIMIT_BACKOFF_MS = 120_000;
 // P-035 2026-09-23. How long a mid-turn 404 on a just-created conversation counts
 // as "not readable yet" before it is the missing conversation it may really be.
 const CONNECTOR_NOT_FOUND_GRACE_MS = 120_000;
+// P-035 2026-09-27 r11. Bound on the composer hydration wait that sits between
+// `goHome` and the home draft guard.
+const COMPOSER_HYDRATION_TIMEOUT_MS = 20_000;
 
 export interface AskOptions {
   prompt: string;
@@ -109,6 +112,33 @@ export type InteractionPreflightPhase =
   | "composer" | "connector" | "model" | "prompt-delivery"
   | "cleanup-escape" | "cleanup-home" | "cleanup-composer";
 
+/**
+ * Bounded wait for the composer to become visible.
+ *
+ * P-035 2026-09-27 r11. Live ms1980 (vendor 9af999b, two fresh daemons): the
+ * home guard judged a half-loaded page about 1.4 s after `goHome` and refused
+ * `composer_count:0` on a composer that had simply not hydrated yet -- the
+ * selector diagnostic read `ready=interactive`, heading "Ready when you are.",
+ * `composer=false`, every composer candidate count 0, and the capture showed
+ * the pre-hydration shell. The login wait that already covers this ran only
+ * AFTER that guard, so the guard came first against an unhydrated surface.
+ *
+ * This wait never admits or refuses anything: a failure to observe the
+ * composer -- its own timeout, a page that cannot answer the visibility
+ * question yet, a closed target -- is swallowed, and the draft guard that runs
+ * immediately after stays the only admission authority. An absent composer
+ * therefore still refuses with exactly the error and reason it refused with
+ * before this wait existed (fail closed).
+ */
+async function waitForComposerHydrated(page: Page, timeoutMs = COMPOSER_HYDRATION_TIMEOUT_MS): Promise<void> {
+  try {
+    await page.locator(joinSelectors(SELECTORS_DUMP.composer)).first()
+      .waitFor({ state: "visible", timeout: timeoutMs });
+  } catch {
+    // Absence is not a verdict here; the following guard is.
+  }
+}
+
 /** Verify current controls on an idle daemon lane without submitting a prompt. */
 export async function runInteractionPreflight(
   opts: InteractionPreflightOptions,
@@ -136,6 +166,10 @@ export async function runInteractionPreflight(
     admitted = true;
     mark("home");
     await goHome(page);
+    // Wait for the hydrated composer BEFORE the home guard: the guard reads the
+    // composer to decide admission, so judging a half-loaded page refuses a
+    // perfectly clean lane. Bounded, and never itself a failure.
+    await waitForComposerHydrated(page);
     await guard();
     mark("login");
     if (!(await isLoggedIn(page, 10_000))) throw new NotLoggedInError();
