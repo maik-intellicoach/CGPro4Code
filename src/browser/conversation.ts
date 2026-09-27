@@ -2209,7 +2209,18 @@ export async function assertPreflightDraftSafe(
         // exact string the refusal names -- is `Dictate` or `Start Voice`;
         // nothing else, exact match only, and never `[role="button"]` on
         // another tag. Checked after `matches` so the allowlist is unchanged.
-        if (control.tagName === "BUTTON" && (id === "Dictate" || id === "Start Voice")) continue;
+        //
+        // P-035 2026-09-28 r12. Live ms1980 (vendor 1684dee): with the hydration
+        // wait working, the SAME empty home lane refused `unknown_control:Send`
+        // -- its only unknown control. On this UI variant the empty composer's
+        // send arrow carries identifier `Send` and neither `send-button` nor
+        // `composer-send-button` testid. It is the same UI chrome, admitted here
+        // by that exact sanitized identifier, on a `button` only, exactly as r8
+        // admitted `Dictate` and `Start Voice`. No prefix match, no case fold:
+        // `Send now`, `Send a message` and a `div[role="button"]` named `Send`
+        // all still refuse. The text checks below are untouched, so typed text
+        // with this button present still refuses `text_present`.
+        if (control.tagName === "BUTTON" && (id === "Dictate" || id === "Start Voice" || id === "Send")) continue;
         if (unknownControls.length < 5 && !unknownControls.includes(id)) unknownControls.push(id);
       }
       if (unknownControls.length > 0) return `unknown_control:${unknownControls.join("|")}`.slice(0, 200);

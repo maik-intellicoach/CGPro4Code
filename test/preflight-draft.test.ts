@@ -289,6 +289,55 @@ describe("draft-safe interaction preflight", () => {
     await expect(assertPreflightDraftSafe(byTestid.page)).resolves.toBeUndefined();
   });
 
+  // P-035 2026-09-28 r12. Live ms1980 (vendor 1684dee): once the hydration wait
+  // worked, the same empty home lane refused `unknown_control:Send` -- its only
+  // unknown control. On this UI variant the empty composer's send arrow has
+  // identifier `Send` and neither `send-button` nor `composer-send-button`
+  // testid. It is UI chrome with no draft content, admitted by that exact
+  // sanitized identifier on a `button`, exactly as r8 admitted Dictate and
+  // Start Voice.
+  it("admits an empty composer holding Add files and more, Dictate, the Send button, the model pill and an empty placeholder paragraph", async () => {
+    const { page } = fixture({
+      rich: [{ tagName: "P", attributes: [{ name: "data-empty-paragraph", value: "" }] }],
+      controls: [
+        { ariaLabel: "Add files and more" },
+        { ariaLabel: "Dictate" },
+        { ariaLabel: "Send" },
+        { ariaLabel: "Select ChatGPT model" },
+      ],
+    });
+    await expect(assertPreflightDraftSafe(page)).resolves.toBeUndefined();
+
+    // The same arrow identified by testid, beside the model pill's other
+    // allowlisted shape and a placeholder paragraph carrying BR children.
+    const byTestid = fixture({
+      rich: [{ tagName: "P", attributes: [{ name: "data-placeholder", value: "Ask anything" }], children: [{ tagName: "BR" }] }],
+      controls: [{ testid: "Send" }, { testid: "model-switcher-dropdown-button" }],
+    });
+    await expect(assertPreflightDraftSafe(byTestid.page)).resolves.toBeUndefined();
+  });
+
+  it("still refuses a Send control that is not a button, or is not an exact identifier match", async () => {
+    const notAButton = await assertPreflightDraftSafe(
+      fixture({ controls: [{ ariaLabel: "Send", tagName: "DIV" }] }).page,
+    ).catch(error => error);
+    expect(notAButton).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(notAButton.reason).toBe("unknown_control:Send");
+
+    const sendSuffix = await assertPreflightDraftSafe(
+      fixture({ controls: [{ ariaLabel: "Send now" }] }).page,
+    ).catch(error => error);
+    expect(sendSuffix.reason).toBe("unknown_control:Send now");
+  });
+
+  it("still refuses typed text with the Send button present", async () => {
+    const { page } = fixture({ text: "private user draft", controls: [{ ariaLabel: "Send" }] });
+    const error = await assertPreflightDraftSafe(page).catch(error => error);
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.reason).toBe("text_present");
+    expect(JSON.stringify(error)).not.toContain("private user draft");
+  });
+
   it("still refuses a Dictate control that is not a button, or is not an exact identifier match", async () => {
     const notAButton = await assertPreflightDraftSafe(
       fixture({ controls: [{ ariaLabel: "Dictate", tagName: "DIV" }] }).page,
