@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runInNewContext } from "node:vm";
 import type { Locator, Page } from "patchright";
 
 // P-035: connector selection must be an honest composer-attachment
@@ -560,4 +561,65 @@ it("preflight connector fallback preserves a draft arriving during the picker wa
   vi.mocked(page.waitForTimeout).mockImplementation(async () => { readableEmpty = false; });
   await expect(setConnector(page, "connector", true)).rejects.toMatchObject({ code: "preflight_draft_protected" });
   expect(vi.mocked(page.keyboard.press).mock.calls.filter(([key]) => key === "Backspace")).toHaveLength(1);
+});
+
+// P-035 2026-09-28 r20. The three pre-attach guards in `setConnector` judged the
+// surface with no connector identity, so the lane's own persisted chip refused
+// `connector_unowned` before the steps that clear it. They now carry the trimmed
+// connector argument. The synthetic DOM below runs the real admission closure
+// against exactly that surface.
+function installChipGuardDom(page: Page, chip: string, typed = ""): void {
+  page.evaluate = vi.fn(async (fn: Function, arg: { selector?: string }) => {
+    if (typeof arg === "string" || !arg?.selector) return false;
+    let chipMounted = true;
+    const clone = () => {
+      const token = {
+        tagName: "SPAN",
+        textContent: chip,
+        parentElement: null,
+        closest: () => token,
+        remove: () => { chipMounted = false; },
+      };
+      return {
+        get textContent() { return (chipMounted ? chip : "") + typed; },
+        querySelectorAll: (selector: string) =>
+          selector === "*" ? [] : chipMounted ? [token] : [],
+      };
+    };
+    const form = { querySelector: () => null, querySelectorAll: () => [] };
+    const composer = {
+      isConnected: true, getClientRects: () => [{}],
+      get innerText() { return (chipMounted ? chip : "") + typed; },
+      closest: () => form, contains: () => false,
+      cloneNode: () => clone(),
+    };
+    const document = {
+      querySelectorAll: (selector: string) => selector === 'input[type="file"]' ? [] : [composer],
+      createTreeWalker: () => ({ nextNode: () => false }),
+    };
+    return runInNewContext(`(${fn.toString()})(arg)`, {
+      arg, document, location: new URL("https://chatgpt.com/"), HTMLTextAreaElement: class {}, NodeFilter: { SHOW_TEXT: 4 },
+    });
+  }) as typeof page.evaluate;
+}
+
+it("preflight connector selection clears its own chip-only composer", async () => {
+  const scenario = makePage();
+  installChipGuardDom(scenario.page, "lane-x");
+  // The already-attached branch stops right after the picker resolves, so the
+  // presses recorded are exactly the pre-attach clear plus its dismiss.
+  scenario.setRows([{ label: "lane-x", visible: true, attrs: { "aria-checked": "true" } }]);
+  await expect(setConnector(scenario.page, "lane-x", true)).resolves.toBeUndefined();
+  expect(vi.mocked(scenario.page.keyboard.press).mock.calls.map(([key]) => key))
+    .toEqual(["Meta+A", "Backspace", "Escape"]);
+  expect(vi.mocked(scenario.page.keyboard.type).mock.calls.map(([text]) => text)).toEqual(["@"]);
+});
+
+it("preflight connector selection refuses a chip plus typed text before Meta+A", async () => {
+  const scenario = makePage();
+  installChipGuardDom(scenario.page, "lane-x", "private draft beside the chip");
+  const error = await setConnector(scenario.page, "lane-x", true).catch(caught => caught);
+  expect(error).toMatchObject({ code: "preflight_draft_protected", reason: "text_present" });
+  expect(scenario.page.keyboard.press).not.toHaveBeenCalled();
+  expect(scenario.page.keyboard.type).not.toHaveBeenCalled();
 });

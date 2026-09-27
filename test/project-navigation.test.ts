@@ -529,3 +529,91 @@ describe("Project-flow composer hydration wait", () => {
     expect(rowClick).toHaveBeenCalledTimes(1);
   });
 });
+
+// P-035 2026-09-28 r20. Live ms1980 (vendor e28e843, lane ms1980, pid 2408): the
+// protected navigation judged the lane's own persisted connector chip with no
+// connector identity and refused `connector_unowned` before reaching the steps
+// that clear it. `openConversation` now takes the lane's configured connector as
+// a trailing parameter and threads it into its protected `guard`; every other
+// caller passes nothing and keeps today's behaviour exactly.
+describe("Protected navigation connector identity", () => {
+  const composerSelector = joinSelectors(SELECTORS.composer);
+  /**
+   * A synthetic home composer holding exactly one outermost connector chip
+   * (`[contenteditable="false"]`) plus optional typed text. The clone models the
+   * real removal: once the guard detaches the owned token, neither the clone's
+   * text nor its token list carries the chip any more. The composer-free
+   * `/projects` directory is modelled as it is live: no composer at all.
+   */
+  function installChipHomeDom(page: Page, chip: string, typed = ""): void {
+    const originalEvaluate = page.evaluate as unknown as (fn: Function, arg: unknown) => Promise<unknown>;
+    page.evaluate = vi.fn(async (fn: Function, arg: { selector?: string }) => {
+      if (typeof arg === "string" || !arg?.selector) return originalEvaluate(fn as never, arg);
+      const onDirectory = new URL(page.url()).pathname === "/projects";
+      let chipMounted = true;
+      const clone = () => {
+        const token = {
+          tagName: "SPAN",
+          textContent: chip,
+          parentElement: null,
+          closest: () => token,
+          remove: () => { chipMounted = false; },
+        };
+        return {
+          get textContent() { return (chipMounted ? chip : "") + typed; },
+          querySelectorAll: (selector: string) =>
+            selector === "*" ? [] : chipMounted ? [token] : [],
+        };
+      };
+      const form = { querySelector: () => null, querySelectorAll: () => [] };
+      const composer = {
+        isConnected: true, getClientRects: () => [{}],
+        get innerText() { return (chipMounted ? chip : "") + typed; },
+        closest: () => form, contains: () => false,
+        cloneNode: () => clone(),
+      };
+      const document = {
+        querySelectorAll: (selector: string) =>
+          selector === composerSelector && !onDirectory ? [composer] : [],
+        createTreeWalker: () => ({ nextNode: () => false }),
+      };
+      return runInNewContext(`(${fn.toString()})(arg)`, {
+        arg, document, location: new URL(page.url()), HTMLTextAreaElement: class {}, NodeFilter: { SHOW_TEXT: 4 },
+      });
+    }) as typeof page.evaluate;
+  }
+
+  it("admits a chip-only composer only for the owned connector and names connector_unowned without it", async () => {
+    const { page, rowClick } = pageFor();
+    installChipHomeDom(page, "lane-x");
+    await expect(assertPreflightDraftSafe(page, { connector: "lane-x" })).resolves.toBeUndefined();
+    // A different connector is not this lane's chip: identity, not mere presence.
+    await expect(assertPreflightDraftSafe(page, { connector: "other-lane" }))
+      .rejects.toMatchObject({ code: "preflight_draft_protected", reason: "connector_token_text" });
+    const refusal = await assertPreflightDraftSafe(page).catch(caught => caught);
+    expect(refusal).toMatchObject({ code: "preflight_draft_protected", reason: "connector_unowned" });
+    expect(rowClick).not.toHaveBeenCalled();
+  });
+
+  it("carries the threaded connector through the protected home guard and refuses without it", async () => {
+    const { page, rowClick } = pageFor();
+    installChipHomeDom(page, "lane-x");
+    await expect(openConversation(page, { gizmoId: target.id }, undefined, true, "lane-x"))
+      .resolves.toBeUndefined();
+    expect(rowClick).toHaveBeenCalledTimes(1);
+
+    const { page: bare, rowClick: bareClick } = pageFor();
+    installChipHomeDom(bare, "lane-x");
+    const error = await openConversation(bare, { gizmoId: target.id }, undefined, true).catch(caught => caught);
+    expect(error).toMatchObject({ code: "preflight_draft_protected", reason: "connector_unowned" });
+    expect(bareClick).not.toHaveBeenCalled();
+  });
+
+  it("still refuses a chip plus typed text beside it when the connector is threaded", async () => {
+    const { page, rowClick } = pageFor();
+    installChipHomeDom(page, "lane-x", "private draft beside the chip");
+    const error = await openConversation(page, { gizmoId: target.id }, undefined, true, "lane-x").catch(caught => caught);
+    expect(error).toMatchObject({ code: "preflight_draft_protected", reason: "text_present" });
+    expect(rowClick).not.toHaveBeenCalled();
+  });
+});

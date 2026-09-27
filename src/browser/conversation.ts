@@ -75,14 +75,23 @@ export async function openConversation(
   opts: { model?: string; conversationId?: string; gizmoId?: string; gizmoShortUrl?: string } = {},
   onPhase?: (phase: ProjectNavigationPhase) => void,
   protectDraft = false,
+  ownedConnector?: string,
 ): Promise<void> {
   // Every protected step proves the CURRENT surface empty before it acts, so
   // the composer-free Projects directory (the one surface this flow visits
   // without a composer) is admissible only after the step before it -- home --
   // was itself proven empty in this same guarded navigation.
   let sourceProvenEmpty = false;
+  // P-035 2026-09-28 r20. The protected navigation is the phase where a lane's
+  // OWN configured connector chip can still be sitting on the home composer:
+  // an earlier preflight attached it, refused later, and left the residue,
+  // while `ownedConnector` in the preflight stays undefined until its own
+  // `setConnector` returns. Threading that identity here is what lets the
+  // guard admit the chip-only surface instead of refusing `connector_unowned`
+  // and never reaching the steps that clear the residue. Undefined keeps the
+  // exact behaviour every other caller had: no owned connector.
   const guard = async (): Promise<void> => {
-    await assertPreflightDraftSafe(page);
+    await assertPreflightDraftSafe(page, { connector: ownedConnector });
     sourceProvenEmpty = true;
   };
   if (opts.conversationId) {
@@ -2018,11 +2027,18 @@ export async function setConnector(page: Page, name: string, protectDraft = fals
     markAt = Date.now();
   };
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
-  if (protectDraft) await assertPreflightDraftSafe(page);
+  // P-035 2026-09-28 r20. The three pre-attach guards judge the surface this
+  // call is about to clear, and the one chip that surface may legitimately
+  // hold is this call's OWN connector -- attached by an earlier refused run
+  // and persisted. Passing the trimmed name lets the guard admit that residue
+  // by identity (exactly the same rule the preflight's own guard uses) so the
+  // steps that clear it actually run. The `{ text: "@" }` guards below are
+  // unchanged: they judge a different, already-cleared surface.
+  if (protectDraft) await assertPreflightDraftSafe(page, { connector: connectorName });
   await composer.click();
-  if (protectDraft) await assertPreflightDraftSafe(page);
+  if (protectDraft) await assertPreflightDraftSafe(page, { connector: connectorName });
   await page.keyboard.press("Meta+A");
-  if (protectDraft) await assertPreflightDraftSafe(page);
+  if (protectDraft) await assertPreflightDraftSafe(page, { connector: connectorName });
   await page.keyboard.press("Backspace");
   await page.keyboard.type("@");
   await page.waitForTimeout(300);

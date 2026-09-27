@@ -163,7 +163,7 @@ export async function runInteractionPreflight(
       model: opts.model,
       gizmoId: opts.gizmoId,
       gizmoShortUrl: opts.gizmoShortUrl,
-    }, mark, true);
+    }, mark, true, configuredConnector);
     mark("account-project");
     await requireAccount(page, opts.expectedAccountEmail);
     mark("composer");

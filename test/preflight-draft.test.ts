@@ -282,7 +282,10 @@ describe("draft-safe interaction preflight", () => {
     goHome.mockImplementation(() => { state.url = "https://chatgpt.com/"; state.count = 1; state.mention = ""; });
     setConnector.mockImplementation(() => { state.mention = "fixture"; });
     await expect(runInteractionPreflight(options, session)).resolves.toMatchObject({ connectorVerified: true, power: 4 });
-    expect(openConversation).toHaveBeenCalledWith(session.page, expect.any(Object), expect.any(Function), true);
+    // P-035 2026-09-28 r20. The protected navigation now also receives the
+    // lane's configured connector, so its own home/surface guards admit the
+    // lane's chip-only residue instead of refusing `connector_unowned`.
+    expect(openConversation).toHaveBeenCalledWith(session.page, expect.any(Object), expect.any(Function), true, "fixture");
     expect(setConnector).toHaveBeenCalledWith(session.page, "fixture", true);
     expect(goHome).toHaveBeenCalledTimes(2);
   });
