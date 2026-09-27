@@ -1182,9 +1182,12 @@ export async function ensureProSixMaximum(
     const picked = await readPickerModel(page, model);
     // P-035 2026-09-27. A greyed-out `Pro` row is not UI drift and not a model
     // choice: it is the account's Pro usage limit. It is read HERE -- the picker
-    // items are already enumerated, before the newest-model check and before
-    // anything is typed or sent -- so the lane reports the real cause instead of
-    // the "selector no longer resolves" misreport that a later failure produced.
+    // items are already enumerated, before the newest-model check -- which is
+    // AFTER sendPrompt has typed the prompt (the model check runs deliberately
+    // after the insert) and before anything is sent. The lane therefore reports
+    // the real cause instead of the "selector no longer resolves" misreport that
+    // a later failure produced, and the refusal now leaves the just-typed prompt
+    // in the composer for `sendPrompt` to remove.
     const proLimit = await detectProUsageLimit(page);
     if (proLimit) {
       console.error(
@@ -2323,7 +2326,22 @@ export async function sendPrompt(
 
   // Typing may change inline modes. Verify the composed request, not just
   // the empty composer, and let failures stop both click and Enter submission.
-  await verifySubmission?.();
+  //
+  // A pre-submit refusal here (the Pro usage limit is the live one) fires
+  // AFTER the prompt is already in the composer. ChatGPT persists that draft
+  // across a lane restart, and the next preflight then refuses it as an
+  // unowned draft and wedges the lane until a human clears it. So this call
+  // removes what it itself inserted, and only while ownership is still
+  // provable here in the same call. The refusal itself is re-thrown
+  // unchanged: this is cleanup, not a different outcome.
+  try {
+    await verifySubmission?.();
+  } catch (error) {
+    if (error instanceof PreSubmitInteractionError) {
+      await discardOwnedPresubmitDraft(page, composer, prompt, preserveExisting);
+    }
+    throw error;
+  }
   if (cancelled?.()) return priorAssistantCount;
 
   // Last thing before the send click: does the composer hold the prompt? This
@@ -2341,6 +2359,67 @@ export async function sendPrompt(
     if (!cancelled?.()) await page.keyboard.press("Enter");
   }
   return priorAssistantCount;
+}
+
+/**
+ * Remove the draft THIS call inserted, immediately after a pre-submit refusal.
+ *
+ * P-035 2026-09-27. The model check runs after the insert on purpose (see the
+ * comment at its call site), so its refusal leaves the prompt sitting in the
+ * composer. ChatGPT keeps that draft across a lane restart, and the next
+ * preflight then refuses it as an unowned draft (`reason=unknown_control:...`,
+ * the restored prompt in the capture): the lane is stuck until a human clears
+ * it. Clearing it here, in the same call that typed it, is the only point at
+ * which ownership is provable.
+ *
+ * Ownership is proven by `assertPreflightDraftSafe`, which admits only when
+ * the composer holds exactly this call's owned text. This call places no
+ * connector token: `preserveExisting` is true on every connector turn, and it
+ * is false here, so the spec is the prompt alone. Anything else -- different
+ * text, an extra node, a token, an evaluation failure -- is not proven ours
+ * and the composer is left untouched. The refusal is the caller's to re-throw;
+ * nothing here may replace or mask it.
+ *
+ * Exactly one content-free line is logged, and it never carries page or
+ * prompt text.
+ */
+async function discardOwnedPresubmitDraft(
+  page: Page, composer: Locator, prompt: string, preserveExisting: boolean,
+): Promise<void> {
+  try {
+    if (preserveExisting) {
+      console.error("[cgpro:presubmit] owned draft cleared=no reason=preserve_existing");
+      return;
+    }
+    let owned = false;
+    try {
+      // Admissible only as exactly the text this call inserted. A refusal here
+      // is "not ours", never a reason to clear anything.
+      await assertPreflightDraftSafe(page, { text: prompt });
+      owned = true;
+    } catch {
+      owned = false;
+    }
+    if (!owned) {
+      console.error("[cgpro:presubmit] owned draft cleared=no reason=not_owned");
+      return;
+    }
+    // Playwright's own keyboard, scoped to the composer this call focused:
+    // select the whole draft, then delete it.
+    await composer.click();
+    await page.keyboard.press("Meta+A");
+    await page.keyboard.press("Delete");
+    const remaining = await readComposer(page, composer);
+    if (remaining === null || remaining.length > 0) {
+      console.error("[cgpro:presubmit] owned draft cleared=no reason=clear_failed");
+      return;
+    }
+    console.error("[cgpro:presubmit] owned draft cleared=yes reason=owned");
+  } catch {
+    // Cleanup must never mask the refusal it is repairing. No composer state
+    // is read or reported beyond the content-free outcome.
+    console.error("[cgpro:presubmit] owned draft cleared=no reason=clear_failed");
+  }
 }
 
 /**
