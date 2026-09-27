@@ -335,25 +335,60 @@ describe("draft-safe interaction preflight", () => {
     expect(error.reason).not.toContain(`${"f".repeat(60)}`);
   });
 
-  // P-035 2026-09-27. Live ms1980 (vendor 52e8ed6): with every composer control
-  // admitted, the empty home composer refused
-  // `rich_attr:data-empty-paragraph`. The editor renders its placeholder as
-  // `<p data-empty-paragraph="">`. Admit exactly that shape: a P, that one
-  // attribute, own text empty, element children only BR.
+  // P-035 2026-09-27 r10. Live ms1980 (vendor 858d698): once
+  // `data-empty-paragraph` was admitted, the same empty placeholder paragraph
+  // refused `rich_attr:data-placeholder`. Admitting attribute names one round
+  // at a time is the wrong rule. A P with no text and only BR children cannot
+  // carry draft content, whatever attributes it has, so that whole shape is
+  // exempt from the attribute refusal: every attribute on it is skipped at once.
   it("admits an empty composer whose editor holds the empty placeholder paragraph", async () => {
     const bare = fixture({
-      rich: [{ tagName: "P", attributes: [{ name: "data-empty-paragraph", value: "" }] }],
+      rich: [{
+        tagName: "P",
+        attributes: [
+          { name: "data-empty-paragraph", value: "" },
+          { name: "data-placeholder", value: "Ask anything" },
+          { name: "class", value: "placeholder" },
+        ],
+      }],
       controls: [{ ariaLabel: "Add files and more" }, { testid: "send-button" }],
     });
     await expect(assertPreflightDraftSafe(bare.page)).resolves.toBeUndefined();
 
-    const withBreak = fixture({ rich: [
-      { tagName: "P", attributes: [{ name: "data-empty-paragraph", value: "" }], children: [{ tagName: "BR" }] },
-    ] });
+    const withBreak = fixture({ rich: [{
+      tagName: "P",
+      attributes: [
+        { name: "data-empty-paragraph", value: "" },
+        { name: "data-placeholder", value: "Ask anything" },
+        { name: "class", value: "placeholder" },
+      ],
+      children: [{ tagName: "BR" }],
+    }] });
     await expect(assertPreflightDraftSafe(withBreak.page)).resolves.toBeUndefined();
   });
 
-  it("still refuses data-empty-paragraph on a P with text, another tag, or a second attribute", async () => {
+  it("refuses a placeholder-named attribute on any node that can carry content", async () => {
+    // A P with own text is not a placeholder paragraph: full attribute check.
+    const withText = await assertPreflightDraftSafe(fixture({ text: "private user draft",
+      rich: [{ tagName: "P", attributes: [{ name: "data-placeholder", value: "x" }], textContent: "hello" }],
+    }).page).catch(error => error);
+    expect(withText.reason).toBe("rich_attr:data-placeholder");
+    expect(JSON.stringify(withText)).not.toContain("private user draft");
+
+    // A P with a non-BR child element is not a placeholder paragraph either.
+    const withElement = await assertPreflightDraftSafe(fixture({
+      rich: [{ tagName: "P", attributes: [{ name: "data-placeholder", value: "x" }], children: [{ tagName: "SPAN" }] }],
+    }).page).catch(error => error);
+    expect(withElement.reason).toBe("rich_attr:data-placeholder");
+
+    // Another tag never qualifies, whatever its text or children.
+    const otherTag = await assertPreflightDraftSafe(fixture({
+      rich: [{ tagName: "SPAN", attributes: [{ name: "data-placeholder", value: "x" }] }],
+    }).page).catch(error => error);
+    expect(otherTag.reason).toBe("rich_attr:data-placeholder");
+  });
+
+  it("still refuses data-empty-paragraph on a P with text or another tag", async () => {
     const withText = await assertPreflightDraftSafe(fixture({ text: "private user draft",
       rich: [{ tagName: "P", attributes: [{ name: "data-empty-paragraph", value: "" }], textContent: "private user draft" }],
     }).page).catch(error => error);
@@ -364,18 +399,14 @@ describe("draft-safe interaction preflight", () => {
       rich: [{ tagName: "SPAN", attributes: [{ name: "data-empty-paragraph", value: "" }] }],
     }).page).catch(error => error);
     expect(otherTag.reason).toBe("rich_attr:data-empty-paragraph");
-
-    const extraAttribute = await assertPreflightDraftSafe(fixture({
-      rich: [{ tagName: "P",
-        attributes: [{ name: "data-empty-paragraph", value: "" }, { name: "data-foo", value: "x" }] }],
-    }).page).catch(error => error);
-    expect(extraAttribute.reason).toBe("rich_attr:data-foo");
   });
 
-  // P-035 2026-09-27. The rich-node refusal now names every refused attribute on
-  // the first refusing node, so a further variant attribute shows up in one round.
+  // P-035 2026-09-27. The rich-node refusal names every refused attribute on
+  // the first refusing node, so a further variant attribute shows up in one
+  // round. r10: the probe node is a SPAN because a bare P with no text and no
+  // non-BR child is now the exempt placeholder shape.
   it("names every refused attribute on the first refusing node, de-duplicated", async () => {
-    const { page } = fixture({ rich: [{ tagName: "P", attributes: [{ name: "data-a" }, { name: "data-b" }] }] });
+    const { page } = fixture({ rich: [{ tagName: "SPAN", attributes: [{ name: "data-a" }, { name: "data-b" }] }] });
     const error = await assertPreflightDraftSafe(page).catch(error => error);
     expect(error).toBeInstanceOf(PreflightDraftProtectedError);
     expect(error.reason).toBe("rich_attr:data-a|data-b");

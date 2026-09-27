@@ -2225,26 +2225,29 @@ export async function assertPreflightDraftSafe(
       //
       // P-035 2026-09-27. On this account's empty home composer the editor
       // renders its placeholder paragraph as `<p data-empty-paragraph="">` --
-      // vendor UI chrome for an empty draft, not content. Admit that ONE
-      // attribute in exactly that shape: only on a P, only while the P's own
-      // trimmed text is empty, and only while its element children are BR
-      // alone. Every other refused attribute on that node still refuses, and
-      // `data-empty-paragraph` on any other tag or on a P with text still
-      // refuses. The refusal now names EVERY refused attribute on the FIRST
-      // refusing node (de-duplicated, DOM attribute order, at most 5, whole
-      // code capped at 200) so any further variant attribute shows up in one
-      // round. Attribute names only, never a value: still content-free.
+      // vendor UI chrome for an empty draft, not content. Live ms1980 (vendor
+      // 858d698) then refused the same node's `data-placeholder`/`class`:
+      // admitting attribute NAMES one live round at a time is the wrong rule.
+      // A P with no text and only BR children cannot carry draft content,
+      // whatever attributes it has, and the text/media/token/control checks
+      // already run independently. So exempt exactly that shape from the
+      // attribute refusal ENTIRELY: on a placeholder paragraph the attribute
+      // loop is skipped, for all attributes at once. Any other tag, or a P
+      // with any text or any non-BR child element, still gets the full check
+      // and its `rich_attr:<a>|<b>` reason. The refusal names EVERY refused
+      // attribute on the FIRST refusing node (de-duplicated, DOM attribute
+      // order, at most 5, whole code capped at 200). Attribute names only,
+      // never a value: still content-free.
       const placeholderParagraph = (element: Element): boolean =>
         element.tagName === "P"
         && (element.textContent ?? "").trim() === ""
         && Array.from(element.children).every(child => child.tagName === "BR");
       for (const child of Array.from(copy.querySelectorAll("*"))) {
         if (!/^(P|BR|SPAN|STRONG|EM|B|I|CODE|PRE|UL|OL|LI)$/.test(child.tagName)) return `rich_node:${chrome(child.tagName) || "unknown"}`;
-        const emptyPlaceholder = placeholderParagraph(child);
+        if (placeholderParagraph(child)) continue;
         const refusedAttributes: string[] = [];
         for (const attribute of Array.from(child.attributes)) {
           if (!/^(data-|contenteditable|role|aria-|hidden|style)/.test(attribute.name)) continue;
-          if (emptyPlaceholder && attribute.name === "data-empty-paragraph") continue;
           const name = chrome(attribute.name) || "unknown";
           if (refusedAttributes.length < 5 && !refusedAttributes.includes(name)) refusedAttributes.push(name);
         }
