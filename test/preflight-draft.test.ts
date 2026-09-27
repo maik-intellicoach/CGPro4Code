@@ -1187,3 +1187,98 @@ describe("foreign text refusal shape", () => {
     }
   });
 });
+
+// P-035 2026-09-28 r19. Live ms1980 refused `foreign_text` on a composer that
+// already proved it held only this call's own chip. The refusing span was a
+// hidden, whitespace-free serialisation that contains the owned connector -- a
+// mirror of the chip, not a draft. These cases prove that exact shape is
+// admitted only while this call's own token was admitted, and that every other
+// node still refuses exactly as before.
+describe("hidden single-token mirror of the owned chip (r19)", () => {
+  const reasonOf = async (page: Page, owned: { text?: string; connector?: string }) =>
+    (await assertPreflightDraftSafe(page, owned).then(() => undefined).catch(caught => caught))?.reason;
+
+  it("admits a hidden whitespace-free span containing the owned connector", async () => {
+    // The composer holds only the owned chip; the span mirrors it as UI chrome.
+    await expect(assertPreflightDraftSafe(
+      fixture({
+        mention: "fixture",
+        foreignText: "[x]{fixture}(id-123)",
+        foreignParent: { tagName: "SPAN", ariaHidden: true },
+      }).page,
+      { connector: "fixture" },
+    )).resolves.toBeUndefined();
+
+    // The aria-hidden ancestor need not be the direct parent.
+    await expect(assertPreflightDraftSafe(
+      fixture({
+        mention: "fixture",
+        foreignText: "[x]{fixture}(id-123)",
+        foreignParent: { tagName: "SPAN" },
+        foreignAncestors: [{ tagName: "DIV", ariaHidden: true }],
+      }).page,
+      { connector: "fixture" },
+    )).resolves.toBeUndefined();
+  });
+
+  it("refuses every neighbouring shape exactly as before", async () => {
+    // Hidden, but the single token carries whitespace.
+    expect(await reasonOf(
+      fixture({
+        mention: "fixture",
+        foreignText: "[x]{fixture} hello",
+        foreignParent: { tagName: "SPAN", ariaHidden: true },
+      }).page,
+      { connector: "fixture" },
+    )).toBe("foreign_text");
+
+    // Hidden single token WITHOUT the owned connector.
+    expect(await reasonOf(
+      fixture({
+        mention: "fixture",
+        foreignText: "[x]{other}(id-123)",
+        foreignParent: { tagName: "SPAN", ariaHidden: true },
+      }).page,
+      { connector: "fixture" },
+    )).toBe("foreign_text");
+
+    // Visible (not aria-hidden) single token that does contain the connector.
+    expect(await reasonOf(
+      fixture({
+        mention: "fixture",
+        foreignText: "[x]{fixture}(id-123)",
+        foreignParent: { tagName: "SPAN", rects: 1 },
+      }).page,
+      { connector: "fixture" },
+    )).toBe("foreign_text");
+
+    // The hidden mirror is present but no owned token was admitted this call.
+    expect(await reasonOf(
+      fixture({
+        foreignText: "[x]{fixture}(id-123)",
+        foreignParent: { tagName: "SPAN", ariaHidden: true },
+      }).page,
+      { connector: "fixture" },
+    )).toBe("foreign_text");
+  });
+
+  it("keeps the unowned shape path as `n/a` when no connector is passed", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = await assertPreflightDraftSafe(
+        fixture({
+          foreignText: "[x]{fixture}(id-123)",
+          foreignParent: { tagName: "SPAN", ariaHidden: true },
+        }).page,
+      ).catch(caught => caught);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("foreign_text");
+      const shapeLine = spy.mock.calls.map(call => String(call[0]))
+        .find(line => line.includes("foreign text shape"));
+      expect(shapeLine).toContain("contains_connector=n/a");
+      expect(shapeLine).not.toContain("id-123");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});

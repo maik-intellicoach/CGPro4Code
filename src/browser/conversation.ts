@@ -2505,14 +2505,37 @@ export async function assertPreflightDraftSafe(
           labels,
         };
       };
+      // P-035 2026-09-28 r19. Live ms1980 refused `foreign_text` (shape:
+      // `tag=SPAN role=- testid=- hidden=aria len=84 equals_connector=no
+      // contains_connector=yes equals_placeholder=none equals_composer_text=no
+      // words=1 path=SPAN<FORM labels=0`) on a composer already proven to hold
+      // only this call's own chip, and only while the chip was present. That
+      // span is a hidden, whitespace-free serialisation mirroring the chip (an
+      // aria-hidden live region or tooltip), not a draft: a draft is visible and
+      // carries its own words. Admit exactly that shape -- a hidden single token
+      // that contains the owned connector AND was only reachable because this
+      // call's own token was admitted above. Every other node still refuses
+      // exactly as before: visible text, hidden text without the owned
+      // connector, hidden text with whitespace, and any such node when no owned
+      // token was admitted (the `n/a` path).
+      const hiddenByAria = (node: Node): boolean => {
+        for (let element = node.parentElement; inForm(element); element = element?.parentElement ?? null) {
+          const current = element as Element;
+          if (current.getAttribute("aria-hidden") === "true") return true;
+          if (current === form) break;
+        }
+        return false;
+      };
       const walker = document.createTreeWalker(form, NodeFilter.SHOW_TEXT);
       while (walker.nextNode()) {
         const node = walker.currentNode;
-        if (!node.textContent?.trim() || composer.contains(node)) continue;
+        const nodeText = node.textContent?.trim() ?? "";
+        if (!nodeText || composer.contains(node)) continue;
         const parent = node.parentElement;
-        if (!parent?.closest('button, [role="button"], [role="menu"], [role="listbox"]')) {
-          return { reason: "foreign_text", foreignShape: foreignShape(node) };
-        }
+        if (parent?.closest('button, [role="button"], [role="menu"], [role="listbox"]')) continue;
+        if (ownedToken && owned.connector && hiddenByAria(node)
+          && !/\s/.test(nodeText) && nodeText.includes(owned.connector)) continue;
+        return { reason: "foreign_text", foreignShape: foreignShape(node) };
       }
       return true;
     }, { selector: joinSelectors(SELECTORS.composer), owned });
