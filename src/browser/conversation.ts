@@ -521,8 +521,20 @@ const PRO_TOOLTIP_SELECTOR = '[role="tooltip"]';
 const PRO_ITEM_LABEL = "Pro";
 /** Cap on the tooltip text carried on the error and the event. */
 const PRO_LIMIT_TEXT_MAX = 200;
-/** How long the hover is given to surface its tooltip. */
+/** How long a hover is given to surface its tooltip. */
 const PRO_TOOLTIP_WAIT_MS = 3_000;
+/** Selector tiers the post-hover poll prefers, in order, before falling back to any element. */
+const PRO_LIMIT_TEXT_TIERS = [
+  PRO_TOOLTIP_SELECTOR,
+  "[data-radix-popper-content-wrapper]",
+  "[data-side]",
+];
+/** How many ancestor levels above the disabled row the passive read walks. */
+const PRO_PASSIVE_ANCESTOR_LEVELS = 4;
+/** One poll step; the deadline still caps the whole wait at PRO_TOOLTIP_WAIT_MS. */
+const PRO_TOOLTIP_POLL_MS = 100;
+/** Hard attempt cap, so a mocked (instant) clock cannot spin the poll loop. */
+const PRO_TOOLTIP_POLL_ATTEMPTS = 40;
 
 /** Month names as ChatGPT spells them in the limit tooltip. */
 const PRO_MONTHS: Record<string, number> = {
@@ -617,6 +629,146 @@ interface ProUsageLimit {
   limitText: string | null;
 }
 
+/** Where the limit sentence was read from. Logged content-free, never page text. */
+type ProLimitTextSource =
+  | "passive-title"
+  | "passive-aria"
+  | "describedby"
+  | "hover-row"
+  | "hover-ancestor"
+  | "none";
+
+/** What one forced hover did. `skipped` means it was never needed. */
+type ProHoverOutcome = "resolved" | "rejected" | "skipped";
+
+interface ProLimitText {
+  source: ProLimitTextSource;
+  text: string;
+}
+
+/**
+ * The limit sentence read WITHOUT any pointer interaction.
+ *
+ * P-035 2026-09-27. The live intelli lane produced no visible `[role="tooltip"]`
+ * within three seconds of a plain `locator.hover()` on the greyed `Pro` row, so
+ * the sentence has to be looked for where the page may already carry it: as a
+ * `title`, as a RELEVANT `aria-label`, or as the text of an `aria-describedby`
+ * target on the disabled row or one of its ancestors. The walk starts at the row
+ * and climbs at most four levels, stopping after the menu boundary.
+ *
+ * Read-only and never throws: any failure means "nothing passive here", and the
+ * caller falls back to a forced hover.
+ *
+ * Every passive candidate is gated on the limit wording. That gate cannot lose a
+ * date -- `parseProAvailableAfter` needs `Try again after <month> <day>, <year>`
+ * anyway -- and it stops a benign `title="Pro"` (the row's own name) from being
+ * recorded as the limit text and masking the real tooltip.
+ */
+async function readProLimitTextPassive(page: Page, index: number): Promise<ProLimitText | null> {
+  try {
+    const found = await page.evaluate(
+      ({ proLimitPassiveAt, levels }: { proLimitPassiveAt: number; levels: number }) => {
+        const relevant = /Limit reached|Try again after/i;
+        const items = Array.from(
+          document.querySelectorAll('[role="menuitem"],[role="menuitemradio"]'),
+        );
+        const row = items[proLimitPassiveAt];
+        if (!row) return null;
+        const chain: Element[] = [row];
+        let node: Element | null = row.parentElement;
+        for (let level = 0; level < levels && node; level++) {
+          chain.push(node);
+          if (node.getAttribute("role") === "menu") break;
+          node = node.parentElement;
+        }
+        for (const element of chain) {
+          const title = (element.getAttribute("title") ?? "").trim();
+          if (title.length > 0 && relevant.test(title)) {
+            return { source: "passive-title" as const, text: title };
+          }
+          const aria = (element.getAttribute("aria-label") ?? "").trim();
+          if (aria.length > 0 && relevant.test(aria)) {
+            return { source: "passive-aria" as const, text: aria };
+          }
+          const describedBy = (element.getAttribute("aria-describedby") ?? "").trim();
+          if (describedBy.length > 0) {
+            for (const id of describedBy.split(/\s+/)) {
+              const target = document.getElementById(id);
+              const text = (target?.textContent ?? "").trim();
+              if (text.length > 0 && relevant.test(text)) {
+                return { source: "describedby" as const, text };
+              }
+            }
+          }
+        }
+        return null;
+      },
+      { proLimitPassiveAt: index, levels: PRO_PASSIVE_ANCESTOR_LEVELS },
+    );
+    if (!found || typeof found.text !== "string" || found.text.length === 0) return null;
+    return { source: found.source, text: found.text };
+  } catch {
+    return null;
+  }
+}
+
+/** Hover with Playwright's own pointer and `force`, the way the live lane needs. */
+async function forcedHover(target: Locator): Promise<ProHoverOutcome> {
+  try {
+    // `force` skips the actionability check that refuses a greyed,
+    // pointer-events-none row; the pointer is still Playwright's, never OS input.
+    await target.hover({ force: true, timeout: PRO_TOOLTIP_WAIT_MS });
+    return "resolved";
+  } catch {
+    return "rejected";
+  }
+}
+
+/** One document-wide, read-only look for a VISIBLE element carrying the sentence. */
+async function scanVisibleLimitText(page: Page): Promise<string | null> {
+  return page.evaluate(
+    ({ tiers }: { tiers: string[] }) => {
+      const relevant = /Limit reached|Try again after/i;
+      const textOf = (element: Element): string => (element.textContent ?? "").trim();
+      const visible = (element: Element): boolean => {
+        const style = window.getComputedStyle(element);
+        if (style.visibility === "hidden" || style.display === "none") return false;
+        if (Number.parseFloat(style.opacity || "1") === 0) return false;
+        const rect = element.getBoundingClientRect();
+        return !(rect.width === 0 && rect.height === 0);
+      };
+      for (const selector of tiers) {
+        for (const element of Array.from(document.querySelectorAll(selector))) {
+          const text = textOf(element);
+          if (text.length > 0 && relevant.test(text) && visible(element)) return text;
+        }
+      }
+      // No known wrapper carried it: the innermost matching element wins, so the
+      // answer is the sentence itself rather than every ancestor's whole subtree.
+      let smallest: string | null = null;
+      for (const element of Array.from(document.querySelectorAll("body *"))) {
+        const text = textOf(element);
+        if (text.length === 0 || !relevant.test(text) || !visible(element)) continue;
+        if (smallest === null || text.length < smallest.length) smallest = text;
+      }
+      return smallest;
+    },
+    { proLimitScan: true, tiers: [...PRO_LIMIT_TEXT_TIERS] },
+  );
+}
+
+/** Poll for the sentence after one hover, up to the hover's own 3 s budget. */
+async function pollVisibleLimitText(page: Page): Promise<string | null> {
+  const deadline = Date.now() + PRO_TOOLTIP_WAIT_MS;
+  for (let attempt = 0; attempt < PRO_TOOLTIP_POLL_ATTEMPTS; attempt++) {
+    const text = await scanVisibleLimitText(page).catch(() => null);
+    if (text) return text;
+    if (Date.now() >= deadline) break;
+    await page.waitForTimeout(PRO_TOOLTIP_POLL_MS).catch(() => undefined);
+  }
+  return null;
+}
+
 /**
  * Is the picker's `Pro` row disabled, and if so when does Pro return?
  *
@@ -625,25 +777,64 @@ interface ProUsageLimit {
  * greyed `Pro`, whose tooltip reads `Limit reached. Try again after Sep 30, 2026.`
  * The composer still names `Latest`, so nothing the model checks look at changes
  * -- which is why the limit has to be read off the row itself. Absent or enabled
- * `Pro` returns null and the caller behaves exactly as before. The hover uses the
- * page's own Playwright API; the tooltip text is the only page content read, and
- * it is capped before it leaves this function.
+ * `Pro` returns null and the caller behaves exactly as before.
+ *
+ * The sentence is read in three widening steps, because a real pointer showed a
+ * tooltip that a plain `hover()` could not reach: the passive attributes first,
+ * then a forced hover on the row, then a forced hover on the nearest ancestor
+ * that is not the menu itself. Every source uses the page's own Playwright API;
+ * the sentence is the only page content read, and it is capped before it leaves
+ * this function. Exactly one content-free diagnostic line is logged per
+ * detection, naming the source and each hover outcome but never the page text.
  */
 async function detectProUsageLimit(page: Page): Promise<ProUsageLimit | null> {
   const index = await findDisabledProItemIndex(page);
   if (index < 0) return null;
   const item = page.locator(MODEL_MENU_ITEM_SELECTOR).nth(index);
-  await item.hover({ timeout: PRO_TOOLTIP_WAIT_MS }).catch(() => undefined);
+
+  let source: ProLimitTextSource = "none";
   let limitText: string | null = null;
-  try {
-    const tooltip = page.locator(PRO_TOOLTIP_SELECTOR).first();
-    await tooltip.waitFor({ state: "visible", timeout: PRO_TOOLTIP_WAIT_MS });
-    const trimmed = ((await tooltip.textContent()) ?? "").trim();
-    if (trimmed.length > 0) limitText = trimmed.slice(0, PRO_LIMIT_TEXT_MAX);
-  } catch {
-    // A disabled Pro row with no readable tooltip is still sufficient evidence.
-    limitText = null;
+  let rowHover: ProHoverOutcome = "skipped";
+  let ancestorHover: ProHoverOutcome = "skipped";
+
+  // 1. Passive sources: no pointer needed, and nothing is left hovered behind.
+  const passive = await readProLimitTextPassive(page, index);
+  if (passive) {
+    source = passive.source;
+    limitText = passive.text.slice(0, PRO_LIMIT_TEXT_MAX);
   }
+  // 2. A forced hover on the disabled row itself.
+  if (limitText === null) {
+    rowHover = await forcedHover(item);
+    if (rowHover === "resolved") {
+      const text = await pollVisibleLimitText(page);
+      if (text) {
+        source = "hover-row";
+        limitText = text.slice(0, PRO_LIMIT_TEXT_MAX);
+      }
+    }
+  }
+  // 3. Still nothing: the tooltip can be bound to a wrapper around the row rather
+  // than to the row, so the nearest ancestor that is not the menu gets the hover.
+  if (limitText === null) {
+    const ancestor = item.locator("xpath=ancestor::*[not(@role='menu')][1]");
+    ancestorHover = await forcedHover(ancestor);
+    if (ancestorHover === "resolved") {
+      const text = await pollVisibleLimitText(page);
+      if (text) {
+        source = "hover-ancestor";
+        limitText = text.slice(0, PRO_LIMIT_TEXT_MAX);
+      }
+    }
+  }
+
+  // 4. One content-free line per detection: which source answered and whether
+  // each hover resolved or rejected. The page's own text never appears here.
+  console.error(
+    `[cgpro:model] pro usage limit probe: source=${source} ` +
+      `rowHover=${rowHover} ancestorHover=${ancestorHover}`,
+  );
+
   // Dismiss the hover the way the existing menu cleanup does, so the popover is
   // left as found before the typed refusal is thrown.
   await page.keyboard.press("Escape").catch(() => undefined);

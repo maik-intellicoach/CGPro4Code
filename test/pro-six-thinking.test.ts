@@ -28,6 +28,94 @@ vi.mock("../src/api/models.js", async (importOriginal) => {
 });
 const { ensureProSixMaximum, menuIsThinkingEffort } = await import("../src/browser/conversation.js");
 
+// P-035 2026-09-27. The Pro-limit path reads the page through `page.evaluate`.
+// The test environment is `node` (no jsdom), so these tests install a tiny
+// read-only stand-in for `document`/`window` and let the fake page call the REAL
+// evaluate callback against it. That is what makes "found from the title /
+// aria-describedby / the popper wrapper / only after a forced hover" statements
+// about the shipped code rather than about a hand-written mock.
+class FakeElement {
+  readonly children: FakeElement[] = [];
+  parent: FakeElement | null = null;
+  /** `false` makes the element report as hidden to `getComputedStyle`/rect. */
+  visible = true;
+
+  constructor(
+    readonly tagName: string,
+    private readonly attrs: Record<string, string> = {},
+    private readonly ownText = "",
+  ) {}
+
+  get textContent(): string {
+    return this.ownText + this.children.map((child) => child.textContent).join("");
+  }
+
+  get parentElement(): FakeElement | null {
+    return this.parent;
+  }
+
+  getAttribute(name: string): string | null {
+    return this.attrs[name] ?? null;
+  }
+
+  setAttribute(name: string, value: string): void {
+    this.attrs[name] = value;
+  }
+
+  append(child: FakeElement): FakeElement {
+    child.parent = this;
+    this.children.push(child);
+    return child;
+  }
+
+  getBoundingClientRect(): { width: number; height: number } {
+    return this.visible ? { width: 140, height: 24 } : { width: 0, height: 0 };
+  }
+}
+
+function descendantsOf(root: FakeElement): FakeElement[] {
+  const out: FakeElement[] = [];
+  const visit = (node: FakeElement): void => {
+    for (const child of node.children) {
+      out.push(child);
+      visit(child);
+    }
+  };
+  visit(root);
+  return out;
+}
+
+/** Supports exactly the attribute selectors the Pro-limit probes use. */
+function matchesAny(node: FakeElement, selectors: string[]): boolean {
+  return selectors.some((selector) => {
+    const attr = /^\[([a-zA-Z-]+)(?:="([^"]*)")?\]$/.exec(selector);
+    if (!attr) return false;
+    const value = node.getAttribute(attr[1]);
+    return attr[2] === undefined ? value !== null : value === attr[2];
+  });
+}
+
+interface FakeDocument {
+  body: FakeElement;
+  querySelectorAll(selector: string): FakeElement[];
+  getElementById(id: string): FakeElement | null;
+}
+
+function makeFakeDocument(body: FakeElement): FakeDocument {
+  const all = (): FakeElement[] => descendantsOf(body);
+  return {
+    body,
+    querySelectorAll: (selector: string): FakeElement[] =>
+      selector === "body *"
+        ? all()
+        : all().filter((node) => matchesAny(node, selector.split(","))),
+    getElementById: (id: string): FakeElement | null =>
+      all().find((node) => node.getAttribute("id") === id) ?? null,
+  };
+}
+
+const LIVE_LIMIT_TEXT = "Limit reached. Try again after Sep 30, 2026.";
+
 function setup(options: {
   max?: string | null;
   sticks?: boolean;
@@ -46,8 +134,27 @@ function setup(options: {
   proIndex?: number;
   /** The disabled row's tooltip text; the live sentence is the default. */
   tooltipText?: string | null;
-  /** The tooltip never becomes visible. */
+  /** The tooltip never appears at all. */
   tooltipVisible?: boolean;
+  /** Passive text placed on the disabled row before any hover. */
+  passiveTitle?: string;
+  passiveAria?: string;
+  /** Text of the element the disabled row's `aria-describedby` points at. */
+  describedByText?: string;
+  /** A `title` on an ancestor inside the menu boundary, not on the row. */
+  ancestorTitle?: string;
+  /** Which selector tier carries the tooltip element. */
+  tooltipTier?: "tooltip" | "popper" | "side";
+  /** The tooltip appears only after the ANCESTOR hover, never the row hover. */
+  tooltipAfterAncestorHoverOnly?: boolean;
+  /** The tooltip exists in the DOM but reports as hidden. */
+  tooltipHidden?: boolean;
+  /** No known tier carries it; only a tiny nested span holds the sentence. */
+  fallbackTooltip?: boolean;
+  /** The disabled row refuses even a forced hover. */
+  rowHoverRejects?: boolean;
+  /** The nearest non-menu ancestor refuses its forced hover. */
+  ancestorHoverRejects?: boolean;
 } = {}) {
   let value = "1";
   const model = {
@@ -73,6 +180,66 @@ function setup(options: {
     // actionability check it can never pass.
     focus: vi.fn(async () => {}),
   };
+  // P-035 2026-09-27: the read-only DOM the real Pro-limit callbacks run against.
+  // Shape mirrors the live picker: body > anchor(data-side) > menu > group > rows,
+  // so the row's nearest non-menu ancestor is the group.
+  const body = new FakeElement("body");
+  const anchor = body.append(new FakeElement("div", { "data-side": "bottom" }));
+  const menu = anchor.append(new FakeElement("div", { role: "menu" }));
+  const group = menu.append(new FakeElement("div"));
+  const rows = (options.pickerEntries ?? ["Latest", "GPT-5.6 Sol", "GPT-5.5"]).map((label) =>
+    group.append(new FakeElement("div", { role: "menuitem" }, label)),
+  );
+  const proRow = options.proIndex === undefined ? undefined : rows[options.proIndex];
+  if (proRow) proRow.setAttribute("aria-disabled", "true");
+  if (options.ancestorTitle !== undefined) group.setAttribute("title", options.ancestorTitle);
+  if (proRow && options.passiveTitle !== undefined) proRow.setAttribute("title", options.passiveTitle);
+  if (proRow && options.passiveAria !== undefined) proRow.setAttribute("aria-label", options.passiveAria);
+  if (proRow && options.describedByText !== undefined) {
+    proRow.setAttribute("aria-describedby", "limit-tip");
+    body.append(new FakeElement("div", { id: "limit-tip" }, options.describedByText));
+  }
+  const fakeDocument = makeFakeDocument(body);
+  (globalThis as Record<string, unknown>).document = fakeDocument;
+  (globalThis as Record<string, unknown>).window = {
+    getComputedStyle: (element: FakeElement) => ({
+      visibility: element.visible ? "visible" : "hidden",
+      display: "block",
+      opacity: "1",
+    }),
+  };
+  const liveText = options.tooltipText === undefined ? LIVE_LIMIT_TEXT : options.tooltipText;
+  const appendTooltip = (text: string, hidden = false): void => {
+    const attrs =
+      options.tooltipTier === "popper"
+        ? { "data-radix-popper-content-wrapper": "" }
+        : options.tooltipTier === "side"
+          ? { "data-side": "top" }
+          : { role: "tooltip" };
+    const element = body.append(new FakeElement("div", attrs, text));
+    element.visible = !hidden;
+  };
+  // The disabled row's forced hover. `{ force: true }` is the whole point on the
+  // live lane: a plain hover on a greyed, pointer-events-none row never resolves.
+  const rowHover = vi.fn(async (hoverOptions?: { force?: boolean }) => {
+    void hoverOptions;
+    if (options.rowHoverRejects) throw new Error("locator.hover: element is not enabled");
+    if (options.tooltipVisible === false || options.tooltipAfterAncestorHoverOnly) return;
+    if (options.fallbackTooltip) {
+      const wrapper = body.append(
+        new FakeElement("div", {}, "Limit reached. Try again after Sep 30, 2026. "),
+      );
+      wrapper.append(new FakeElement("span", {}, liveText ?? ""));
+      return;
+    }
+    if (liveText !== null) appendTooltip(liveText, options.tooltipHidden === true);
+  });
+  const ancestorHover = vi.fn(async (hoverOptions?: { force?: boolean }) => {
+    void hoverOptions;
+    if (options.ancestorHoverRejects) throw new Error("locator.hover: element does not receive events");
+    if (options.tooltipVisible === false) return;
+    if (liveText !== null) appendTooltip(liveText, options.tooltipHidden === true);
+  });
   // P-035 2026-09-18: `evaluate` is part of the real page shape and the menu
   // close postcondition needs it. Without it the fake made every path throw
   // "page.evaluate is not a function" from inside a finally, which masked the
@@ -88,36 +255,35 @@ function setup(options: {
       type: vi.fn(async () => {}),
     },
     waitForTimeout: vi.fn(async () => {}),
-    // Hover and tooltip reads go through the page's own locator API, never OS
-    // input. The disabled-Pro check uses `nth(index).hover()` for the row and
-    // `first().waitFor/textContent()` for the tooltip.
+    // Hover reads go through the page's own locator API, never OS input. The
+    // disabled-Pro check uses `nth(index).hover()` for the row and
+    // `nth(index).locator("xpath=ancestor::...").hover()` for the wrapper above
+    // the menu. `rowHover`/`ancestorHover` are returned to the caller for
+    // assertions on `{ force: true }`.
     locator: vi.fn((selector: string) => {
-      if (selector.includes("tooltip")) {
+      if (selector.includes("menuitem")) {
         return {
-          first: () => ({
-            waitFor: options.tooltipVisible === false
-              ? vi.fn(async () => {
-                  throw new Error("locator.waitFor: Timeout 3000ms exceeded.");
-                })
-              : vi.fn(async () => {}),
-            textContent: vi.fn(async () =>
-              options.tooltipText === undefined
-                ? "Limit reached. Try again after Sep 30, 2026."
-                : options.tooltipText),
+          nth: () => ({
+            hover: rowHover,
+            locator: () => ({ hover: ancestorHover }),
           }),
         };
       }
       return { nth: () => ({ hover: vi.fn(async () => {}) }) };
     }),
-    // Three probes share this entry point on the real page, told apart by
+    // Four probes share this entry point on the real page, told apart by
     // argument shape: the pointer-blocker count takes a selector string, the
-    // picker read takes `{ max }`, and the menu dump takes
-    // `{ selectedSelector, max }` and returns prose.
-    evaluate: vi.fn(async (_fn: unknown, arg: unknown) => {
+    // picker read takes `{ max }`, the menu dump takes `{ selectedSelector, max }`
+    // and returns prose, and the two Pro-limit probes run the SHIPPED callback
+    // against the fake DOM installed above.
+    evaluate: vi.fn(async (fn: unknown, arg: unknown) => {
       if (typeof arg === "string") return openMenus;
       const keys = arg && typeof arg === "object" ? Object.keys(arg) : [];
       if (keys.includes("proLimitProbe")) return options.proIndex ?? -1;
       if (keys.includes("selectedSelector")) return "row=\"6 Pro\" menus=1 menuItems=[] sliders=[4/4]";
+      if (keys.includes("proLimitPassiveAt") || keys.includes("proLimitScan")) {
+        return (fn as (value: unknown) => unknown)(arg);
+      }
       if (options.pickerEmpty) return { entries: [], checkedIndex: -1 };
       return {
         entries: options.pickerEntries ?? ["Latest", "GPT-5.6 Sol", "GPT-5.5"],
@@ -127,7 +293,7 @@ function setup(options: {
   } as unknown as Page;
   requireSelector.mockResolvedValueOnce(model).mockResolvedValueOnce(slider).mockResolvedValueOnce(selected);
   firstResolved.mockResolvedValue(options.menuOpened ? slider : null);
-  return { page, model, slider, selected };
+  return { page, model, slider, selected, rowHover, ancestorHover, fakeDocument };
 }
 
 beforeEach(() => {
@@ -488,5 +654,159 @@ describe("Pro usage limit in the model picker", () => {
     });
     const error = await rejection(s.page);
     expect(error.code).toBe("pro_usage_limit_reached");
+  });
+
+  // --- Passive sources (no pointer at all), P-035 2026-09-27 ----------------
+  it("reads the sentence from the disabled row's title without any hover", async () => {
+    const s = setup({ pickerEntries: ["Latest", "Pro"], proIndex: 1, passiveTitle: LIVE_LIMIT_TEXT });
+    const error = await rejection(s.page);
+    expect(error.limitText).toBe(LIVE_LIMIT_TEXT);
+    expect(error.availableAfter).toMatch(/^2026-09-30T00:00:00[+-]\d{2}:\d{2}$/);
+    // Nothing needed a pointer, so neither hover ran.
+    expect(s.rowHover).not.toHaveBeenCalled();
+    expect(s.ancestorHover).not.toHaveBeenCalled();
+  });
+
+  it("reads the sentence from a relevant aria-label on the row", async () => {
+    const s = setup({ pickerEntries: ["Latest", "Pro"], proIndex: 1, passiveAria: LIVE_LIMIT_TEXT });
+    const error = await rejection(s.page);
+    expect(error.limitText).toBe(LIVE_LIMIT_TEXT);
+    expect(s.rowHover).not.toHaveBeenCalled();
+  });
+
+  it("ignores a passive title/aria-label that is only the row's own name", async () => {
+    // A bare "Pro" title or label is the row's NAME, not limit text. Only wording
+    // that says "Limit reached"/"Try again after" counts, so a benign attribute
+    // can never mask the real tooltip and the hover path still runs.
+    const s = setup({
+      pickerEntries: ["Latest", "Pro"],
+      proIndex: 1,
+      passiveTitle: "Pro",
+      passiveAria: "Pro",
+    });
+    const error = await rejection(s.page);
+    expect(error.limitText).toBe(LIVE_LIMIT_TEXT);
+    expect(s.rowHover).toHaveBeenCalledWith(expect.objectContaining({ force: true }));
+  });
+
+  it("reads the sentence from the element the row's aria-describedby points at", async () => {
+    const s = setup({ pickerEntries: ["Latest", "Pro"], proIndex: 1, describedByText: LIVE_LIMIT_TEXT });
+    const error = await rejection(s.page);
+    expect(error.limitText).toBe(LIVE_LIMIT_TEXT);
+    expect(error.availableAfter).toMatch(/^2026-09-30T00:00:00[+-]\d{2}:\d{2}$/);
+    expect(s.rowHover).not.toHaveBeenCalled();
+  });
+
+  it("reads a title from an ancestor inside the menu boundary", async () => {
+    const s = setup({ pickerEntries: ["Latest", "Pro"], proIndex: 1, ancestorTitle: LIVE_LIMIT_TEXT });
+    const error = await rejection(s.page);
+    expect(error.limitText).toBe(LIVE_LIMIT_TEXT);
+    expect(s.rowHover).not.toHaveBeenCalled();
+  });
+
+  // --- Forced-hover sources -------------------------------------------------
+  it("finds a tooltip that only appears after the forced row hover", async () => {
+    const s = setup({ pickerEntries: ["Latest", "Pro"], proIndex: 1 });
+    // The tooltip element does not exist yet; the hover itself creates it.
+    expect(s.fakeDocument.querySelectorAll('[role="tooltip"]')).toHaveLength(0);
+    const error = await rejection(s.page);
+    expect(s.rowHover).toHaveBeenCalledWith(expect.objectContaining({ force: true }));
+    expect(error.limitText).toBe(LIVE_LIMIT_TEXT);
+    expect(error.availableAfter).toMatch(/^2026-09-30T00:00:00[+-]\d{2}:\d{2}$/);
+    expect(s.fakeDocument.querySelectorAll('[role="tooltip"]')).toHaveLength(1);
+  });
+
+  it("falls back to the nearest non-menu ancestor when the row hover yields nothing", async () => {
+    const s = setup({
+      pickerEntries: ["Latest", "Pro"],
+      proIndex: 1,
+      tooltipAfterAncestorHoverOnly: true,
+    });
+    const error = await rejection(s.page);
+    expect(s.rowHover).toHaveBeenCalledWith(expect.objectContaining({ force: true }));
+    expect(s.ancestorHover).toHaveBeenCalledWith(expect.objectContaining({ force: true }));
+    expect(error.limitText).toBe(LIVE_LIMIT_TEXT);
+    expect(error.availableAfter).toMatch(/^2026-09-30T00:00:00[+-]\d{2}:\d{2}$/);
+  });
+
+  it("survives a refused row hover and still reads the ancestor's tooltip", async () => {
+    const s = setup({
+      pickerEntries: ["Latest", "Pro"],
+      proIndex: 1,
+      rowHoverRejects: true,
+      tooltipAfterAncestorHoverOnly: true,
+    });
+    const error = await rejection(s.page);
+    expect(error.limitText).toBe(LIVE_LIMIT_TEXT);
+  });
+
+  it("finds a popper wrapper that is not role=tooltip", async () => {
+    const s = setup({ pickerEntries: ["Latest", "Pro"], proIndex: 1, tooltipTier: "popper" });
+    const error = await rejection(s.page);
+    expect(error.limitText).toBe(LIVE_LIMIT_TEXT);
+    expect(error.availableAfter).toMatch(/^2026-09-30T00:00:00[+-]\d{2}:\d{2}$/);
+  });
+
+  it("finds a [data-side] wrapper that is not role=tooltip", async () => {
+    const s = setup({ pickerEntries: ["Latest", "Pro"], proIndex: 1, tooltipTier: "side" });
+    const error = await rejection(s.page);
+    expect(error.limitText).toBe(LIVE_LIMIT_TEXT);
+  });
+
+  it("prefers the smallest matching element when no known wrapper carries the sentence", async () => {
+    const s = setup({ pickerEntries: ["Latest", "Pro"], proIndex: 1, fallbackTooltip: true });
+    const error = await rejection(s.page);
+    // The outer div matches too, but the inner span's shorter text wins, so the
+    // recorded sentence is the sentence and not the whole subtree.
+    expect(error.limitText).toBe(LIVE_LIMIT_TEXT);
+  });
+
+  it("ignores a tooltip that is present but not visible", async () => {
+    const s = setup({ pickerEntries: ["Latest", "Pro"], proIndex: 1, tooltipHidden: true });
+    const error = await rejection(s.page);
+    expect(error.limitText).toBeNull();
+    expect(error.availableAfter).toBeNull();
+  });
+
+  // --- Diagnostics ----------------------------------------------------------
+  it("logs one content-free line naming the source and each hover outcome", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const s = setup({
+        pickerEntries: ["Latest", "Pro"],
+        proIndex: 1,
+        tooltipAfterAncestorHoverOnly: true,
+      });
+      await rejection(s.page);
+      const probe = spy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("pro usage limit probe"));
+      expect(probe).toHaveLength(1);
+      expect(probe[0]).toContain("source=hover-ancestor");
+      expect(probe[0]).toContain("rowHover=resolved");
+      expect(probe[0]).toContain("ancestorHover=resolved");
+      // The line carries no page text.
+      expect(probe[0]).not.toContain("Limit reached");
+      expect(probe[0]).not.toContain("Try again after");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("logs the passive source and skipped hovers when no pointer was needed", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const s = setup({ pickerEntries: ["Latest", "Pro"], proIndex: 1, passiveTitle: LIVE_LIMIT_TEXT });
+      await rejection(s.page);
+      const probe = spy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("pro usage limit probe"));
+      expect(probe).toHaveLength(1);
+      expect(probe[0]).toContain("source=passive-title");
+      expect(probe[0]).toContain("rowHover=skipped");
+      expect(probe[0]).toContain("ancestorHover=skipped");
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
