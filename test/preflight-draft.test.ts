@@ -27,7 +27,8 @@ const { runInteractionPreflight } = await import("../src/core/orchestrator.js");
 // return content only inside this VM; the Page boundary returns a boolean.
 function fixture(initial: Partial<State> = {}) {
   const state: State = { text: "", attachment: false, file: false, mention: "", unknown: false,
-    readable: true, count: 1, form: true, unknownButton: false, unknownTestId: "", url: "https://chatgpt.com/", ...initial };
+    readable: true, count: 1, form: true, unknownButton: false, unknownTestId: "", controls: [],
+    url: "https://chatgpt.com/", ...initial };
   const page = {
     url: () => state.url,
     keyboard: { press: vi.fn(async () => {}) },
@@ -36,13 +37,21 @@ function fixture(initial: Partial<State> = {}) {
       const tokens = state.mention ? [{ tagName: "A", textContent: state.mention, remove() {} }] : [];
       const copy = { textContent: state.text, querySelectorAll: (selector: string) => selector === "*"
         ? (state.unknown ? [{ tagName: "CUSTOM-TOKEN", attributes: [] }] : []) : tokens };
+      // Form controls answer `matches` the way CSS attribute selectors would, so
+      // the guard's real allowlist string decides admission, not the fixture.
+      const controls = state.controls.length > 0
+        ? state.controls
+        : state.unknownButton ? [{ testid: state.unknownTestId }] : [];
       const form = {
         querySelector: () => state.attachment ? {} : null,
-        querySelectorAll: () => state.unknownButton
-          ? [{ closest: () => null, matches: () => false,
-              getAttribute: (name: string) => name === "data-testid" ? state.unknownTestId : null,
-              tagName: "BUTTON" }]
-          : [],
+        querySelectorAll: () => controls.map(control => ({
+          closest: () => null,
+          matches: (selector: string) => (!!control.testid && selector.includes(`data-testid="${control.testid}"`))
+            || (!!control.ariaLabel && selector.includes(`aria-label="${control.ariaLabel}"`)),
+          getAttribute: (name: string) => name === "data-testid" ? (control.testid ?? "")
+            : name === "aria-label" ? (control.ariaLabel ?? null) : null,
+          tagName: "BUTTON",
+        })),
       };
       const composer = { isConnected: true, getClientRects: () => [{}], innerText: state.text || state.mention, cloneNode: () => copy,
         closest: () => state.form ? form : null, contains: () => false };
@@ -61,7 +70,8 @@ function fixture(initial: Partial<State> = {}) {
 }
 interface State {
   text: string; attachment: boolean; file: boolean; mention: string; unknown: boolean;
-  readable: boolean; count: number; form: boolean; unknownButton: boolean; unknownTestId: string; url: string;
+  readable: boolean; count: number; form: boolean; unknownButton: boolean; unknownTestId: string;
+  controls: Array<{ testid?: string; ariaLabel?: string }>; url: string;
 }
 const options = { model: "gpt-6-pro" as const, connector: "fixture", gizmoId: "project", expectedAccountEmail: "fixture@example.com" };
 
@@ -160,6 +170,66 @@ describe("draft-safe interaction preflight", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+
+  // P-035 2026-09-27. Live ms1980: this account's composer `+` carries
+  // aria-label="Add files and more" and no composer-plus-btn testid, so an
+  // empty home lane refused `unknown_control:Add files and more`.
+  it("admits an empty composer holding only the Add files and more button plus allowlisted controls", async () => {
+    const { page } = fixture({ controls: [
+      { ariaLabel: "Add files and more" },
+      { testid: "send-button" },
+      { ariaLabel: "Select ChatGPT model" },
+    ] });
+    await expect(assertPreflightDraftSafe(page)).resolves.toBeUndefined();
+  });
+
+  it("names every unknown control at once, de-duplicated in DOM order", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { page } = fixture({ controls: [
+        { testid: "alpha-ctl" }, { testid: "beta-ctl" }, { testid: "alpha-ctl" },
+      ] });
+      const error = await assertPreflightDraftSafe(page).catch(error => error);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("unknown_control:alpha-ctl|beta-ctl");
+      const refusals = spy.mock.calls.map(call => String(call[0]))
+        .filter(line => line.includes("draft guard refused"));
+      expect(refusals).toHaveLength(1);
+      expect(refusals[0]).toContain("reason=unknown_control:alpha-ctl|beta-ctl");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("still refuses on the control branch with typed text present, leaking no draft text", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { page } = fixture({ text: "private user draft",
+        controls: [{ testid: "alpha-ctl" }, { testid: "beta-ctl" }] });
+      const error = await assertPreflightDraftSafe(page).catch(error => error);
+      expect(error.reason).toBe("unknown_control:alpha-ctl|beta-ctl");
+      const logged = spy.mock.calls.map(call => String(call[0])).join("\n");
+      expect(logged).toContain("reason=unknown_control:alpha-ctl|beta-ctl");
+      expect(logged).not.toContain("private user draft");
+      expect(JSON.stringify(error)).not.toContain("private user draft");
+      expect(error.message).not.toContain("private user draft");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("caps the multi-control reason at five identifiers and 200 characters", async () => {
+    const long = (fill: string) => fill.repeat(80);
+    const { page } = fixture({ controls: [
+      { testid: long("a") }, { testid: long("b") }, { testid: long("c") },
+      { testid: long("d") }, { testid: long("e") }, { testid: long("f") },
+    ] });
+    const error = await assertPreflightDraftSafe(page).catch(error => error);
+    const expected = `unknown_control:${["a", "b", "c", "d", "e"].map(fill => fill.repeat(60)).join("|")}`.slice(0, 200);
+    expect(error.reason).toBe(expected);
+    expect(error.reason.length).toBeLessThanOrEqual(200);
+    expect(error.reason).not.toContain(`${"f".repeat(60)}`);
   });
 
   it("names a typed-text refusal text_present without leaking the draft", async () => {

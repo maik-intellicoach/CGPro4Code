@@ -2186,10 +2186,21 @@ export async function assertPreflightDraftSafe(
       for (const [kind, mediaSelector] of mediaKinds) {
         if (form.querySelector(mediaSelector)) return `form_media:${kind}`;
       }
+      // P-035 2026-09-27. On this account's UI variant the composer `+` carries
+      // aria-label="Add files and more" and no composer-plus-btn testid, so an
+      // empty home lane refused `unknown_control:Add files and more`. It is the
+      // same control, admitted here; nothing else newly joins the allowlist.
+      // The refusal now names EVERY unknown control at once (existing sanitized
+      // identifier, de-duplicated, DOM order, at most 5, whole code capped at
+      // 200 chars) so any further variant control shows up in one round.
+      const unknownControls: string[] = [];
       for (const control of Array.from(form.querySelectorAll('button, [role="button"]'))) {
         if (composer.contains(control) || control.closest('[role="menu"], [role="listbox"]')) continue;
-        if (!control.matches('button[data-testid="composer-plus-btn"], button[data-testid="send-button"], button[data-testid="composer-send-button"], button[aria-label="Select ChatGPT model"], button.__composer-pill[aria-haspopup="menu"], button[data-testid="model-switcher-dropdown-button"]')) return `unknown_control:${identify(control)}`;
+        if (control.matches('button[data-testid="composer-plus-btn"], button[aria-label="Add files and more"], button[data-testid="send-button"], button[data-testid="composer-send-button"], button[aria-label="Select ChatGPT model"], button.__composer-pill[aria-haspopup="menu"], button[data-testid="model-switcher-dropdown-button"]')) continue;
+        const id = identify(control);
+        if (unknownControls.length < 5 && !unknownControls.includes(id)) unknownControls.push(id);
       }
+      if (unknownControls.length > 0) return `unknown_control:${unknownControls.join("|")}`.slice(0, 200);
       const copy = composer.cloneNode(true) as HTMLElement;
       const tokens = Array.from(copy.querySelectorAll<HTMLElement>('[contenteditable="false"]'));
       if (tokens.length) {
