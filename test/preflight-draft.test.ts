@@ -2436,3 +2436,95 @@ describe("lone @ residue from a failed connector click (r33)", () => {
     }
   });
 });
+
+// P-035 2026-09-28 r34. Live 06:59 (vendor 90f7c9d): r33 admitted the composer's
+// lone `@`, then the foreign-text walk refused `foreign_text` on the editor's
+// own hidden mirror of that same `@` (shape: `tag=SPAN hidden=aria len=1
+// equals_connector=no contains_connector=no equals_composer_text=yes words=1
+// path=SPAN<FORM`). The r19/r27 mirror rules both need an admitted owned token,
+// which a lone `@` does not have. These cases pin the new admission, the
+// chip+`@` variant, and every neighbouring refusal.
+describe("hidden mirror of the admitted lone @ (r34)", () => {
+  const reasonOf = async (page: Page, owned: { text?: string; connector?: string }) =>
+    (await assertPreflightDraftSafe(page, owned).then(() => undefined).catch(caught => caught))?.reason;
+  const hiddenMirror = (body: string) =>
+    ({ foreignText: body, foreignParent: { tagName: "SPAN", ariaHidden: true } });
+
+  it("admits a hidden aria mirror of the admitted lone @", async () => {
+    // Composer holds only the lone `@`; the span mirrors it as UI chrome.
+    await expect(assertPreflightDraftSafe(
+      fixture({ text: "@", ...hiddenMirror("@") }).page,
+      { connector: "lane-x" },
+    )).resolves.toBeUndefined();
+
+    // Whitespace and format characters carry no content, so the same mirror
+    // ringed by them is still just the lone `@`.
+    await expect(assertPreflightDraftSafe(
+      fixture({ text: "@", ...hiddenMirror(" \u200B@\uFEFF\n") }).page,
+      { connector: "lane-x" },
+    )).resolves.toBeUndefined();
+
+    // The aria-hidden ancestor need not be the direct parent.
+    await expect(assertPreflightDraftSafe(
+      fixture({ text: "@", foreignText: "@", foreignParent: { tagName: "SPAN" },
+        foreignAncestors: [{ tagName: "DIV", ariaHidden: true }] }).page,
+      { connector: "lane-x" },
+    )).resolves.toBeUndefined();
+  });
+
+  it("admits the hidden mirror of the owned chip plus the lone @", async () => {
+    // The chip was admitted, so the mirror may carry the connector with the `@`.
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: "lane-x", text: "@", ...hiddenMirror("lane-x @") }).page,
+      { connector: "lane-x" },
+    )).resolves.toBeUndefined();
+
+    // The `@` may precede the whitespace-separated connector too.
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: "lane-x", text: "@", ...hiddenMirror("@ lane-x") }).page,
+      { connector: "lane-x" },
+    )).resolves.toBeUndefined();
+  });
+
+  it("refuses a VISIBLE @ node outside the composer", async () => {
+    expect(await reasonOf(
+      fixture({ text: "@", foreignText: "@", foreignParent: { tagName: "SPAN", rects: 1 } }).page,
+      { connector: "lane-x" },
+    )).toBe("foreign_text");
+  });
+
+  it("refuses a hidden aria mirror that is not exactly the lone or chip+@ shape", async () => {
+    // `@x` is not a lone `@`.
+    expect(await reasonOf(
+      fixture({ text: "@", ...hiddenMirror("@x") }).page,
+      { connector: "lane-x" },
+    )).toBe("foreign_text");
+
+    // A different connector's chip-plus-@ mirror, with no owned token admitted.
+    expect(await reasonOf(
+      fixture({ text: "@", ...hiddenMirror("other-y @") }).page,
+      { connector: "lane-x" },
+    )).toBe("foreign_text");
+
+    // Hidden mirror `@` while the composer holds only the owned chip, so no
+    // lone `@` was admitted this call: unchanged refusal.
+    expect(await reasonOf(
+      fixture({ mention: "lane-x", ...hiddenMirror("@") }).page,
+      { connector: "lane-x" },
+    )).toBe("foreign_text");
+  });
+
+  it("refuses a composer holding @ without an owned connector, as today", async () => {
+    expect(await reasonOf(
+      fixture({ text: "@", ...hiddenMirror("@") }).page,
+      {},
+    )).toBe("text_present");
+  });
+
+  it("refuses the hidden mirror @ when the composer holds real text, as today", async () => {
+    expect(await reasonOf(
+      fixture({ text: "real user draft", ...hiddenMirror("@") }).page,
+      { connector: "lane-x", text: "real user draft" },
+    )).toBe("foreign_text");
+  });
+});

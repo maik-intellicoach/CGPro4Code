@@ -2669,6 +2669,12 @@ export async function assertPreflightDraftSafe(
       // carrying the owned connector's own trimmed text; what remains decides
       // admission.
       let textAdmitted = false;
+      // P-035 2026-09-28 r34. A DISTINCT flag for exactly the r33 lone-`@`
+      // admission, set in both branches below and nowhere else. The foreign-text
+      // walk needs it to admit the editor's hidden mirror of that same `@`
+      // without reusing any broader flag: an empty chip remainder and an owned
+      // token plus text leave it false, so those paths are unchanged.
+      let loneAtAdmitted = false;
       if (ownedToken) {
         if (owned.provenance !== undefined) {
           // P-035 2026-09-28 r26. Provenance mode: the draft this facade
@@ -2747,7 +2753,13 @@ export async function assertPreflightDraftSafe(
           // and only when NOTHING else survives after whitespace and `\p{Cf}`
           // are removed. Without that identity, or with any other character, the
           // refusal below is exactly as before.
-          if (stripped.length > 0 && !(owned.connector !== undefined && stripped === "@")) {
+          //
+          // P-035 2026-09-28 r34. Name that lone-`@` admission as its own flag
+          // (`loneAtAdmitted`) so the foreign-text walk can admit the hidden
+          // mirror of the same `@`; the empty-remainder admission below leaves
+          // the flag false, so nothing else changes.
+          const loneAt = owned.connector !== undefined && stripped === "@";
+          if (stripped.length > 0 && !loneAt) {
             // Content-free shape of the refused remainder: how many of its code
             // points are whitespace, `\p{Cf}`, or anything else. Counts only,
             // never a character or any text.
@@ -2763,6 +2775,7 @@ export async function assertPreflightDraftSafe(
           }
           text = "";
           textAdmitted = true;
+          if (loneAt) loneAtAdmitted = true;
         }
       }
       if (!textAdmitted) {
@@ -2792,6 +2805,9 @@ export async function assertPreflightDraftSafe(
           const stripped = remainder.replace(/[\s\p{Cf}]/gu, "");
           if (owned.connector !== undefined && stripped === "@") {
             textAdmitted = true;
+            // P-035 2026-09-28 r34. Same distinct flag as the token branch
+            // above: this is the no-token lone-`@` admission r33 added.
+            loneAtAdmitted = true;
           } else {
             const noTokenShape = (value: string): { len: number; ws: number; cf: number; at: number; other: number } => {
               let ws = 0;
@@ -3023,6 +3039,27 @@ export async function assertPreflightDraftSafe(
                   && reduceAlnum(mirror).includes(reduceAlnum(owned.provenance.prefix))))
               && unescaped.includes(owned.provenance.marker);
           if (mirror.includes(owned.connector) && mirrorsOwned) continue;
+        }
+        // P-035 2026-09-28 r34. Live 06:59 (vendor 90f7c9d): r33 admitted the
+        // composer's lone `@`, then this walk refused `foreign_text` on the
+        // editor's own hidden mirror of that same `@` (shape: `tag=SPAN
+        // hidden=aria len=1 equals_connector=no contains_connector=no
+        // equals_composer_text=yes words=1 path=SPAN<FORM`). Both mirror rules
+        // above need an admitted owned token, which a lone `@` does not have, so
+        // neither can admit it. Admit exactly that node here, and ONLY while
+        // this call's own lone `@` was admitted above (`loneAtAdmitted`): the
+        // node must still be hidden by aria, and its text stripped of whitespace
+        // and `\p{Cf}` must be exactly `@`, or -- only when an owned token was
+        // admitted, the chip+`@` shape -- exactly the owned connector with
+        // whitespace removed, preceded or followed by `@`. Everything else
+        // (visible, `@x`, a different token's name, or any node when
+        // `loneAtAdmitted` is false) refuses exactly as today.
+        if (loneAtAdmitted && hiddenByAria(node)) {
+          const stripped = nodeText.replace(/[\s\p{Cf}]/gu, "");
+          const connector = (owned.connector ?? "").replace(/\s+/gu, "");
+          if (stripped === "@"
+            || (ownedToken && connector.length > 0
+              && (stripped === `${connector}@` || stripped === `@${connector}`))) continue;
         }
         return { reason: "foreign_text", foreignShape: foreignShape(node) };
       }
