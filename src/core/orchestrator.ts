@@ -212,6 +212,17 @@ export async function runInteractionPreflight(
         await guard();
         mark("cleanup-home");
         await goHome(page, { model: opts.model });
+        // P-035 2026-09-28 r21. The same race, one navigation later again: live
+        // ms1980 (vendor 57d8588, lane ms1980, pid 90325) passed account,
+        // Project, composer, connector and model, then refused
+        // `reason=composer_count:0` at `failedPhase=cleanup-home`, on the
+        // pre-hydration home shell this cleanup `goHome` had just landed on.
+        // The cleanup guard reads the composer for the same admission decision
+        // the home guard does, so it needs the same bounded hydration wait
+        // before it. Bounded, and never itself a failure -- the guard stays the
+        // only admission authority, so an absent composer still refuses
+        // `composer_count:0` exactly as it did without this wait.
+        await waitForComposerHydrated(page);
         ownedConnector = undefined;
         await guard();
         mark("cleanup-composer");

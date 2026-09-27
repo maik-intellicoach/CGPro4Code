@@ -718,8 +718,11 @@ describe("home composer hydration wait", () => {
     state.composerHydrationMs = 30;
     await expect(runInteractionPreflight(options, session))
       .resolves.toMatchObject({ connectorVerified: true, power: 4 });
-    // One bounded wait, against the shipped composer selector, at the shipped bound.
-    expect(composerWaits).toHaveLength(1);
+    // One bounded wait for the home navigation, against the shipped composer
+    // selector, at the shipped bound. (r21 adds the same wait to the CLEANUP
+    // navigation, so this successful preflight issues two in total; index 0 is
+    // the home wait this case exists to pin.)
+    expect(composerWaits).toHaveLength(2);
     expect(composerWaits[0].selector).toBe(joinSelectors(SELECTORS.composer));
     expect(composerWaits[0].options).toEqual({ state: "visible", timeout: 20_000 });
     // The composer was absent when the wait began and appeared only inside it,
@@ -750,6 +753,65 @@ describe("home composer hydration wait", () => {
     expect(openConversation).not.toHaveBeenCalled();
     expect(setConnector).not.toHaveBeenCalled();
     expect(clearComposer).not.toHaveBeenCalled();
+  });
+});
+
+// P-035 2026-09-28 r21. Live ms1980 (vendor 57d8588, lane ms1980, pid 90325):
+// the preflight passed account, Project, composer, connector and model, then
+// refused `reason=composer_count:0` at `failedPhase=cleanup-home` on the
+// pre-hydration home shell its own cleanup `goHome` had just landed on. The r11
+// race, one navigation later: the cleanup guard judges a just-navigated surface
+// exactly as the home guard does, so it needs the same bounded wait first.
+describe("cleanup-home composer hydration wait", () => {
+  it("waits for the cleanup home composer to hydrate before the cleanup guard, then resolves", async () => {
+    const { state, session, composerWaits } = fixture({ url: "about:blank", count: 0 });
+    // The home navigation lands hydrated; the CLEANUP navigation lands on the
+    // pre-hydration shell and the composer appears only inside the wait.
+    goHome
+      .mockImplementationOnce(() => { state.url = "https://chatgpt.com/"; state.mention = ""; state.count = 1; })
+      .mockImplementationOnce(() => {
+        state.url = "https://chatgpt.com/"; state.mention = ""; state.count = 0; state.composerHydrationMs = 30;
+      });
+    setConnector.mockImplementation(() => { state.mention = "fixture"; });
+    // Without the cleanup wait the cleanup guard would read `count:0` and refuse,
+    // so resolving successfully is itself the proof the guard ran after hydration.
+    await expect(runInteractionPreflight(options, session))
+      .resolves.toMatchObject({ connectorVerified: true, power: 4 });
+    expect(goHome).toHaveBeenCalledTimes(2);
+    // A second bounded wait, against the shipped composer selector, at the shipped bound.
+    expect(composerWaits).toHaveLength(2);
+    expect(composerWaits[1].selector).toBe(joinSelectors(SELECTORS.composer));
+    expect(composerWaits[1].options).toEqual({ state: "visible", timeout: 20_000 });
+    // It began on the pre-hydration shell and the composer arrived inside it.
+    expect(composerWaits[1].countAtStart).toBe(0);
+    expect(state.count).toBe(1);
+  });
+
+  it("swallows the cleanup wait's own timeout and refuses composer_count:0 exactly as today", async () => {
+    const { state, session, composerWaits } = fixture({ url: "about:blank", count: 0 });
+    goHome
+      .mockImplementationOnce(() => { state.url = "https://chatgpt.com/"; state.mention = ""; state.count = 1; })
+      .mockImplementationOnce(() => {
+        state.url = "https://chatgpt.com/"; state.mention = ""; state.count = 0; state.composerNeverHydrates = true;
+      });
+    setConnector.mockImplementation(() => { state.mention = "fixture"; });
+    const phases: string[] = [];
+    const error = await runInteractionPreflight(options, session, phase => phases.push(phase)).catch(caught => caught);
+    // The wait is not an error: the guard, not the wait, refused, with the
+    // unchanged error, code and reason, at the unchanged phase.
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.code).toBe("preflight_draft_protected");
+    expect(error.reason).toBe("composer_count:0");
+    expect(phases.at(-1)).toBe("cleanup-home");
+    expect(composerWaits).toHaveLength(2);
+    expect(composerWaits[1].selector).toBe(joinSelectors(SELECTORS.composer));
+    expect(composerWaits[1].options).toEqual({ state: "visible", timeout: 20_000 });
+    expect(composerWaits[1].countAtStart).toBe(0);
+    // Both navigations happened (the cleanup one refused), and the phase that
+    // follows cleanup-home -- its own clearComposer -- never ran. The one main-flow
+    // clearComposer call is unchanged.
+    expect(goHome).toHaveBeenCalledTimes(2);
+    expect(clearComposer).toHaveBeenCalledTimes(1);
   });
 });
 
