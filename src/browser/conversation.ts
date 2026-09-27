@@ -2354,8 +2354,36 @@ export async function assertPreflightDraftSafe(
           // A sole owned connector token is admissible, not arbitrary text that
           // happens to contain the connector name. Text beside the chip is a
           // draft like any other, so it refuses with the plain text code.
-          if (text.trim() !== owned.connector) return "text_present";
+          //
+          // P-035 2026-09-28 r16. Live ms1980 (vendor f74220e): the composer held
+          // ONLY this call's own connector chip, and this branch still refused
+          // `text_present`. The old rule compared the composer's RENDERED
+          // `innerText` to the connector string, but the chip's own textContent
+          // already equals that connector exactly, so anything the editor renders
+          // beyond it -- an invisible character such as U+200B, or chip chrome the
+          // clone does not carry -- made the comparison fail on a chip-only
+          // composer. Judge this branch the way an empty composer is judged
+          // instead: by the detached copy AFTER the owned token was removed.
+          // Whitespace and Unicode format characters (`\p{Cf}`, e.g. U+200B,
+          // U+200C, U+200D, U+2060, U+FEFF) carry no draft content, so a
+          // remainder of only those is the same as an empty composer.
+          const remainder = copy.textContent ?? "";
+          if (remainder.replace(/[\s\p{Cf}]/gu, "").length > 0) {
+            // Content-free shape of the refused remainder: how many of its code
+            // points are whitespace, `\p{Cf}`, or anything else. Counts only,
+            // never a character or any text.
+            let ws = 0;
+            let cf = 0;
+            let other = 0;
+            for (const codePoint of remainder) {
+              if (/\p{Cf}/u.test(codePoint)) cf += 1;
+              else if (/\s/.test(codePoint)) ws += 1;
+              else other += 1;
+            }
+            return { reason: "text_present", chipRemainder: { len: ws + cf + other, ws, cf, other } };
+          }
           text = "";
+          textAdmitted = true;
         }
       }
       if (!textAdmitted) {
@@ -2378,6 +2406,16 @@ export async function assertPreflightDraftSafe(
     }, { selector: joinSelectors(SELECTORS.composer), owned });
     if (outcome === true) safe = true;
     else if (typeof outcome === "string") reason = outcome;
+    else if (typeof outcome === "object" && "reason" in outcome) {
+      // P-035 2026-09-28 r16. The sole-owned-token text refusal carries the
+      // content-free shape of the chip's remainder, so a live round names which
+      // class the extra code points were without ever naming a character.
+      reason = outcome.reason;
+      if (outcome.chipRemainder) {
+        const { len, ws, cf, other } = outcome.chipRemainder;
+        console.error(`[cgpro:preflight] chip remainder shape: len=${len} ws=${ws} cf=${cf} other=${other}`);
+      }
+    }
   } catch { /* Evaluation failure is unknown, never empty. */ }
   if (safe !== true) {
     // Exactly one content-free line per refusal. No branch answered means the

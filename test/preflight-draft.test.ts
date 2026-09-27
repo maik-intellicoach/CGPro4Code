@@ -112,13 +112,22 @@ function fixture(initial: Partial<State> = {}) {
           tagName: control.tagName ?? "BUTTON",
         })),
       };
-      const composer = { isConnected: true, getClientRects: () => [{}], innerText: tokenTopTexts.join("") + state.text, cloneNode: () => copy,
+      const composer = { isConnected: true, getClientRects: () => [{}],
+        innerText: state.composerInnerText ?? (tokenTopTexts.join("") + state.text), cloneNode: () => copy,
         closest: () => state.form ? form : null, contains: () => false };
       const document = {
         body: { childNodes: state.count ? [composer] : [] },
         querySelectorAll: (selector: string) => selector === 'input[type="file"]'
           ? [{ files: state.file ? [{}] : [] }] : Array.from({ length: state.count }, () => composer),
-        createTreeWalker: () => ({ nextNode: () => false }),
+        // P-035 2026-09-28 r16. Models ONE text node outside the composer so a
+        // test can prove the foreign-text walk still runs after admission.
+        createTreeWalker: () => {
+          let served = false;
+          return {
+            nextNode: () => { if (served || !state.foreignText) return false; served = true; return true; },
+            get currentNode() { return { textContent: state.foreignText ?? "", parentElement: null }; },
+          };
+        },
       };
       return runInNewContext(`(${fn.toString()})(arg)`, {
         arg, document, location: new URL(state.url), HTMLTextAreaElement: class {}, NodeFilter: { SHOW_TEXT: 4 },
@@ -157,6 +166,10 @@ interface State {
   composerHydrationMs?: number;
   /** Makes the bounded composer wait itself time out, as a never-hydrating page does. */
   composerNeverHydrates?: boolean;
+  /** Overrides the composer's rendered innerText, to model text the detached copy lacks. */
+  composerInnerText?: string;
+  /** One text node outside the composer, which the foreign-text walk must still reach. */
+  foreignText?: string;
 }
 const options = { model: "gpt-6-pro" as const, connector: "fixture", gizmoId: "project", expectedAccountEmail: "fixture@example.com" };
 
@@ -734,5 +747,118 @@ describe("lane-owned connector chip residue", () => {
     expect(error).toBeInstanceOf(PreflightDraftProtectedError);
     expect(error.reason).toBe("connector_unowned");
     expect(goHome).not.toHaveBeenCalled();
+  });
+});
+
+// P-035 2026-09-28 r16. Live ms1980 (vendor f74220e, lane ms1980, pid 60447):
+// an earlier preflight attached this lane's connector chip and it persisted, and
+// the very next guard refused `text_present` on a composer holding ONLY that
+// chip. The old rule compared the composer's RENDERED innerText to the connector
+// string; the chip's own textContent already equals the connector, so anything
+// the editor rendered beyond it -- an invisible character such as U+200B, or
+// rendered-only chip chrome the clone does not carry -- failed a chip-only
+// composer. The branch now judges the detached copy after the owned token was
+// removed, exactly as an empty composer is judged. These cases pin that rule and
+// every neighbouring refusal that must not change.
+describe("chip-only composer remainder", () => {
+  it("admits a lone owned chip whose remainder is only format characters", async () => {
+    // U+200B (zero width space) around the chip: the rendered innerText is not
+    // the connector, but what is left after the owned token was removed is a
+    // single `\p{Cf}` code point.
+    const zeroWidth = fixture({ mention: "fixture", text: "\u200B" });
+    await expect(assertPreflightDraftSafe(zeroWidth.page, { connector: "fixture" }))
+      .resolves.toBeUndefined();
+
+    // U+FEFF (byte order mark / zero width no-break space) is the same class.
+    const bom = fixture({ mention: "fixture", text: "\uFEFF" });
+    await expect(assertPreflightDraftSafe(bom.page, { connector: "fixture" }))
+      .resolves.toBeUndefined();
+
+    // A mixture of whitespace and format characters is still no draft.
+    const mixed = fixture({ mention: "fixture", text: " \u200B\n\u2060 " });
+    await expect(assertPreflightDraftSafe(mixed.page, { connector: "fixture" }))
+      .resolves.toBeUndefined();
+  });
+
+  it("admits a lone owned chip whose rendered innerText carries text the detached copy does not", async () => {
+    // The whole composer is the chip, so the copy left after the owned token was
+    // removed is empty even though the rendered innerText is not the connector.
+    // This is the copy rule, and the fake DOM can simulate the divergence.
+    const renderedOnly = fixture({ mention: "fixture", text: "", composerInnerText: "fixture\u200B\u2060" });
+    await expect(assertPreflightDraftSafe(renderedOnly.page, { connector: "fixture" }))
+      .resolves.toBeUndefined();
+  });
+
+  it("refuses typed text beside the owned chip and names the content-free remainder shape", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const typed = fixture({ mention: "fixture", text: "hello" });
+      const error = await assertPreflightDraftSafe(typed.page, { connector: "fixture" }).catch(caught => caught);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("text_present");
+      const logged = spy.mock.calls.map(call => String(call[0])).join("\n");
+      expect(logged).toContain("chip remainder shape: len=5 ws=0 cf=0 other=5");
+      // Counts only: neither the characters nor the draft text are named.
+      expect(logged).not.toContain("hello");
+      expect(JSON.stringify(error)).not.toContain("hello");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("classifies a whitespace and format-character remainder without admitting it", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // A format character plus a real character: the remainder is not empty, so
+      // it refuses, and the shape names the classes rather than the text.
+      const error = await assertPreflightDraftSafe(
+        fixture({ mention: "fixture", text: "\u200Bx" }).page, { connector: "fixture" },
+      ).catch(caught => caught);
+      expect(error.reason).toBe("text_present");
+      const shapeLine = spy.mock.calls.map(call => String(call[0]))
+        .find(line => line.includes("chip remainder shape"));
+      expect(shapeLine).toContain("chip remainder shape: len=2 ws=0 cf=1 other=1");
+      // Counts only: the shape line names no character.
+      expect(shapeLine).not.toContain("x");
+      expect(JSON.stringify(error)).not.toContain("\u200Bx");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("refuses a second paragraph beside the owned chip", async () => {
+    const secondParagraph = fixture({
+      mention: "fixture", text: "x", rich: [{ tagName: "P", textContent: "x" }],
+    });
+    const error = await assertPreflightDraftSafe(secondParagraph.page, { connector: "fixture" })
+      .catch(caught => caught);
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.reason).toBe("text_present");
+  });
+
+  it("still runs the foreign-text walk after admitting a chip-only composer", async () => {
+    // The remainder is only a format character, so the new rule admits the chip,
+    // and the later walk must still see the text node outside the composer.
+    const error = await assertPreflightDraftSafe(
+      fixture({ mention: "fixture", text: "\u200B", foreignText: "outside draft" }).page,
+      { connector: "fixture" },
+    ).catch(caught => caught);
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.reason).toBe("foreign_text");
+    expect(JSON.stringify(error)).not.toContain("outside draft");
+  });
+
+  it("keeps the combined connector+text branch results unchanged", async () => {
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: "fixture", text: "owned probe" }).page,
+      { connector: "fixture", text: "owned probe" },
+    )).resolves.toBeUndefined();
+
+    const mismatch = await assertPreflightDraftSafe(
+      fixture({ mention: "fixture", text: "owned probe plus private draft" }).page,
+      { connector: "fixture", text: "owned probe" },
+    ).catch(caught => caught);
+    expect(mismatch).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(mismatch.reason).toBe("owned_text_mismatch");
   });
 });
