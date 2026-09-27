@@ -80,8 +80,34 @@ function fixture(initial: Partial<Surface> = {}) {
   const document = {
     body: { childNodes: [composer] },
     querySelectorAll: (selector: string) => (selector === 'input[type="file"]' ? [] : [composer]),
-    // No text node outside the composer: the walk finds nothing to refuse.
-    createTreeWalker: () => ({ nextNode: () => false, get currentNode() { return null; } }),
+    // P-035 2026-09-28 r27. One hidden mirror text node outside the composer --
+    // the serialised copy of the draft the live composer also renders -- so the
+    // foreign-text walk has a node to judge. It is cleared with the draft, as
+    // the real mirror is: an empty surface mirrors nothing.
+    createTreeWalker: () => {
+      let served = false;
+      return {
+        nextNode: () => { if (served || !state.mirror) return false; served = true; return true; },
+        get currentNode() {
+          const mirror = state.mirror;
+          return {
+            textContent: mirror?.text ?? "",
+            parentElement: mirror
+              ? {
+                tagName: "SPAN",
+                parentElement: null,
+                contains: () => false,
+                closest: () => null,
+                getAttribute: (name: string) => name === "aria-hidden" && mirror.ariaHidden
+                  ? "true" : null,
+                hasAttribute: () => false,
+                getClientRects: () => Array.from({ length: mirror.rects ?? 1 }, () => ({})),
+              }
+              : null,
+          };
+        },
+      };
+    },
   };
   const page = {
     isClosed: () => false,
@@ -96,7 +122,7 @@ function fixture(initial: Partial<Surface> = {}) {
         // re-proof can admit: an `Expand` left on an empty composer would be
         // chrome with no owned text to justify it.
         if (key === "Backspace" && !state.persist) {
-          state.chip = null; state.text = ""; state.expand = false; state.rich = [];
+          state.chip = null; state.text = ""; state.expand = false; state.rich = []; state.mirror = null;
         }
       }),
     },
@@ -122,6 +148,12 @@ interface Surface {
   controlTag?: string;
   /** Rich nodes inside the composer copy, cleared with the draft by `Backspace`. */
   rich?: RichNode[];
+  /**
+   * P-035 2026-09-28 r27. One hidden text node outside the composer holding the
+   * serialised copy of the draft the live composer also mirrors. Cleared with
+   * the draft by `Backspace`, exactly as the real mirror is.
+   */
+  mirror?: { text: string; ariaHidden?: boolean; rects?: number } | null;
 }
 /** One rich node in the composer copy, with the fields the guard reads. */
 interface RichNode {
@@ -452,5 +484,50 @@ describe("POST /discard-owned-draft provenance mode", () => {
     // was ACCEPTED (409 provenance_mismatch), never 400 invalid_request.
     expect(result.status).toBe(409);
     expect(JSON.parse(result.body)).toEqual({ error: "draft_not_owned", reason: "provenance_mismatch" });
+  });
+
+  // P-035 2026-09-28 r27. Live ms1980 (vendor bad524b): this exact call passed the
+  // chip identity and the provenance proof, then the foreign-text walk refused
+  // `foreign_text` on the hidden SPAN mirroring the whole serialised draft (3141
+  // chars, 435 words). The mirror is admitted only while it provably mirrors the
+  // content the proof already named, so the endpoint clears the lane.
+  describe("hidden mirror of the proven draft (r27)", () => {
+    const serialised = `${CONNECTOR} ${composed()}`;
+
+    it("clears a composed draft whose hidden mirror carries the whole serialised copy", async () => {
+      const { page, presses, click } = fixture({
+        text: composed(), mirror: { text: serialised, ariaHidden: true },
+      });
+      const result = await discard(stateFor(page), { connector: CONNECTOR, prefix: HEADER, marker: MARKER });
+      expect(result.status).toBe(200);
+      expect(JSON.parse(result.body)).toEqual({ cleared: true });
+      // Proof before the clear, one clear only, and the lane re-proven empty
+      // after a fresh home (the mirror went with the draft).
+      expect(presses).toEqual(["Meta+A", "Backspace"]);
+      expect(click).toHaveBeenCalledTimes(1);
+      expect(goHome).toHaveBeenCalledTimes(2);
+    });
+
+    it("refuses the same mirror when its marker is missing, and touches nothing", async () => {
+      const withoutMarker = `${HEADER}\nUSER: the different planning request\ninvocation_id="${UUID}"`;
+      const { page, click, presses } = fixture({
+        text: composed(), mirror: { text: `${CONNECTOR} ${withoutMarker}`, ariaHidden: true },
+      });
+      const result = await discard(stateFor(page), { connector: CONNECTOR, prefix: HEADER, marker: MARKER });
+      expect(result.status).toBe(409);
+      expect(JSON.parse(result.body)).toEqual({ error: "draft_not_owned", reason: "foreign_text" });
+      expect(presses).toEqual([]);
+      expect(click).not.toHaveBeenCalled();
+    });
+
+    it("refuses a visible serialised copy exactly as before", async () => {
+      const { page, presses } = fixture({
+        text: composed(), mirror: { text: serialised, ariaHidden: false },
+      });
+      const result = await discard(stateFor(page), { connector: CONNECTOR, prefix: HEADER, marker: MARKER });
+      expect(result.status).toBe(409);
+      expect(JSON.parse(result.body)).toEqual({ error: "draft_not_owned", reason: "foreign_text" });
+      expect(presses).toEqual([]);
+    });
   });
 });

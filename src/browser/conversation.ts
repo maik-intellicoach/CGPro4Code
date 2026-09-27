@@ -2685,6 +2685,28 @@ export async function assertPreflightDraftSafe(
         if (parent?.closest('button, [role="button"], [role="menu"], [role="listbox"]')) continue;
         if (ownedToken && owned.connector && hiddenByAria(node)
           && !/\s/.test(nodeText) && nodeText.includes(owned.connector)) continue;
+        // P-035 2026-09-28 r27. Live ms1980 (vendor bad524b) passed chip
+        // identity and the provenance proof, then refused `foreign_text` (shape:
+        // `tag=SPAN hidden=aria len=3141 contains_connector=yes words=435
+        // path=SPAN<FORM`): with a TEXT draft the same hidden composer mirror
+        // r19 admits only as a whitespace-free single token carries the WHOLE
+        // serialised draft instead. Admit that node only while it provably
+        // MIRRORS the content already proven in this call: this call's own token
+        // was admitted, the node is hidden by aria, its normalised text carries
+        // the owned connector, and it also carries the owned proof -- the whole
+        // owned text under an exact-text proof, or the planning header plus the
+        // literal invocation marker under a provenance proof. Without an owned
+        // text or provenance this rule never applies, so r19 and every other
+        // refusal are unchanged.
+        if (ownedToken && owned.connector && hiddenByAria(node)) {
+          const mirror = norm(nodeText);
+          const mirrorsOwned = owned.text !== undefined
+            ? mirror.includes(norm(owned.text))
+            : owned.provenance !== undefined
+              && mirror.includes(norm(owned.provenance.prefix))
+              && nodeText.includes(owned.provenance.marker);
+          if (mirror.includes(owned.connector) && mirrorsOwned) continue;
+        }
         return { reason: "foreign_text", foreignShape: foreignShape(node) };
       }
       return true;

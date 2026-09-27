@@ -1634,3 +1634,105 @@ describe("composed-draft provenance proof (r26)", () => {
     expect(noProof.reason).toBe("unknown_control:Expand");
   });
 });
+
+// P-035 2026-09-28 r27. The live refusal at vendor bad524b: chip identity and the
+// provenance proof both passed, then the foreign-text walk refused `foreign_text`
+// on a hidden SPAN holding the WHOLE serialised draft (connector + header +
+// request + marker, 3141 chars, 435 words). r19 admits only a whitespace-free
+// single token, which is what that mirror is for a chip-only composer; with a
+// text draft it mirrors the proven draft instead. These cases prove the node is
+// admitted exactly while it provably mirrors the proof already in force, and
+// that every neighbouring shape still refuses `foreign_text`.
+describe("hidden mirror of the proven draft (r27)", () => {
+  const CONNECTOR = "fixture";
+  const TEXT = "the planning prompt this lane typed";
+  const HEADER = "planning system header v1\nlane=intelli facade=planning";
+  const MARKER = "[cgpro:composed-invocation]";
+  const UUID = "0f8fad5b-d9cb-469f-a165-70867728950e";
+  const composed = (request = "the different planning request"): string =>
+    `${HEADER}\nUSER: ${request}\n${MARKER}\ninvocation_id="${UUID}"`;
+  const mirrorOf = (body: string) => ({ foreignText: body, foreignParent: { tagName: "SPAN", ariaHidden: true } });
+  const reasonOf = async (page: Page, owned: { text?: string; connector?: string;
+    provenance?: { prefix: string; marker: string } }) =>
+    (await assertPreflightDraftSafe(page, owned).then(() => undefined).catch(caught => caught))?.reason;
+
+  it("admits a hidden span holding the whole serialised composed draft", async () => {
+    // The composer holds this call's own chip followed by the composed draft;
+    // the hidden span mirrors that whole serialisation, connector included.
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(`${CONNECTOR} ${composed()}`) }).page,
+      { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+    )).resolves.toBeUndefined();
+
+    // The aria-hidden ancestor need not be the direct parent.
+    await expect(assertPreflightDraftSafe(
+      fixture({
+        mention: CONNECTOR, text: composed(),
+        foreignText: `${CONNECTOR} ${composed()}`,
+        foreignParent: { tagName: "SPAN" },
+        foreignAncestors: [{ tagName: "DIV", ariaHidden: true }],
+      }).page,
+      { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+    )).resolves.toBeUndefined();
+  });
+
+  it("refuses the same hidden serialised mirror when the marker is missing", async () => {
+    const withoutMarker = `${HEADER}\nUSER: the different planning request\ninvocation_id="${UUID}"`;
+    expect(await reasonOf(
+      fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(`${CONNECTOR} ${withoutMarker}`) }).page,
+      { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+    )).toBe("foreign_text");
+  });
+
+  it("refuses a visible serialised copy and one hidden without the owned connector", async () => {
+    // Visible (not aria-hidden): the mirror rule needs the aria-hidden ancestor.
+    expect(await reasonOf(
+      fixture({
+        mention: CONNECTOR, text: composed(),
+        foreignText: `${CONNECTOR} ${composed()}`,
+        foreignParent: { tagName: "SPAN", rects: 1 },
+      }).page,
+      { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+    )).toBe("foreign_text");
+
+    // Hidden, but the serialisation does not carry this call's connector.
+    expect(await reasonOf(
+      fixture({ mention: CONNECTOR, text: composed(), ...mirrorOf(`other ${composed()}`) }).page,
+      { connector: CONNECTOR, provenance: { prefix: HEADER, marker: MARKER } },
+    )).toBe("foreign_text");
+  });
+
+  it("refuses the hidden serialised mirror when no owned proof is in force", async () => {
+    // Chip-only composer and the mirror present, but this call named neither an
+    // owned text nor a provenance triple: the r19 rule needs a whitespace-free
+    // token and the new rule needs an owned proof, so nothing admits it.
+    expect(await reasonOf(
+      fixture({ mention: CONNECTOR, ...mirrorOf(`${CONNECTOR} ${composed()}`) }).page,
+      { connector: CONNECTOR },
+    )).toBe("foreign_text");
+  });
+
+  it("admits a hidden mirror carrying the connector and the full owned text", async () => {
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: CONNECTOR, text: TEXT, ...mirrorOf(`${CONNECTOR} ${TEXT}`) }).page,
+      { connector: CONNECTOR, text: TEXT },
+    )).resolves.toBeUndefined();
+  });
+
+  it("admits a mirror with extra non-whitespace content only because it includes the FULL owned text", async () => {
+    // Substring inclusion decides: extra content beside the owned text is
+    // forgiven when every character of the owned text is still present, in
+    // order, in the mirror.
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: CONNECTOR, text: TEXT, ...mirrorOf(`${CONNECTOR} ${TEXT} and a stranger's aside`) }).page,
+      { connector: CONNECTOR, text: TEXT },
+    )).resolves.toBeUndefined();
+  });
+
+  it("refuses a mirror that is missing part of the owned text", async () => {
+    expect(await reasonOf(
+      fixture({ mention: CONNECTOR, text: TEXT, ...mirrorOf(`${CONNECTOR} the planning prompt this lane`) }).page,
+      { connector: CONNECTOR, text: TEXT },
+    )).toBe("foreign_text");
+  });
+});
