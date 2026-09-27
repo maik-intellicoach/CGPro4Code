@@ -632,4 +632,104 @@ describe("bounded preflight lease lifecycle", () => {
     expect(request.res.writes.join("")).not.toContain("private");
   });
 
+  // P-035 2026-09-28 r35. Live 07:20 SGT (vendor f3035e4, lane Intelli): the
+  // preflight detected the Pro usage limit (failedPhase=model-catalogue-read),
+  // its own `finally` cleanup then ran cleanup-home for 61s, the 140s deadline
+  // fired during that cleanup, and the 409 said `interaction_preflight_timeout`
+  // -- so the watchdog never recorded the limit. These four are the precedence
+  // bite check: only the Pro-limit code outranks a later cancel, and the two
+  // facts the ask path already forwards travel with it.
+  const proLimitFailure = {
+    code: "pro_usage_limit_reached" as const,
+    availableAfter: "2026-09-30T00:00:00+08:00",
+    limitText: "Limit reached. Try again after Sep 30, 2026.",
+  };
+
+  it("lets a primary Pro-limit failure outrank a deadline cancel during cleanup", async () => {
+    const { state, page } = fixture();
+    const work = deferred();
+    runInteractionPreflight.mockImplementation((_opts, _session, report) => {
+      report("model", "model-catalogue-read", proLimitFailure);
+      return work.promise;
+    });
+    const originalClose = page.close.getMockImplementation()!;
+    page.close.mockImplementation(async () => { await originalClose(); work.reject(new Error("closed during cleanup")); });
+    const request = call(state, "POST", "/preflight", body);
+    await flush();
+    await vi.advanceTimersByTimeAsync(140_000);
+    await request.pending;
+    expect(JSON.parse(request.res.writes.join(""))).toMatchObject({
+      error: "interaction_preflight_failed",
+      code: "pro_usage_limit_reached",
+      availableAfter: proLimitFailure.availableAfter,
+      limitText: proLimitFailure.limitText,
+      failedPhase: "model-catalogue-read",
+    });
+    expect(state.interaction.failureCode).toBe("pro_usage_limit_reached");
+    expect(state.queue.busy).toBe(false);
+  });
+
+  it("still reports recovery_required when the Pro-limit page close is unproven", async () => {
+    const { state, page } = fixture();
+    const work = deferred();
+    runInteractionPreflight.mockImplementation((_opts, _session, report) => {
+      report("model", "model-catalogue-read", {
+        code: "pro_usage_limit_reached",
+        availableAfter: null,
+        limitText: proLimitFailure.limitText,
+      });
+      return work.promise;
+    });
+    page.close.mockImplementation(async () => { throw new Error("close failed"); });
+    const request = call(state, "POST", "/preflight", body);
+    await flush();
+    await vi.advanceTimersByTimeAsync(150_000);
+    await request.pending;
+    expect(JSON.parse(request.res.writes.join(""))).toMatchObject({
+      error: "interaction_preflight_failed",
+      code: "interaction_preflight_recovery_required",
+    });
+    expect(state.slots![0].leasedBy).toBe("preflight-quarantined");
+    expect(state.interaction.failureCode).toBe("interaction_preflight_recovery_required");
+  });
+
+  it("keeps the plain deadline timeout when no primary failure was reported", async () => {
+    const { state, page } = fixture();
+    const work = deferred();
+    runInteractionPreflight.mockImplementation((_opts, _session, report) => {
+      report("cleanup-home", "connector");
+      return work.promise;
+    });
+    const originalClose = page.close.getMockImplementation()!;
+    page.close.mockImplementation(async () => { await originalClose(); work.reject(new Error("closed")); });
+    const request = call(state, "POST", "/preflight", body);
+    await flush();
+    await vi.advanceTimersByTimeAsync(140_000);
+    await request.pending;
+    const result = JSON.parse(request.res.writes.join(""));
+    expect(result.code).toBe("interaction_preflight_timeout");
+    expect(result.availableAfter).toBeUndefined();
+    expect(result.limitText).toBeUndefined();
+  });
+
+  it("keeps the cancel code over a non-limit primary failure", async () => {
+    const { state, page } = fixture();
+    const work = deferred();
+    runInteractionPreflight.mockImplementation((_opts, _session, report) => {
+      report("cleanup-home", "project-row-wait", { code: "browser_operation_timeout" });
+      return work.promise;
+    });
+    const originalClose = page.close.getMockImplementation()!;
+    page.close.mockImplementation(async () => { await originalClose(); work.reject(new Error("closed")); });
+    const request = call(state, "POST", "/preflight", body);
+    await flush();
+    await vi.advanceTimersByTimeAsync(140_000);
+    await request.pending;
+    const result = JSON.parse(request.res.writes.join(""));
+    expect(result.code).toBe("interaction_preflight_timeout");
+    expect(result.failure).toEqual({ code: "browser_operation_timeout" });
+    expect(result.availableAfter).toBeUndefined();
+    expect(result.limitText).toBeUndefined();
+  });
+
 });

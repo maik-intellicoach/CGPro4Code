@@ -203,11 +203,28 @@ export interface InteractionFailure {
     | "browser_operation_timeout" | "project_list_unavailable"
     | "project_identity_unverified" | AccountDiagnosticCode | "unclassified_error";
   httpStatus?: number;
+  /**
+   * Set only for `pro_usage_limit_reached`: the two facts the ask path already
+   * forwards. The preflight's 409 is built from a classified `InteractionFailure`
+   * (the raw error is swallowed by the cancellation race), so they have to
+   * travel on the failure itself or the caller can never learn when Pro returns.
+   */
+  availableAfter?: string | null;
+  limitText?: string | null;
 }
 
 /** Closed classification boundary: never return message, name, URL, stack or cause. */
 export function classifyInteractionFailure(error: unknown): InteractionFailure {
-  if (error instanceof PreSubmitInteractionError) return { code: error.code };
+  if (error instanceof PreSubmitInteractionError) {
+    return {
+      code: error.code,
+      // P-035 2026-09-28 r35. Only the Pro-limit code carries these, with the
+      // same values the ask path forwards; every other code keeps today's shape.
+      ...(error.code === "pro_usage_limit_reached"
+        ? { availableAfter: error.availableAfter ?? null, limitText: error.limitText ?? null }
+        : {}),
+    };
+  }
   if (error instanceof SelectorBrokenError) return { code: "selector_unresolved" };
   if (error instanceof NotLoggedInError) return { code: "not_logged_in" };
   if (error instanceof browserErrors.TimeoutError) return { code: "browser_operation_timeout" };

@@ -1210,8 +1210,20 @@ export async function handleRequest(
         // escalation instead of risking other paid turns in this browser.
         if (!release) slot.leasedBy = "preflight-quarantined";
       }
+      // P-035 2026-09-28 r35. A primary failure already reported through
+      // `onPhase` before the deadline/disconnect cancel outranks the cancel
+      // code -- but ONLY for the Pro usage limit, whose whole point is that no
+      // paid turn can run until it resets. The live case: the preflight detected
+      // the limit (failedPhase=model-catalogue-read), its own `finally` cleanup
+      // then ran for 61s, the 140s deadline fired during that cleanup, and the
+      // 409 said `interaction_preflight_timeout`, so the watchdog never recorded
+      // the limit. The recorded failure is inherently pre-cancel: the `onPhase`
+      // callback above only latches one while `!cancelled`. Every other code
+      // keeps today's precedence, and an unproven release still wins over both.
+      const primaryProLimit = failure?.code === "pro_usage_limit_reached" ? failure : undefined;
       const failureCode = !release ? "interaction_preflight_recovery_required"
-        : cancelled ?? failure?.code;
+        : primaryProLimit ? "pro_usage_limit_reached"
+          : cancelled ?? failure?.code;
       slot.interaction = {
         state: "degraded",
         checkedAt: new Date().toISOString(),
@@ -1227,6 +1239,14 @@ export async function handleRequest(
         res.end(JSON.stringify({
           error: "interaction_preflight_failed",
           ...(failureCode ? { code: failureCode } : {}),
+          // P-035 2026-09-28 r35. When the reported primary failure is the Pro
+          // usage limit, the 409 carries the same two facts the ask path
+          // forwards -- when Pro returns and the capped tooltip it read. The
+          // watchdog reads them from here to record the limit; they are never
+          // logged anywhere new.
+          ...(primaryProLimit
+            ? { availableAfter: primaryProLimit.availableAfter ?? null, limitText: primaryProLimit.limitText ?? null }
+            : {}),
           message: error instanceof Error ? error.message.slice(0, 400) : String(error).slice(0, 400),
           phase: cancelled ? phase : error instanceof PreSubmitInteractionError ? error.phase : phase,
           ...(failedPhase ? { failedPhase } : {}),

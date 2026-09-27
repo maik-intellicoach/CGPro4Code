@@ -1359,3 +1359,45 @@ it("carries the Pro usage limit fields on the daemon error event", async () => {
   expect(sse).toContain('"availableAfter":"2026-09-30T00:00:00+08:00"');
   expect(sse).toContain('"limitText":"Limit reached. Try again after Sep 30, 2026."');
 });
+
+// P-035 2026-09-28 r35. The preflight 409 is built from a CLASSIFIED failure,
+// so the Pro-limit facts the ask path forwards have to survive the
+// classification AND reach the 409 top level. This is the no-cancellation case:
+// the typed refusal is thrown, classified, and must arrive whole.
+it("carries the Pro usage limit fields on the preflight 409", async () => {
+  const limitText = "Limit reached. Try again after Sep 30, 2026.";
+  const availableAfter = "2026-09-30T00:00:00+08:00";
+  runInteractionPreflight.mockRejectedValue(new PreSubmitInteractionError(
+    "pro_usage_limit_reached",
+    "model_verification",
+    `ChatGPT Pro usage limit reached before submission: ${limitText}`,
+    { availableAfter, limitText },
+  ));
+  const state = fakeState();
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST", url: "/preflight", headers: { authorization: "Bearer test-token" } });
+  const pending = handleRequest(req, res, state);
+  sendBody(req, {
+    model: "gpt-6-pro",
+    connector: "connector",
+    gizmoId: "g-p-project",
+    expectedAccountEmail: "account@example.test",
+  });
+  await pending;
+
+  expect((res as unknown as FakeRes).statusCode).toBe(409);
+  const result = parseJsonBody(res as unknown as FakeRes) as Record<string, unknown>;
+  expect(result.code).toBe("pro_usage_limit_reached");
+  expect(result.availableAfter).toBe(availableAfter);
+  expect(result.limitText).toBe(limitText);
+  expect(result.failure).toEqual({
+    code: "pro_usage_limit_reached",
+    availableAfter,
+    limitText,
+  });
+  expect(state.interaction).toMatchObject({
+    state: "degraded",
+    failureCode: "pro_usage_limit_reached",
+  });
+});
