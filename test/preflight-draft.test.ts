@@ -293,8 +293,12 @@ describe("draft-safe interaction preflight", () => {
   it("only admits exact owned text or token, never extra text or attachments", async () => {
     const { state, page } = fixture({ text: "owned probe" });
     await expect(assertPreflightDraftSafe(page, { text: "owned probe" })).resolves.toBeUndefined();
+    // P-035 2026-09-28 r25. This assertion used to require a refusal: the
+    // comparison was whitespace-strict, so a single trailing space failed it.
+    // Whitespace is now normalised on both sides, so trailing space is admitted;
+    // any extra NON-whitespace character still refuses (the next assertion).
     state.text += " ";
-    await expect(assertPreflightDraftSafe(page, { text: "owned probe" })).rejects.toThrow("safe draft ownership");
+    await expect(assertPreflightDraftSafe(page, { text: "owned probe" })).resolves.toBeUndefined();
     state.text += " plus private user draft";
     await expect(assertPreflightDraftSafe(page, { text: "owned probe" })).rejects.toThrow("safe draft ownership");
     state.text = ""; state.mention = "fixture";
@@ -793,6 +797,99 @@ describe("home composer hydration wait", () => {
     expect(openConversation).not.toHaveBeenCalled();
     expect(setConnector).not.toHaveBeenCalled();
     expect(clearComposer).not.toHaveBeenCalled();
+  });
+});
+
+// P-035 2026-09-28 r25. Live vendor 740db47 (Intelli daemon pid 40642): the one
+// approved POST /discard-owned-draft call passed token identity and attributes,
+// then refused `owned_text_mismatch` on the exact 908-char multi-line prompt it
+// had itself pasted, because the comparison was whitespace-strict and Chrome's
+// `innerText` renders paragraph breaks differently from the source newlines. The
+// owned-text comparison now normalises whitespace on BOTH sides -- every
+// non-whitespace character still decides -- and the refusal carries one
+// content-free shape line. These cases pin the new proof and the shape.
+describe("whitespace-insensitive owned-text proof (r25)", () => {
+  const shapeLineOf = (spy: ReturnType<typeof vi.spyOn>) => spy.mock.calls
+    .map(call => String(call[0])).find(line => line.includes("owned text shape"));
+
+  it("admits owned text whose rendered breaks or line-trailing spaces differ from the source", async () => {
+    // One source newline between paragraphs, rendered by `innerText` as two.
+    const doubled = "line one\n\nline two\n\nline three";
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: "fixture", text: doubled }).page,
+      { connector: "fixture", text: "line one\nline two\nline three" },
+    )).resolves.toBeUndefined();
+
+    // The same source lines, each rendered with a trailing space.
+    const spaced = "line one \nline two \nline three ";
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: "fixture", text: spaced }).page,
+      { connector: "fixture", text: "line one\nline two\nline three" },
+    )).resolves.toBeUndefined();
+
+    // The no-token branch normalises the same way.
+    await expect(assertPreflightDraftSafe(
+      fixture({ text: "multi\n\nline text" }).page,
+      { text: "multi\nline text" },
+    )).resolves.toBeUndefined();
+  });
+
+  it("still refuses one extra non-whitespace character and logs the shape line", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = await assertPreflightDraftSafe(
+        fixture({ mention: "fixture", text: "owned probf" }).page,
+        { connector: "fixture", text: "owned probe" },
+      ).catch(caught => caught);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("owned_text_mismatch");
+      // Both sides normalise to eleven characters that agree up to the tenth.
+      expect(shapeLineOf(spy)).toBe(
+        "[cgpro:preflight] owned text shape: have_len=11 want_len=11 common_prefix=10",
+      );
+      // Exactly one shape line, and it never carries the refused text.
+      expect(spy.mock.calls.map(call => String(call[0]))
+        .filter(line => line.includes("owned text shape"))).toHaveLength(1);
+      expect(shapeLineOf(spy)).not.toContain("owned prob");
+      expect(JSON.stringify(error)).not.toContain("owned prob");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("refuses an extra character across a rendered newline and counts the normalised prefix", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // The rendered remainder equals the owned text except for one extra `X`
+      // after the second paragraph. Normalising whitespace makes both single
+      // spaced, and the common prefix is the ten characters before `X`.
+      const error = await assertPreflightDraftSafe(
+        fixture({ mention: "fixture", text: "alpha\n\nbetaX" }).page,
+        { connector: "fixture", text: "alpha\nbeta" },
+      ).catch(caught => caught);
+      expect(error.reason).toBe("owned_text_mismatch");
+      expect(shapeLineOf(spy)).toBe(
+        "[cgpro:preflight] owned text shape: have_len=11 want_len=10 common_prefix=10",
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("names a wholly different remainder with a zero-length common prefix", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = await assertPreflightDraftSafe(
+        fixture({ mention: "fixture", text: "zzz" }).page,
+        { connector: "fixture", text: "owned probe" },
+      ).catch(caught => caught);
+      expect(error.reason).toBe("owned_text_mismatch");
+      expect(shapeLineOf(spy)).toBe(
+        "[cgpro:preflight] owned text shape: have_len=3 want_len=11 common_prefix=0",
+      );
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

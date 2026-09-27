@@ -2204,10 +2204,27 @@ interface ForeignTextShape {
   labels: number;
 }
 
+/**
+ * P-035 2026-09-28 r25. The owned-text comparison refused `owned_text_mismatch`
+ * without saying how far the two sides agreed, so a live refusal left the
+ * mismatch class -- an extra character, a truncation, a wholly different string
+ * -- unknown. The shape carries three counts and no text: the two normalised
+ * lengths and the length of their longest common prefix.
+ */
+interface OwnedTextShape {
+  haveLen: number;
+  wantLen: number;
+  commonPrefix: number;
+}
+
 /** The content-free diagnostics a single refusal may carry beside its reason. */
 type PreflightDiagnostic =
-  | { reason: string; chipRemainder: { len: number; ws: number; cf: number; other: number }; foreignShape?: undefined }
-  | { reason: string; foreignShape: ForeignTextShape; chipRemainder?: undefined };
+  | {
+    reason: string; chipRemainder: { len: number; ws: number; cf: number; other: number };
+    foreignShape?: undefined; ownedTextShape?: undefined;
+  }
+  | { reason: string; foreignShape: ForeignTextShape; chipRemainder?: undefined; ownedTextShape?: undefined }
+  | { reason: string; ownedTextShape: OwnedTextShape; chipRemainder?: undefined; foreignShape?: undefined };
 
 /**
  * Read-only, content-free admission for the no-submit preflight. Unknown rich
@@ -2236,6 +2253,21 @@ export async function assertPreflightDraftSafe(
       /** Keep a code to UI chrome: [A-Za-z0-9 _.:-], trimmed, capped at 60. */
       const chrome = (value: string): string =>
         value.replace(/[^A-Za-z0-9 _.:-]/g, "").trim().slice(0, 60);
+      // P-035 2026-09-28 r25. Whitespace is a rendering artefact: `innerText`
+      // renders the paragraph breaks of pasted multi-line text differently from
+      // the source newlines, so the owned-text comparison normalises every run
+      // of whitespace to one space and trims. Every non-whitespace character
+      // must still match exactly and in order; only the whitespace between them
+      // is forgiven.
+      const norm = (value: string): string => value.replace(/\s+/g, " ").trim();
+      // The length of the longest common prefix of two strings, code unit by
+      // code unit. A count only: never any character.
+      const commonPrefixLength = (a: string, b: string): number => {
+        const max = Math.min(a.length, b.length);
+        let index = 0;
+        while (index < max && a[index] === b[index]) index += 1;
+        return index;
+      };
       /** UI chrome only for a control: data-testid, else aria-label, else tag name. */
       const identify = (element: { getAttribute?: (name: string) => string | null; tagName?: string }): string => {
         let raw = "";
@@ -2417,12 +2449,24 @@ export async function assertPreflightDraftSafe(
           // owned token AND this call's prompt in one inline flow, so neither
           // half alone can prove the draft. Remove the token's own rendered
           // text from the composer read and compare what is left to the owned
-          // text, trimming leading/trailing whitespace only. An extra draft
+          // text, normalising whitespace on both sides (r25). An extra draft
           // beside the prompt, a different prompt, or a token name that is not
           // the one removed first changes the remainder and refuses.
           const tokenName = ownedToken.textContent?.trim() ?? "";
           const remainder = text.replace(tokenName, "");
-          if (remainder.trim() !== owned.text) return "owned_text_mismatch";
+          // P-035 2026-09-28 r25. Was `remainder.trim() !== owned.text`, a
+          // whitespace-strict comparison: the live 908-char multi-line prompt
+          // rendered as `innerText` never matched its own source newlines, so an
+          // exact owned draft was refused. Compare with whitespace normalised on
+          // BOTH sides instead; every non-whitespace character still decides.
+          const have = norm(remainder);
+          const want = norm(owned.text);
+          if (have !== want) {
+            return {
+              reason: "owned_text_mismatch",
+              ownedTextShape: { haveLen: have.length, wantLen: want.length, commonPrefix: commonPrefixLength(have, want) },
+            };
+          }
           textAdmitted = true;
         } else {
           // A sole owned connector token is admissible, not arbitrary text that
@@ -2462,7 +2506,19 @@ export async function assertPreflightDraftSafe(
       }
       if (!textAdmitted) {
         if (owned.text !== undefined) {
-          if (text !== owned.text) return "owned_text_mismatch";
+          // P-035 2026-09-28 r25. Was `text !== owned.text`, the same
+          // whitespace-strict rule as the combined branch above, so a
+          // multi-line prompt could never match here either. Normalise
+          // whitespace on both sides; every non-whitespace character still
+          // decides.
+          const have = norm(text);
+          const want = norm(owned.text);
+          if (have !== want) {
+            return {
+              reason: "owned_text_mismatch",
+              ownedTextShape: { haveLen: have.length, wantLen: want.length, commonPrefix: commonPrefixLength(have, want) },
+            };
+          }
         } else {
           if (text.trim() || (copy.textContent ?? "").length > 0) return "text_present";
           if (composer instanceof HTMLTextAreaElement && text.length > 0) return "text_present";
@@ -2613,6 +2669,16 @@ export async function assertPreflightDraftSafe(
           + `hidden=${hidden} len=${len} equals_connector=${equalsConnector} `
           + `contains_connector=${containsConnector} equals_placeholder=${equalsPlaceholder} `
           + `equals_composer_text=${equalsComposerText} words=${words} path=${path} labels=${labels}`,
+        );
+      }
+      // P-035 2026-09-28 r25. Exactly one content-free shape line for the
+      // owned-text refusal, so a live round names how far the composer's text
+      // agreed with the owned text: the two normalised lengths and the length
+      // of their longest common prefix. Counts only, never any text.
+      if (outcome.ownedTextShape) {
+        const { haveLen, wantLen, commonPrefix } = outcome.ownedTextShape;
+        console.error(
+          `[cgpro:preflight] owned text shape: have_len=${haveLen} want_len=${wantLen} common_prefix=${commonPrefix}`,
         );
       }
     }

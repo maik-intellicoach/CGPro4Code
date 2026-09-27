@@ -211,6 +211,24 @@ describe("POST /discard-owned-draft", () => {
     expect(presses).toEqual(["Meta+A", "Backspace"]);
   });
 
+  // P-035 2026-09-28 r25. The live refusal at vendor 740db47: this approved
+  // call's own multi-line prompt was pasted, and `innerText` rendered its
+  // paragraph breaks differently from the source newlines, so the
+  // whitespace-strict comparison refused `owned_text_mismatch`. Normalising
+  // whitespace on both sides admits exactly that paste and clears it.
+  it("clears an exact multi-line pasted prompt whose rendered breaks differ", async () => {
+    const source = "line one\nline two\nline three";
+    const rendered = "line one\n\nline two\n\nline three";
+    const { page, presses, click } = fixture({ text: rendered, rich: [{
+      tagName: "P", attributes: [{ name: "data-prompt-literal-paste", value: "" }], textContent: rendered,
+    }] });
+    const result = await discard(stateFor(page), { connector: CONNECTOR, text: source });
+    expect(result.status).toBe(200);
+    expect(JSON.parse(result.body)).toEqual({ cleared: true });
+    expect(presses).toEqual(["Meta+A", "Backspace"]);
+    expect(click).toHaveBeenCalledTimes(1);
+  });
+
   it("refuses one extra character in the draft and touches nothing", async () => {
     const { page, click, presses } = fixture({ text: `${TEXT}x` });
     const result = await discard(stateFor(page), { connector: CONNECTOR, text: TEXT });
