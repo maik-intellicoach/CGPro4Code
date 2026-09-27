@@ -2389,6 +2389,17 @@ export async function assertPreflightDraftSafe(
         if (placeholderParagraph(child)) continue;
         const refusedAttributes: string[] = [];
         for (const attribute of Array.from(child.attributes)) {
+          // P-035 2026-09-28 r24. ChatGPT tags each paragraph our automation
+          // pasted with `data-prompt-literal-paste`, so a draft this call itself
+          // introduced refused `rich_attr:data-prompt-literal-paste` before the
+          // exact-text comparison below ever ran. Skip exactly that attribute
+          // name ONLY while a combined exact-text proof is in force
+          // (`owned.text !== undefined`, the same condition the token and Expand
+          // branches use): the caller has then named the full owned draft, and
+          // the text comparison still decides admission, so a foreign draft
+          // beside it refuses exactly as before. Every other attribute on the
+          // node -- and this attribute without an owned text -- refuse unchanged.
+          if (owned.text !== undefined && attribute.name === "data-prompt-literal-paste") continue;
           if (!/^(data-|contenteditable|role|aria-|hidden|style)/.test(attribute.name)) continue;
           const name = chrome(attribute.name) || "unknown";
           if (refusedAttributes.length < 5 && !refusedAttributes.includes(name)) refusedAttributes.push(name);

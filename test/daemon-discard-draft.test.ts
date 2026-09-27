@@ -37,10 +37,19 @@ function fixture(initial: Partial<Surface> = {}) {
   const chip = state.chip === null ? null : {
     tagName: "A", textContent: state.chip, parentElement: null, closest: () => null, remove: vi.fn(),
   };
+  // Rich nodes carry the real shape the guard reads: tagName, an attributes
+  // list and own textContent, plus an empty child list (so a P with text is
+  // never mistaken for the exempt placeholder paragraph).
+  const materialize = (node: RichNode): object => ({
+    tagName: node.tagName,
+    attributes: (node.attributes ?? []).map(attribute => ({ name: attribute.name, value: attribute.value ?? "" })),
+    textContent: node.textContent ?? "",
+    children: [],
+  });
   const copy = {
     get textContent() { return state.text; },
     querySelectorAll: (selector: string) => (selector === '[contenteditable="false"]'
-      ? (state.chip === null ? [] : [chip]) : []),
+      ? (state.chip === null ? [] : [chip]) : selector === "*" ? (state.rich ?? []).map(materialize) : []),
   };
   const control = {
     tagName: state.controlTag ?? "BUTTON",
@@ -86,7 +95,9 @@ function fixture(initial: Partial<Surface> = {}) {
         // long draft, so it goes with it -- and that is exactly why the empty
         // re-proof can admit: an `Expand` left on an empty composer would be
         // chrome with no owned text to justify it.
-        if (key === "Backspace" && !state.persist) { state.chip = null; state.text = ""; state.expand = false; }
+        if (key === "Backspace" && !state.persist) {
+          state.chip = null; state.text = ""; state.expand = false; state.rich = [];
+        }
       }),
     },
     locator: () => ({ first: () => ({ waitFor: async () => {} }) }),
@@ -109,6 +120,14 @@ interface Surface {
   persist?: boolean;
   /** The tag the `Expand` control uses; only `BUTTON` is admissible. */
   controlTag?: string;
+  /** Rich nodes inside the composer copy, cleared with the draft by `Backspace`. */
+  rich?: RichNode[];
+}
+/** One rich node in the composer copy, with the fields the guard reads. */
+interface RichNode {
+  tagName: string;
+  attributes?: Array<{ name: string; value?: string }>;
+  textContent?: string;
 }
 
 function stateFor(page: Page): ServerState {
@@ -175,6 +194,21 @@ describe("POST /discard-owned-draft", () => {
     expect(result.status).toBe(200);
     expect(presses).toEqual(["Meta+A", "Backspace"]);
     expect(click).toHaveBeenCalledTimes(1);
+  });
+
+  // P-035 2026-09-28 r24. ChatGPT marks each paragraph our automation pasted
+  // with `data-prompt-literal-paste`, so the one approved discard call refused
+  // `draft_not_owned reason=rich_attr:data-prompt-literal-paste` on a draft it
+  // had itself introduced. Under the owned-text proof that one attribute name
+  // is now skipped and the exact text still decides, so this exact paste clears.
+  it("clears an exact pasted draft that carries the paste marker", async () => {
+    const { page, presses } = fixture({ rich: [{
+      tagName: "P", attributes: [{ name: "data-prompt-literal-paste", value: "" }], textContent: TEXT,
+    }] });
+    const result = await discard(stateFor(page), { connector: CONNECTOR, text: TEXT });
+    expect(result.status).toBe(200);
+    expect(JSON.parse(result.body)).toEqual({ cleared: true });
+    expect(presses).toEqual(["Meta+A", "Backspace"]);
   });
 
   it("refuses one extra character in the draft and touches nothing", async () => {

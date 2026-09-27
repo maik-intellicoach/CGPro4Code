@@ -665,6 +665,46 @@ describe("draft-safe interaction preflight", () => {
     expect(firstError.reason).toBe("rich_node:DIV");
   });
 
+  // P-035 2026-09-28 r24. ChatGPT tags each paragraph our automation pasted
+  // with `data-prompt-literal-paste`, so an exact paste this call itself made
+  // refused `rich_attr:data-prompt-literal-paste` before the text comparison
+  // ran. That one attribute name is skipped ONLY under a combined exact-text
+  // proof; the text comparison still decides admission, and every other
+  // attribute -- and this attribute without owned text -- refuse unchanged.
+  it("admits an exact owned paste carrying the paste marker, only while the owned text is in force", async () => {
+    const pasted = (text: string) => fixture({
+      mention: "fixture", text,
+      rich: [{
+        tagName: "P", attributes: [{ name: "data-prompt-literal-paste", value: "" }], textContent: text,
+      }],
+    });
+    await expect(assertPreflightDraftSafe(pasted("owned probe").page, { connector: "fixture", text: "owned probe" }))
+      .resolves.toBeUndefined();
+
+    // One changed character in the owned text still refuses by the text check.
+    const changed = await assertPreflightDraftSafe(
+      pasted("owned probf").page, { connector: "fixture", text: "owned probe" },
+    ).catch(error => error);
+    expect(changed.reason).toBe("owned_text_mismatch");
+
+    // Without an owned text the same DOM refuses the marker exactly as before.
+    const unowned = await assertPreflightDraftSafe(
+      pasted("owned probe").page, { connector: "fixture" }).catch(error => error);
+    expect(unowned).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(unowned.reason).toBe("rich_attr:data-prompt-literal-paste");
+
+    // A second attribute on the same marked node is still refused.
+    const extra = await assertPreflightDraftSafe(fixture({
+      mention: "fixture", text: "owned probe",
+      rich: [{
+        tagName: "P", attributes: [
+          { name: "data-prompt-literal-paste", value: "" }, { name: "data-other", value: "" },
+        ], textContent: "owned probe",
+      }],
+    }).page, { connector: "fixture", text: "owned probe" }).catch(error => error);
+    expect(extra.reason).toBe("rich_attr:data-other");
+  });
+
   it("names a typed-text refusal text_present without leaking the draft", async () => {
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
