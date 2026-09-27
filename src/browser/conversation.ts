@@ -2322,7 +2322,20 @@ export async function assertPreflightDraftSafe(
         // `Send now`, `Send a message` and a `div[role="button"]` named `Send`
         // all still refuse. The text checks below are untouched, so typed text
         // with this button present still refuses `text_present`.
-        if (control.tagName === "BUTTON" && (id === "Dictate" || id === "Start Voice" || id === "Send")) continue;
+        //
+        // P-035 2026-09-28 r23. A long draft renders its expander on the
+        // composer, and the lone `Expand` button refused the whole surface as
+        // `unknown_control:Expand` even when every other check had already
+        // proven the composer held EXACTLY this call's own connector chip and
+        // prompt. Admit that one identifier only while a combined exact-text
+        // proof is in force (`owned.text !== undefined`, the same condition the
+        // token branch below uses): the caller has then named the full owned
+        // draft, so the expander is chrome over content this call introduced.
+        // Any other caller -- and every `[role="button"]` -- still refuses
+        // `unknown_control:Expand` exactly as before.
+        if (control.tagName === "BUTTON"
+          && (id === "Dictate" || id === "Start Voice" || id === "Send"
+            || (id === "Expand" && owned.text !== undefined))) continue;
         if (unknownControls.length < 5 && !unknownControls.includes(id)) unknownControls.push(id);
       }
       if (unknownControls.length > 0) return `unknown_control:${unknownControls.join("|")}`.slice(0, 200);

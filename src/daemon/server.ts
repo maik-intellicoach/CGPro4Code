@@ -33,10 +33,13 @@ import type { Page } from "patchright";
 import { describeWindow, openSession, parkWindow, showWindow, type Session } from "../browser/session.js";
 import { fetchAuthSessionInPage, goHome, isLoggedIn } from "../browser/chatgpt.js";
 import {
+  assertPreflightDraftSafe,
+  clearComposer,
   currentConversationId,
   openConversation,
   readLatestAssistantText,
   turnIsWorking,
+  waitForComposerHydrated,
 } from "../browser/conversation.js";
 import { detectPlan, fetchMe, type MeResponse } from "../api/me.js";
 import { archiveSavedConversation } from "../api/conversation-filing.js";
@@ -48,7 +51,13 @@ import {
   type AskOptions,
   type AskRunner,
 } from "../core/orchestrator.js";
-import { classifyInteractionFailure, type InteractionFailure, NotLoggedInError, PreSubmitInteractionError } from "../errors.js";
+import {
+  classifyInteractionFailure,
+  type InteractionFailure,
+  NotLoggedInError,
+  PreflightDraftProtectedError,
+  PreSubmitInteractionError,
+} from "../errors.js";
 import { SELECTORS, TURN_CRITICAL_SELECTORS, type SelectorSet } from "../browser/selectors.js";
 import {
   clearDaemonInfo,
@@ -266,7 +275,7 @@ export interface SlotState {
   id: number;
   /** Slot 0 drives `session.page`; higher slots are created lazily and dropped once closed or crashed. */
   page: Page | null;
-  /** Leased by an /ask, /preflight, /archive-saved or idle /reload. */
+  /** Leased by an /ask, /preflight, /archive-saved, /discard-owned-draft or idle /reload. */
   busy: boolean;
   /**
    * Which handler holds the lease. A slot that is busy with no invocation and
@@ -1270,6 +1279,97 @@ export async function handleRequest(
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: (error as Error).message }));
     } finally { releaseSlot(state, slot, "archive"); state.queue.release(); }
+    return;
+  }
+
+  if (method === "POST" && url.pathname === "/discard-owned-draft") {
+    // P-035 2026-09-28 r23. The one idle-only lane operation that discards a
+    // draft this daemon's own earlier automation typed, and only after the SAME
+    // combined ownership proof the preflight uses admits it: the composer holds
+    // exactly the named connector chip followed by exactly the named text. A
+    // refusal touches nothing. It never waits and never interrupts a turn, and
+    // every response and log line is content-free -- connector, text and page
+    // are never echoed.
+    let body: { connector?: unknown; text?: unknown } | null;
+    try {
+      state.readerBudget.acquire();
+    } catch {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "reader_budget_exceeded" }));
+      return;
+    }
+    try {
+      body = await readJsonBody(req);
+    } catch {
+      console.error("[cgpro:discard] outcome=invalid reason=-");
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_request" }));
+      return;
+    } finally { state.readerBudget.release(); }
+    const connector = typeof body?.connector === "string" ? body.connector : "";
+    const text = typeof body?.text === "string" ? body.text : "";
+    if (!body || typeof body.connector !== "string" || connector.length < 1 || connector.length > 120 ||
+        typeof body.text !== "string" || text.length < 1 || text.length > 20_000) {
+      console.error("[cgpro:discard] outcome=invalid reason=-");
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_request" }));
+      return;
+    }
+    if (!state.queue.tryAcquire()) {
+      console.error("[cgpro:discard] outcome=busy reason=-");
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "lane_busy" }));
+      return;
+    }
+    const slot = leaseSlot(state, "discard");
+    // The guard's reason is already a closed, content-free code. Never fall
+    // back to an error message, which could carry page content.
+    const guardReason = (error: unknown): string =>
+      error instanceof PreflightDraftProtectedError ? (error.reason ?? "unknown").slice(0, 200) : "unknown";
+    // False until the ownership proof has admitted; after the clear has been
+    // ISSUED an unexpected failure is a possible persistence, never a clean
+    // unowned refusal.
+    let clearIssued = false;
+    try {
+      const page = await slotPage(state, slot);
+      await goHome(page);
+      await waitForComposerHydrated(page);
+      try {
+        await assertPreflightDraftSafe(page, { connector, text });
+      } catch (error) {
+        const reason = guardReason(error);
+        console.error(`[cgpro:discard] outcome=not_owned reason=${reason}`);
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "draft_not_owned", reason }));
+        return;
+      }
+      clearIssued = true;
+      await clearComposer(page, () => assertPreflightDraftSafe(page, { connector, text }));
+      await goHome(page);
+      await waitForComposerHydrated(page);
+      try {
+        await assertPreflightDraftSafe(page);
+      } catch (error) {
+        const reason = guardReason(error);
+        console.error(`[cgpro:discard] outcome=persisted reason=${reason}`);
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "draft_persisted", reason }));
+        return;
+      }
+      console.error("[cgpro:discard] outcome=cleared reason=-");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ cleared: true }));
+    } catch (error) {
+      const reason = guardReason(error);
+      console.error(`[cgpro:discard] outcome=${clearIssued ? "persisted" : "not_owned"} reason=${reason}`);
+      if (!res.headersSent) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: clearIssued ? "draft_persisted" : "draft_not_owned",
+          reason,
+        }));
+      }
+    } finally { releaseSlot(state, slot, "discard"); state.queue.release(); }
     return;
   }
 
