@@ -679,3 +679,60 @@ describe("home composer hydration wait", () => {
     expect(clearComposer).not.toHaveBeenCalled();
   });
 });
+
+// P-035 2026-09-28 r15. Live ms1980 (vendor 96e567d, lane ms1980, pid 35868):
+// an earlier preflight attached this lane's connector chip, a later guard
+// refused for an unrelated reason, `protectedDraft` deliberately skipped
+// cleanup, and ChatGPT persisted the chip. Every guard before `setConnector`,
+// and every cleanup guard after `goHome` reset `ownedConnector`, then saw an
+// unowned chip and refused `connector_unowned`, so the lane could never clear
+// its own residue and stayed wedged. The lane's configured connector name is
+// lane-specific automation state; a composer holding ONLY that chip carries no
+// user content. These cases pin the r15 admission at the preflight's own guard
+// and every neighbouring refusal that must not change.
+describe("lane-owned connector chip residue", () => {
+  const laneOptions = { ...options, connector: "lane-x" };
+
+  it("admits the composer's lone lane-owned chip at the pre-attach guards and proceeds past home", async () => {
+    const { state, session } = fixture({ mention: "lane-x" });
+    // The chip is present on the home composer from the first read -- exactly
+    // the residue the live lane held -- and it is still there when
+    // `setConnector` leaves it (the mock does not touch the DOM).
+    expect(state.mention).toBe("lane-x");
+    const phases: string[] = [];
+    await expect(runInteractionPreflight(laneOptions, session, phase => phases.push(phase)))
+      .resolves.toMatchObject({ connectorVerified: true, power: 4 });
+    // Both pre-attach guards admitted it: the preflight recorded `home` and then
+    // crossed into `login`, so it proceeded past the phase that used to refuse.
+    expect(phases[0]).toBe("home");
+    expect(phases).toContain("login");
+    expect(openConversation).toHaveBeenCalledTimes(1);
+    expect(setConnector).toHaveBeenCalledWith(session.page, "lane-x", true);
+    expect(goHome).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses a lane-owned chip followed by typed text as text_present", async () => {
+    const { session } = fixture({ mention: "lane-x", text: "private user draft" });
+    const error = await runInteractionPreflight(laneOptions, session).catch(caught => caught);
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.reason).toBe("text_present");
+    expect(goHome).not.toHaveBeenCalled();
+  });
+
+  it("refuses a differently named chip as connector_token_text", async () => {
+    const { session } = fixture({ mention: "other-y" });
+    const error = await runInteractionPreflight(laneOptions, session).catch(caught => caught);
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.reason).toBe("connector_token_text");
+    expect(goHome).not.toHaveBeenCalled();
+  });
+
+  it("still refuses a chip with no configured connector as connector_unowned", async () => {
+    const { session } = fixture({ mention: "lane-x" });
+    const unowned = { ...options, connector: undefined as unknown as string };
+    const error = await runInteractionPreflight(unowned, session).catch(caught => caught);
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.reason).toBe("connector_unowned");
+    expect(goHome).not.toHaveBeenCalled();
+  });
+});

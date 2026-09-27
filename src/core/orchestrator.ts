@@ -120,9 +120,20 @@ export async function runInteractionPreflight(
   let verificationError: unknown;
   let admitted = false;
   let protectedDraft = false;
+  // P-035 2026-09-28 r15. The lane's own configured connector is not a user
+  // draft. An earlier preflight on this lane attached the chip, the guard then
+  // refused for an unrelated reason, `protectedDraft` skipped cleanup by
+  // design, and ChatGPT persisted the chip. Every guard before `setConnector`
+  // -- and every cleanup guard after `goHome` resets `ownedConnector` -- then
+  // ran with no owned connector, refused the lane's own residue as
+  // `connector_unowned`, and left the lane permanently stuck. `ownedConnector`
+  // stays the authority once this run has attached a connector; before and
+  // after that, the one connector this lane may own is the one it is
+  // configured to use.
+  const configuredConnector = opts.connector?.trim() || undefined;
   let ownedConnector: string | undefined;
   const guard = async (): Promise<void> => {
-    try { await assertPreflightDraftSafe(page, { connector: ownedConnector }); }
+    try { await assertPreflightDraftSafe(page, { connector: ownedConnector ?? configuredConnector }); }
     catch (error) { protectedDraft = true; throw error; }
   };
   let phase: InteractionPreflightPhase = "home";
