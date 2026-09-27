@@ -34,6 +34,8 @@ function fixture(initial: Partial<State> = {}) {
   // composer count it saw when the wait began, so a test can prove the home
   // guard ran after hydration and not before it.
   const composerWaits: Array<{ selector: string; options: { state?: string; timeout?: number }; countAtStart: number }> = [];
+  // Every outermost token the guard removed from its clone this evaluation.
+  const removedTokens: FixtureToken[] = [];
   const page = {
     url: () => state.url,
     keyboard: { press: vi.fn(async () => {}) },
@@ -60,7 +62,28 @@ function fixture(initial: Partial<State> = {}) {
     evaluate: vi.fn(async (fn: Function, arg: unknown) => {
       if (!state.readable) throw new Error("synthetic evaluation failure with private content");
       const tokenTexts = state.mentions ?? (state.mention ? [state.mention] : []);
-      const tokens = tokenTexts.map(textContent => ({ tagName: "A", textContent, remove() {} }));
+      // P-035 2026-09-28 r14. A chip's icon is itself a
+      // `[contenteditable="false"]` node, so the fixture builds real
+      // `parentElement` links and a real `closest`: the guard keeps only the
+      // OUTERMOST tokens. `state.mentions`/`state.mention` stay the flat `A`
+      // shape every earlier case used; `state.tokenTree` names tag and nesting.
+      const tokenRoots: TokenNode[] = state.tokenTree
+        ?? tokenTexts.map(textContent => ({ tagName: "A", textContent }));
+      const tokens: FixtureToken[] = [];
+      const buildToken = (node: TokenNode, parent: unknown): FixtureToken => {
+        const element: FixtureToken = {
+          tagName: node.tagName,
+          textContent: node.textContent ?? "",
+          parentElement: parent,
+          closest: () => element,
+          remove: () => { removedTokens.push(element); },
+        };
+        tokens.push(element);
+        for (const child of node.children ?? []) buildToken(child, element);
+        return element;
+      };
+      for (const root of tokenRoots) buildToken(root, null);
+      const tokenTopTexts = tokenRoots.map(node => node.textContent ?? "");
       // Synthetic rich nodes carry the real shape the guard reads: tagName,
       // an attributes list, own textContent, and element children.
       const materialize = (node: RichNode): object => ({
@@ -89,7 +112,7 @@ function fixture(initial: Partial<State> = {}) {
           tagName: control.tagName ?? "BUTTON",
         })),
       };
-      const composer = { isConnected: true, getClientRects: () => [{}], innerText: tokenTexts.join("") + state.text, cloneNode: () => copy,
+      const composer = { isConnected: true, getClientRects: () => [{}], innerText: tokenTopTexts.join("") + state.text, cloneNode: () => copy,
         closest: () => state.form ? form : null, contains: () => false };
       const document = {
         body: { childNodes: state.count ? [composer] : [] },
@@ -102,7 +125,7 @@ function fixture(initial: Partial<State> = {}) {
       });
     }),
   } as unknown as Page;
-  return { state, page, session: { page } as Session, composerWaits };
+  return { state, page, session: { page } as Session, composerWaits, removedTokens };
 }
 interface RichNode {
   tagName: string;
@@ -110,10 +133,26 @@ interface RichNode {
   textContent?: string;
   children?: RichNode[];
 }
+/** One connector chip in the composer, with the nesting a real chip has. */
+interface TokenNode {
+  tagName: string;
+  textContent?: string;
+  children?: TokenNode[];
+}
+/** The token shape the guard reads: tag, text, parentElement and closest/remove. */
+interface FixtureToken {
+  tagName: string;
+  textContent: string;
+  parentElement: unknown;
+  closest: () => FixtureToken;
+  remove: () => void;
+}
 interface State {
   text: string; attachment: boolean; file: boolean; mention: string; mentions?: string[]; unknown: boolean;
   readable: boolean; count: number; form: boolean; unknownButton: boolean; unknownTestId: string;
   controls: Array<{ testid?: string; ariaLabel?: string; tagName?: string }>; url: string; rich?: RichNode[];
+  /** Connector chips by tag and nesting; overrides the flat `mention(s)` shape. */
+  tokenTree?: TokenNode[];
   /** Delays the composer's appearance until this many ms into the hydration wait. */
   composerHydrationMs?: number;
   /** Makes the bounded composer wait itself time out, as a never-hydrating page does. */
@@ -210,7 +249,8 @@ describe("draft-safe interaction preflight", () => {
       fixture({ mention: "fixture", text: "owned probe" }).page, { connector: "other", text: "owned probe" },
     ).catch(error => error);
     expect(wrongToken).toBeInstanceOf(PreflightDraftProtectedError);
-    expect(wrongToken.reason).toBe("connector_token_mismatch");
+    // r14: the old conflated `connector_token_mismatch` now names the text check.
+    expect(wrongToken.reason).toBe("connector_token_text");
 
     const wrongText = await assertPreflightDraftSafe(
       fixture({ mention: "fixture", text: "owned probe" }).page, { connector: "fixture", text: "different probe" },
@@ -227,7 +267,62 @@ describe("draft-safe interaction preflight", () => {
       fixture({ mentions: ["fixture", "fixture"], text: "owned probe" }).page,
       { connector: "fixture", text: "owned probe" },
     ).catch(error => error);
-    expect(twoTokens.reason).toBe("connector_token_mismatch");
+    // r14: the two-token shape now names its own count sub-reason.
+    expect(twoTokens.reason).toBe("connector_token_count:2");
+  });
+
+  // P-035 2026-09-28 r14. Live ms1980: the composer held exactly one connector
+  // chip and the guard still refused `connector_token_mismatch`. Ownership must
+  // be proven by the chip's TEXT, not its tag -- intelli's chip is an `a`,
+  // ms1980's is not -- and a nested `[contenteditable="false"]` icon inside a
+  // chip is part of that chip, not a second token.
+  it("identifies the owned chip by its text, whatever its tag, counting only outermost tokens", async () => {
+    // The live ms1980 shape: one chip that is not an `A`, carrying the name.
+    const spanChip = fixture({ tokenTree: [{ tagName: "SPAN", textContent: "fixture" }] });
+    await expect(assertPreflightDraftSafe(spanChip.page, { connector: "fixture" }))
+      .resolves.toBeUndefined();
+
+    // An `A` chip whose icon is itself `[contenteditable="false"]` is ONE
+    // outermost token: the nested node must not read as a second chip.
+    const nestedIcon = fixture({ tokenTree: [{
+      tagName: "A", textContent: "fixture", children: [{ tagName: "SPAN", textContent: "" }],
+    }] });
+    await expect(assertPreflightDraftSafe(nestedIcon.page, { connector: "fixture" }))
+      .resolves.toBeUndefined();
+    // Exactly the outermost element was removed, with its nested content.
+    expect(nestedIcon.removedTokens).toHaveLength(1);
+    expect(nestedIcon.removedTokens[0].tagName).toBe("A");
+  });
+
+  it("names each connector-token refusal by its own sub-reason, content-free", async () => {
+    const twoSiblings = await assertPreflightDraftSafe(
+      fixture({ tokenTree: [
+        { tagName: "A", textContent: "fixture" }, { tagName: "SPAN", textContent: "fixture" },
+      ] }).page, { connector: "fixture" },
+    ).catch(error => error);
+    expect(twoSiblings.reason).toBe("connector_token_count:2");
+
+    const wrongName = await assertPreflightDraftSafe(
+      fixture({ tokenTree: [{ tagName: "SPAN", textContent: "some other chip" }] }).page,
+      { connector: "fixture" },
+    ).catch(error => error);
+    expect(wrongName.reason).toBe("connector_token_text");
+    expect(JSON.stringify(wrongName)).not.toContain("some other chip");
+
+    const unowned = await assertPreflightDraftSafe(
+      fixture({ tokenTree: [{ tagName: "SPAN", textContent: "fixture" }] }).page,
+    ).catch(error => error);
+    expect(unowned).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(unowned.reason).toBe("connector_unowned");
+
+    // Typed text beside the chip, with no owned text named, still refuses.
+    const typedBeside = await assertPreflightDraftSafe(
+      fixture({ tokenTree: [{ tagName: "SPAN", textContent: "fixture" }], text: " plus private draft" }).page,
+      { connector: "fixture" },
+    ).catch(error => error);
+    expect(typedBeside).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(typedBeside.reason).toBe("text_present");
+    expect(JSON.stringify(typedBeside)).not.toContain("private draft");
   });
 
   it("does not expose refused content in its typed error", async () => {

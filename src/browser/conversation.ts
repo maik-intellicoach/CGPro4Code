@@ -2277,11 +2277,27 @@ export async function assertPreflightDraftSafe(
       }
       if (unknownControls.length > 0) return `unknown_control:${unknownControls.join("|")}`.slice(0, 200);
       const copy = composer.cloneNode(true) as HTMLElement;
-      const tokens = Array.from(copy.querySelectorAll<HTMLElement>('[contenteditable="false"]'));
+      // P-035 2026-09-28 r14. Ownership is proven by the chip's TEXT, never its
+      // tag: ms1980's owned chip is not an `A` while intelli's is, so the old
+      // `tagName !== "A"` clause refused the very chip this call attached. The
+      // single `connector_token_mismatch` also named four conditions at once.
+      // Tokens are the OUTERMOST `[contenteditable="false"]` elements only: a
+      // token nested inside another token (a chip's own icon, say) is part of
+      // that chip, not a second token. Each refusal below now names its own
+      // condition, content-free.
+      const allTokens = Array.from(copy.querySelectorAll<HTMLElement>('[contenteditable="false"]'));
+      const tokens = allTokens.filter(
+        token => !token.parentElement?.closest('[contenteditable="false"]'),
+      );
+      let ownedToken: HTMLElement | undefined;
       if (tokens.length) {
-        if (!owned.connector || tokens.length !== 1 || tokens[0].tagName !== "A" ||
-            tokens[0].textContent?.trim() !== owned.connector) return "connector_token_mismatch";
-        tokens[0].remove();
+        if (!owned.connector) return "connector_unowned";
+        if (tokens.length !== 1) return `connector_token_count:${tokens.length}`;
+        if (tokens[0].textContent?.trim() !== owned.connector) return "connector_token_text";
+        ownedToken = tokens[0];
+        // Remove exactly the outermost element, with its nested content, so the
+        // rich-node and text checks below judge only what remains.
+        ownedToken.remove();
       }
       // Only familiar text formatting is admissible. Unrecognised rich nodes
       // (including empty mentions) fail closed even when their text is empty.
@@ -2317,10 +2333,11 @@ export async function assertPreflightDraftSafe(
         if (refusedAttributes.length > 0) return `rich_attr:${refusedAttributes.join("|")}`.slice(0, 200);
       }
       let text = composer instanceof HTMLTextAreaElement ? composer.value : composer.innerText;
-      // The token branch above already proved exactly one A token carrying the
-      // owned connector's own trimmed text; what remains decides admission.
+      // The token branch above already proved exactly one outermost token
+      // carrying the owned connector's own trimmed text; what remains decides
+      // admission.
       let textAdmitted = false;
-      if (tokens.length) {
+      if (ownedToken) {
         if (owned.text !== undefined) {
           // P-035 2026-09-27. Combined ownership: a connector turn places the
           // owned token AND this call's prompt in one inline flow, so neither
@@ -2329,14 +2346,15 @@ export async function assertPreflightDraftSafe(
           // text, trimming leading/trailing whitespace only. An extra draft
           // beside the prompt, a different prompt, or a token name that is not
           // the one removed first changes the remainder and refuses.
-          const tokenName = tokens[0].textContent?.trim() ?? "";
+          const tokenName = ownedToken.textContent?.trim() ?? "";
           const remainder = text.replace(tokenName, "");
           if (remainder.trim() !== owned.text) return "owned_text_mismatch";
           textAdmitted = true;
         } else {
           // A sole owned connector token is admissible, not arbitrary text that
-          // happens to contain the connector name.
-          if (text.trim() !== owned.connector) return "connector_token_mismatch";
+          // happens to contain the connector name. Text beside the chip is a
+          // draft like any other, so it refuses with the plain text code.
+          if (text.trim() !== owned.connector) return "text_present";
           text = "";
         }
       }
