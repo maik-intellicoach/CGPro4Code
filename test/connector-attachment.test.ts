@@ -623,3 +623,59 @@ it("preflight connector selection refuses a chip plus typed text before Meta+A",
   expect(scenario.page.keyboard.press).not.toHaveBeenCalled();
   expect(scenario.page.keyboard.type).not.toHaveBeenCalled();
 });
+
+// P-035 2026-09-28 r33. Live intelli 06:21: the found-connector branch ran
+// `clickConnector` (first-click-threw, then attempt=1 and attempt=2) and threw,
+// and the `@` our code had typed stayed in the composer. Every later preflight
+// then refused `text_present` at `failedPhase=home`, so the lane restarted every
+// tick. The picker-missing branch already clears its failed `@`; the
+// found-but-click-failed branch must run the same guarded clear and then rethrow
+// the ORIGINAL error, never a cleanup error.
+describe("failed connector click clears its typed @ (r33)", () => {
+  /** A found row whose click throws a non-timeout error the way the live lane did. */
+  const failingClick = () => {
+    const original = new Error("locator.click: Error: element is not stable");
+    const scenario = makePage();
+    scenario.setRows([{ label: "connector", visible: true, onSelected: () => { throw original; } }]);
+    return { scenario, original };
+  };
+
+  it("clears the query and rethrows the original error", async () => {
+    const { scenario, original } = failingClick();
+    const { page } = scenario;
+    const error = await setConnector(page, "connector").catch(caught => caught);
+    // The ORIGINAL click error reaches the caller, unwrapped.
+    expect(error).toBe(original);
+    // setConnector's own pre-attach clear is the first two presses (Meta+A then
+    // Backspace, before the click). Everything AFTER those is the cleanup the
+    // failed click now triggers: Escape, then Meta+A, then Backspace.
+    const presses = vi.mocked(page.keyboard.press).mock.calls.map(([key]) => key);
+    expect(presses.slice(0, 2)).toEqual(["Meta+A", "Backspace"]);
+    expect(presses.slice(2)).toEqual(["Escape", "Meta+A", "Backspace"]);
+  });
+
+  it("rethrows the original error even when a cleanup guard itself refuses", async () => {
+    const { scenario, original } = failingClick();
+    const { page } = scenario;
+    // The three pre-attach guards admit; the cleanup's first guard then refuses
+    // (the composer changed under the clear). A cleanup error must never replace
+    // the original click error.
+    let guardCalls = 0;
+    page.evaluate = vi.fn(async () => (guardCalls += 1) <= 3) as typeof page.evaluate;
+    const error = await setConnector(page, "connector", true).catch(caught => caught);
+    expect(error).toBe(original);
+  });
+
+  it("runs the guarded clear under protectDraft, each step behind its { text: '@' } guard", async () => {
+    const { scenario, original } = failingClick();
+    const { page } = scenario;
+    page.evaluate = vi.fn(async () => true) as typeof page.evaluate;
+    const error = await setConnector(page, "connector", true).catch(caught => caught);
+    expect(error).toBe(original);
+    const presses = vi.mocked(page.keyboard.press).mock.calls.map(([key]) => key);
+    expect(presses.slice(2)).toEqual(["Escape", "Meta+A", "Backspace"]);
+    // Three pre-attach guards plus the three the cleanup runs: the cleanup is
+    // guarded exactly like the picker-missing branch, not only its presses.
+    expect(vi.mocked(page.evaluate).mock.calls).toHaveLength(6);
+  });
+});

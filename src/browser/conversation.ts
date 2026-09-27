@@ -2012,6 +2012,25 @@ async function clickConnector(page: Page, row: Locator, name: string): Promise<v
   }
 }
 
+/**
+ * P-035 2026-09-28 r33. The clear of the `@` this call itself typed: Escape,
+ * composer click, Meta+A, Backspace, each step preceded by the same
+ * `{ text: "@" }` guard the pre-attach steps use when `protectDraft`. Two
+ * branches need exactly this sequence -- the picker-missing fallback and the
+ * found-but-click-failed branch -- so it lives here once. The CALLER decides
+ * whether its own errors propagate (picker-missing) or are swallowed
+ * (found-but-click-failed, where the ORIGINAL error must reach the caller).
+ */
+async function clearTypedConnectorQuery(page: Page, composer: Locator, protectDraft: boolean): Promise<void> {
+  if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
+  await page.keyboard.press("Escape").catch(() => undefined);
+  await composer.click();
+  if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
+  await page.keyboard.press("Meta+A");
+  if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
+  await page.keyboard.press("Backspace");
+}
+
 export async function setConnector(page: Page, name: string, protectDraft = false): Promise<void> {
   const connectorName = name.trim();
   if (!connectorName) throw new Error("connector name must not be empty");
@@ -2054,36 +2073,42 @@ export async function setConnector(page: Page, name: string, protectDraft = fals
       step("already-attached");
       return;
     }
-    await clickConnector(page, connector, connectorName);
-    step("picker-click");
-    await page.waitForTimeout(300);
-    await assertConnectorAttached(page, connectorName);
-    step("attach-assert");
-    // Dismiss the @-picker, exactly as the already-attached branch above does.
-    // Leaving it open was the 2026-09-17 prompt-loss bug: CDP insertText goes to
-    // whatever holds focus, so the whole prompt was typed into the picker's
-    // search field and the composer kept only the mention. Measured twice on
-    // intelli, same numbers both times -- 33 of 2982 characters, and
-    // `p035-low-risk-workstation-intelli` is exactly 33 characters long.
-    //
-    // It reads as intermittent because it depends on which branch runs: a page
-    // whose connector is already attached escapes and delivers, a freshly
-    // started one clicks and did not. That is the cold-page failure rate (3 of
-    // 10 cold first turns against 12 of 999 warm), and it is why a restart --
-    // when every lane is cold -- looked like a connector outage.
-    await page.keyboard.press("Escape").catch(() => undefined);
-    await page.waitForTimeout(150);
-    return;
+    try {
+      await clickConnector(page, connector, connectorName);
+      step("picker-click");
+      await page.waitForTimeout(300);
+      await assertConnectorAttached(page, connectorName);
+      step("attach-assert");
+      // Dismiss the @-picker, exactly as the already-attached branch above does.
+      // Leaving it open was the 2026-09-17 prompt-loss bug: CDP insertText goes to
+      // whatever holds focus, so the whole prompt was typed into the picker's
+      // search field and the composer kept only the mention. Measured twice on
+      // intelli, same numbers both times -- 33 of 2982 characters, and
+      // `p035-low-risk-workstation-intelli` is exactly 33 characters long.
+      //
+      // It reads as intermittent because it depends on which branch runs: a page
+      // whose connector is already attached escapes and delivers, a freshly
+      // started one clicks and did not. That is the cold-page failure rate (3 of
+      // 10 cold first turns against 12 of 999 warm), and it is why a restart --
+      // when every lane is cold -- looked like a connector outage.
+      await page.keyboard.press("Escape").catch(() => undefined);
+      await page.waitForTimeout(150);
+      return;
+    } catch (error) {
+      // P-035 2026-09-28 r33. Live intelli 06:21: the found-connector branch ran
+      // `clickConnector` (first-click-threw, attempt=1 and attempt=2) and threw,
+      // and the `@` our code had typed stayed in the composer. Every later
+      // preflight then refused `text_present`, so the lane restarted every tick.
+      // The picker-missing branch already clears that `@`; this branch did not.
+      // Run the SAME guarded clear here, swallowing only its own errors so the
+      // ORIGINAL click/attach error is what reaches the caller.
+      await clearTypedConnectorQuery(page, composer, protectDraft).catch(() => undefined);
+      throw error;
+    }
   }
 
   // Clear the failed @ query before trying older plus-menu layouts.
-  if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
-  await page.keyboard.press("Escape").catch(() => undefined);
-  await composer.click();
-  if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
-  await page.keyboard.press("Meta+A");
-  if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
-  await page.keyboard.press("Backspace");
+  await clearTypedConnectorQuery(page, composer, protectDraft);
   step("picker-missing");
   if (!(await openComposerToolsPopover(page))) {
     if (!protectDraft) await recordConnectorDiagnostics(page);
@@ -2289,16 +2314,21 @@ type PreflightDiagnostic =
   | {
     reason: string; chipRemainder: { len: number; ws: number; cf: number; other: number };
     foreignShape?: undefined; ownedTextShape?: undefined; provenanceShape?: undefined;
-    richAttrShape?: undefined;
+    richAttrShape?: undefined; noTokenShape?: undefined;
   }
   | { reason: string; foreignShape: ForeignTextShape; chipRemainder?: undefined; ownedTextShape?: undefined;
-    provenanceShape?: undefined; richAttrShape?: undefined }
+    provenanceShape?: undefined; richAttrShape?: undefined; noTokenShape?: undefined }
   | { reason: string; ownedTextShape: OwnedTextShape; chipRemainder?: undefined; foreignShape?: undefined;
-    provenanceShape?: undefined; richAttrShape?: undefined }
+    provenanceShape?: undefined; richAttrShape?: undefined; noTokenShape?: undefined }
   | { reason: string; provenanceShape: ProvenanceShape; chipRemainder?: undefined; foreignShape?: undefined;
-    ownedTextShape?: undefined; richAttrShape?: undefined }
+    ownedTextShape?: undefined; richAttrShape?: undefined; noTokenShape?: undefined }
   | { reason: string; richAttrShape: RichAttrShape; chipRemainder?: undefined; foreignShape?: undefined;
-    ownedTextShape?: undefined; provenanceShape?: undefined };
+    ownedTextShape?: undefined; provenanceShape?: undefined; noTokenShape?: undefined }
+  | {
+    reason: string; noTokenShape: { len: number; ws: number; cf: number; at: number; other: number };
+    chipRemainder?: undefined; foreignShape?: undefined; ownedTextShape?: undefined;
+    provenanceShape?: undefined; richAttrShape?: undefined;
+  };
 
 /**
  * Read-only, content-free admission for the no-submit preflight. Unknown rich
@@ -2707,7 +2737,17 @@ export async function assertPreflightDraftSafe(
           // U+200C, U+200D, U+2060, U+FEFF) carry no draft content, so a
           // remainder of only those is the same as an empty composer.
           const remainder = copy.textContent ?? "";
-          if (remainder.replace(/[\s\p{Cf}]/gu, "").length > 0) {
+          const stripped = remainder.replace(/[\s\p{Cf}]/gu, "");
+          // P-035 2026-09-28 r33. A lone `@` is the residue a FAILED connector
+          // click leaves in the composer (r33 in `setConnector`): our own code
+          // typed it, it carries no user content, and a later guard's plain
+          // `text_present` refusal would restart the lane every tick. Admit it
+          // -- but ONLY while a lane connector identity is in force
+          // (`owned.connector`, the same identity the r15/r20 chip residue uses)
+          // and only when NOTHING else survives after whitespace and `\p{Cf}`
+          // are removed. Without that identity, or with any other character, the
+          // refusal below is exactly as before.
+          if (stripped.length > 0 && !(owned.connector !== undefined && stripped === "@")) {
             // Content-free shape of the refused remainder: how many of its code
             // points are whitespace, `\p{Cf}`, or anything else. Counts only,
             // never a character or any text.
@@ -2741,8 +2781,38 @@ export async function assertPreflightDraftSafe(
             };
           }
         } else {
-          if (text.trim() || (copy.textContent ?? "").length > 0) return "text_present";
-          if (composer instanceof HTMLTextAreaElement && text.length > 0) return "text_present";
+          // P-035 2026-09-28 r33. Same residue rule as the token-else branch
+          // above, for a composer with NO owned token: a lone `@` our own failed
+          // connector click typed is admitted while a lane connector identity is
+          // in force, and refused exactly as before otherwise. The refusal now
+          // carries ONE content-free shape line -- counts of the remainder's
+          // whitespace, `\p{Cf}`, `@` and everything else, never a character --
+          // so a live round names whether the leftover was really our `@`.
+          const remainder = copy.textContent ?? "";
+          const stripped = remainder.replace(/[\s\p{Cf}]/gu, "");
+          if (owned.connector !== undefined && stripped === "@") {
+            textAdmitted = true;
+          } else {
+            const noTokenShape = (value: string): { len: number; ws: number; cf: number; at: number; other: number } => {
+              let ws = 0;
+              let cf = 0;
+              let at = 0;
+              let other = 0;
+              for (const codePoint of value) {
+                if (codePoint === "@") at += 1;
+                else if (/\p{Cf}/u.test(codePoint)) cf += 1;
+                else if (/\s/.test(codePoint)) ws += 1;
+                else other += 1;
+              }
+              return { len: ws + cf + at + other, ws, cf, at, other };
+            };
+            if (text.trim() || remainder.length > 0) {
+              return { reason: "text_present", noTokenShape: noTokenShape(remainder) };
+            }
+            if (composer instanceof HTMLTextAreaElement && text.length > 0) {
+              return { reason: "text_present", noTokenShape: noTokenShape(remainder) };
+            }
+          }
         }
       }
       // Non-control text outside the editable region may be a rich draft chip.
@@ -2968,6 +3038,15 @@ export async function assertPreflightDraftSafe(
       if (outcome.chipRemainder) {
         const { len, ws, cf, other } = outcome.chipRemainder;
         console.error(`[cgpro:preflight] chip remainder shape: len=${len} ws=${ws} cf=${cf} other=${other}`);
+      }
+      // P-035 2026-09-28 r33. Exactly one content-free shape line for the
+      // no-token `text_present` refusal, so a live round names whether the
+      // leftover was our own `@` (at=1, other=0) or real user text beside it.
+      // Counts only, in the same code-point classes the chip remainder uses,
+      // with `@` counted on its own: never a character.
+      if (outcome.noTokenShape) {
+        const { len, ws, cf, at, other } = outcome.noTokenShape;
+        console.error(`[cgpro:preflight] no-token text shape: len=${len} ws=${ws} cf=${cf} at=${at} other=${other}`);
       }
       // P-035 2026-09-28 r17. Exactly one content-free shape line for the
       // foreign-text refusal, so the next live round names the node class. It

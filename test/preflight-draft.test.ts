@@ -2340,3 +2340,99 @@ describe("letters-and-digits header match in the hidden mirror (r30)", () => {
     )).toBe("foreign_text");
   });
 });
+
+// P-035 2026-09-28 r33. Live intelli 06:21: `setConnector` found the connector
+// row, its click threw (first-click-threw, attempt=1 and attempt=2) and the `@`
+// our code had typed stayed in the composer. Every later preflight then refused
+// `text_present` at `failedPhase=home`, so the lane restarted every tick. The
+// picker-missing branch already clears its failed `@`; `setConnector` now clears
+// this one too, and the guard admits a LONE `@` as owned residue while a lane
+// connector identity is in force. A lone `@` carries no user content; any other
+// text, and any `@` without that identity, refuse exactly as before. These
+// cases pin the admission, the neighbouring refusals and the new content-free
+// no-token shape line.
+describe("lone @ residue from a failed connector click (r33)", () => {
+  it("admits a composer holding only @ while a lane connector identity is in force", async () => {
+    await expect(assertPreflightDraftSafe(fixture({ text: "@" }).page, { connector: "lane-x" }))
+      .resolves.toBeUndefined();
+    // Whitespace and format characters carry no content, so the same `@` ringed
+    // by them is still just the lone `@`.
+    await expect(assertPreflightDraftSafe(fixture({ text: " \u200B@\uFEFF\n" }).page, { connector: "lane-x" }))
+      .resolves.toBeUndefined();
+  });
+
+  it("admits the owned chip plus a lone @", async () => {
+    await expect(assertPreflightDraftSafe(
+      fixture({ mention: "lane-x", text: "@" }).page, { connector: "lane-x" },
+    )).resolves.toBeUndefined();
+  });
+
+  it("refuses @ with no owned connector", async () => {
+    const error = await assertPreflightDraftSafe(fixture({ text: "@" }).page).catch(caught => caught);
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.reason).toBe("text_present");
+  });
+
+  it("refuses @ beside a differently named chip as connector_token_text", async () => {
+    const error = await assertPreflightDraftSafe(
+      fixture({ mention: "other-y", text: "@" }).page, { connector: "lane-x" },
+    ).catch(caught => caught);
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.reason).toBe("connector_token_text");
+  });
+
+  it("refuses @x and names the count-only no-token shape", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = await assertPreflightDraftSafe(
+        fixture({ text: "@x" }).page, { connector: "lane-x" },
+      ).catch(caught => caught);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("text_present");
+      const line = spy.mock.calls.map(call => String(call[0]))
+        .find(candidate => candidate.includes("no-token text shape"));
+      // One `@`, one other character, no whitespace or format characters.
+      expect(line).toBe("[cgpro:preflight] no-token text shape: len=2 ws=0 cf=0 at=1 other=1");
+      expect(spy.mock.calls.map(call => String(call[0]))
+        .filter(candidate => candidate.includes("no-token text shape"))).toHaveLength(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("refuses @x beside the owned chip with the chip remainder shape", async () => {
+    // The token-else branch keeps its own content-free line; the new `at` field
+    // is only on the no-token line.
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = await assertPreflightDraftSafe(
+        fixture({ mention: "lane-x", text: "@x" }).page, { connector: "lane-x" },
+      ).catch(caught => caught);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("text_present");
+      expect(spy.mock.calls.map(call => String(call[0])).join("\n"))
+        .toContain("chip remainder shape: len=2 ws=0 cf=0 other=2");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("never puts the refused text in the no-token shape line", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = await assertPreflightDraftSafe(
+        fixture({ text: "@zorblequux" }).page, { connector: "lane-x" },
+      ).catch(caught => caught);
+      expect(error.reason).toBe("text_present");
+      const line = spy.mock.calls.map(call => String(call[0]))
+        .find(candidate => candidate.includes("no-token text shape"));
+      expect(line).toBe("[cgpro:preflight] no-token text shape: len=11 ws=0 cf=0 at=1 other=10");
+      expect(line).not.toContain("zorblequux");
+      expect(line).not.toContain("zor");
+      expect(JSON.stringify(error)).not.toContain("zorblequux");
+      expect(error.message).not.toContain("zorblequux");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
