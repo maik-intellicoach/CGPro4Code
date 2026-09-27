@@ -30,6 +30,8 @@ const { PreSubmitInteractionError } = await import("../src/errors.js");
  */
 interface ComposerState {
   text: string;
+  /** The connector chip an inline `@` selection leaves in the composer, if any. */
+  mention?: string;
   unknown: boolean;
   readable: boolean;
   url: string;
@@ -73,17 +75,19 @@ function fakePage(state: ComposerState, options: { ignoreClear?: boolean } = {})
     waitForTimeout: vi.fn(async () => {}),
     evaluate: vi.fn(async (fn: Function, arg: unknown) => {
       if (!state.readable) throw new Error("synthetic evaluation failure with private content");
+      const mention = state.mention ?? "";
+      const tokens = mention ? [{ tagName: "A", textContent: mention, remove() {} }] : [];
       const copy = {
         textContent: state.text,
         querySelectorAll: (selector: string) => {
           if (selector === "*") return state.unknown ? [{ tagName: "CUSTOM-TOKEN", attributes: [] }] : [];
-          return []; // no inline connector token on a non-preserving turn
+          return tokens; // the inline connector chip, when this turn placed one
         },
       };
       const composer = {
         isConnected: true,
         getClientRects: () => [{}],
-        innerText: state.text,
+        innerText: mention + state.text,
         cloneNode: () => copy,
         closest: () => form,
         contains: () => false,
@@ -187,6 +191,58 @@ describe("sendPrompt removes the draft it inserted when a pre-submit check refus
 
     expect(state.text).toBe("hello world"); // the connector/mention turn is never cleared
     expect(presubmitLines(log)).toEqual(["[cgpro:presubmit] owned draft cleared=no reason=preserve_existing"]);
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Delete");
+  });
+
+  // P-035 2026-09-27. On a connector turn preserveExisting is true because the
+  // connector chip this same invocation placed lives inside the composer. When
+  // the caller names that connector, ownership is provable as the COMBINED
+  // token-plus-prompt shape, and only then is the composer cleared.
+  it("clears its own connector-turn draft (owned token plus prompt) and re-throws unchanged", async () => {
+    const connector = "p035-low-risk-workstation-intelli";
+    const state: ComposerState = { text: "", mention: connector, unknown: false, readable: true, url: "https://chatgpt.com/" };
+    requireSelector.mockImplementation(async () => fakeLocator(state));
+    firstResolved.mockResolvedValue(fakeLocator(state));
+    const error = proLimitRefusal();
+
+    const page = fakePage(state);
+    const rejected = sendPrompt(page, "hello world", true, undefined, async () => { throw error; }, connector);
+    await expect(rejected).rejects.toBe(error); // same object: code, phase and message intact
+
+    expect(error.code).toBe("pro_usage_limit_reached");
+    expect(state.text).toBe(""); // the prompt this call typed is gone
+    expect(presubmitLines(log)).toEqual(["[cgpro:presubmit] owned draft cleared=yes reason=owned"]);
+  });
+
+  it("leaves a connector turn untouched when the token is not the owned connector", async () => {
+    const state: ComposerState = { text: "", mention: "some-other-connector", unknown: false, readable: true, url: "https://chatgpt.com/" };
+    requireSelector.mockImplementation(async () => fakeLocator(state));
+    firstResolved.mockResolvedValue(fakeLocator(state));
+
+    const page = fakePage(state);
+    await expect(sendPrompt(
+      page, "hello world", true, undefined, async () => { throw proLimitRefusal(); }, "p035-low-risk-workstation-intelli",
+    )).rejects.toBeInstanceOf(PreSubmitInteractionError);
+
+    expect(state.text).toBe("hello world"); // NOT cleared
+    expect(presubmitLines(log)).toEqual(["[cgpro:presubmit] owned draft cleared=no reason=not_owned"]);
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Delete");
+  });
+
+  it("leaves a connector turn untouched when other user text sits beside the token and prompt", async () => {
+    const connector = "p035-low-risk-workstation-intelli";
+    const state: ComposerState = { text: "", mention: connector, unknown: false, readable: true, url: "https://chatgpt.com/" };
+    requireSelector.mockImplementation(async () => fakeLocator(state));
+    firstResolved.mockResolvedValue(fakeLocator(state));
+
+    const page = fakePage(state);
+    await expect(sendPrompt(page, "hello world", true, undefined, async () => {
+      state.text += " plus someone else's draft"; // extra text arrives during the check
+      throw proLimitRefusal();
+    }, connector)).rejects.toBeInstanceOf(PreSubmitInteractionError);
+
+    expect(state.text).toBe("hello world plus someone else's draft"); // NOT cleared
+    expect(presubmitLines(log)).toEqual(["[cgpro:presubmit] owned draft cleared=no reason=not_owned"]);
     expect(page.keyboard.press).not.toHaveBeenCalledWith("Delete");
   });
 

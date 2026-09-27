@@ -34,7 +34,8 @@ function fixture(initial: Partial<State> = {}) {
     keyboard: { press: vi.fn(async () => {}) },
     evaluate: vi.fn(async (fn: Function, arg: unknown) => {
       if (!state.readable) throw new Error("synthetic evaluation failure with private content");
-      const tokens = state.mention ? [{ tagName: "A", textContent: state.mention, remove() {} }] : [];
+      const tokenTexts = state.mentions ?? (state.mention ? [state.mention] : []);
+      const tokens = tokenTexts.map(textContent => ({ tagName: "A", textContent, remove() {} }));
       const copy = { textContent: state.text, querySelectorAll: (selector: string) => selector === "*"
         ? (state.unknown ? [{ tagName: "CUSTOM-TOKEN", attributes: [] }] : []) : tokens };
       // Form controls answer `matches` the way CSS attribute selectors would, so
@@ -53,7 +54,7 @@ function fixture(initial: Partial<State> = {}) {
           tagName: "BUTTON",
         })),
       };
-      const composer = { isConnected: true, getClientRects: () => [{}], innerText: state.text || state.mention, cloneNode: () => copy,
+      const composer = { isConnected: true, getClientRects: () => [{}], innerText: tokenTexts.join("") + state.text, cloneNode: () => copy,
         closest: () => state.form ? form : null, contains: () => false };
       const document = {
         body: { childNodes: state.count ? [composer] : [] },
@@ -69,7 +70,7 @@ function fixture(initial: Partial<State> = {}) {
   return { state, page, session: { page } as Session };
 }
 interface State {
-  text: string; attachment: boolean; file: boolean; mention: string; unknown: boolean;
+  text: string; attachment: boolean; file: boolean; mention: string; mentions?: string[]; unknown: boolean;
   readable: boolean; count: number; form: boolean; unknownButton: boolean; unknownTestId: string;
   controls: Array<{ testid?: string; ariaLabel?: string }>; url: string;
 }
@@ -143,6 +144,45 @@ describe("draft-safe interaction preflight", () => {
     await expect(assertPreflightDraftSafe(page, { connector: "fixture" })).resolves.toBeUndefined();
     state.file = true;
     await expect(assertPreflightDraftSafe(page, { connector: "fixture" })).rejects.toBeInstanceOf(PreflightDraftProtectedError);
+  });
+
+  // P-035 2026-09-27. A connector turn places the owned connector token AND
+  // this call's prompt in one composer. The combined spec admits exactly that
+  // shape and refuses a wrong token, a wrong prompt, an extra draft beside
+  // them, or a second token.
+  it("admits only the owned connector token followed by the owned text", async () => {
+    const { page } = fixture({ mention: "fixture", text: "owned probe" });
+    await expect(assertPreflightDraftSafe(page, { connector: "fixture", text: "owned probe" }))
+      .resolves.toBeUndefined();
+    // Leading/trailing whitespace around the remainder is trimmed, nothing else.
+    const spaced = fixture({ mention: "fixture", text: "  owned probe  " });
+    await expect(assertPreflightDraftSafe(spaced.page, { connector: "fixture", text: "owned probe" }))
+      .resolves.toBeUndefined();
+  });
+
+  it("refuses a combined connector turn on a wrong token, wrong text, extra text, or two tokens", async () => {
+    const wrongToken = await assertPreflightDraftSafe(
+      fixture({ mention: "fixture", text: "owned probe" }).page, { connector: "other", text: "owned probe" },
+    ).catch(error => error);
+    expect(wrongToken).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(wrongToken.reason).toBe("connector_token_mismatch");
+
+    const wrongText = await assertPreflightDraftSafe(
+      fixture({ mention: "fixture", text: "owned probe" }).page, { connector: "fixture", text: "different probe" },
+    ).catch(error => error);
+    expect(wrongText.reason).toBe("owned_text_mismatch");
+
+    const extraText = await assertPreflightDraftSafe(
+      fixture({ mention: "fixture", text: "owned probe plus private draft" }).page,
+      { connector: "fixture", text: "owned probe" },
+    ).catch(error => error);
+    expect(extraText.reason).toBe("owned_text_mismatch");
+
+    const twoTokens = await assertPreflightDraftSafe(
+      fixture({ mentions: ["fixture", "fixture"], text: "owned probe" }).page,
+      { connector: "fixture", text: "owned probe" },
+    ).catch(error => error);
+    expect(twoTokens.reason).toBe("connector_token_mismatch");
   });
 
   it("does not expose refused content in its typed error", async () => {

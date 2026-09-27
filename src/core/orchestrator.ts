@@ -256,6 +256,11 @@ function runAskInner(
   const nativeState: { report: NativeResearchReport | null } = { report: null };
   let nextNativeReportPollAt = 0;
   let nativeMaximumVerified = false;
+  // The connector this turn owns once `setConnector` succeeded, in the same
+  // trimmed form the preflight records. Passed to `sendPrompt` so a pre-submit
+  // refusal can prove the connector turn's own draft (token plus prompt) before
+  // clearing it. Undefined on every turn without a connector.
+  let ownedConnector: string | undefined;
 
   const result: Promise<AskResult> = (async () => {
     if (!session) {
@@ -327,6 +332,7 @@ function runAskInner(
       if (opts.connector !== undefined) {
         log(`setConnector ${opts.connector}…`);
         await setConnector(page, opts.connector);
+        ownedConnector = opts.connector.trim();
         emitter.push({ type: "tool", name: "connector-selected", meta: { connector: opts.connector } });
       }
 
@@ -351,6 +357,7 @@ function runAskInner(
             emitter.push({ type: "tool", name: "model-thinking-verified", meta: selection });
           }
         },
+        ownedConnector,
       );
       if (opts.deepResearch && !cancelled && !nativeMaximumVerified) {
         throw new Error("Native research maximum UI setting was not verified before submission");

@@ -2110,7 +2110,8 @@ export async function setConnector(page: Page, name: string, protectDraft = fals
 /**
  * Read-only, content-free admission for the no-submit preflight. Unknown rich
  * nodes or controls are protected, not converted into a text backup. Only the
- * exact probe text / single connector token introduced by this call may pass.
+ * exact probe text, the single connector token introduced by this call, or that
+ * token followed by this call's exact text (the connector-turn shape) may pass.
  *
  * Safe draft admission depends on the known navigation PHASE, never on a
  * universal composer count. A composer-free page is admissible only as the
@@ -2220,17 +2221,36 @@ export async function assertPreflightDraftSafe(
         if (badAttribute) return `rich_attr:${chrome(badAttribute.name) || "unknown"}`;
       }
       let text = composer instanceof HTMLTextAreaElement ? composer.value : composer.innerText;
+      // The token branch above already proved exactly one A token carrying the
+      // owned connector's own trimmed text; what remains decides admission.
+      let textAdmitted = false;
       if (tokens.length) {
-        // A sole owned connector token is admissible, not arbitrary text that
-        // happens to contain the connector name.
-        if (text.trim() !== owned.connector) return "connector_token_mismatch";
-        text = "";
+        if (owned.text !== undefined) {
+          // P-035 2026-09-27. Combined ownership: a connector turn places the
+          // owned token AND this call's prompt in one inline flow, so neither
+          // half alone can prove the draft. Remove the token's own rendered
+          // text from the composer read and compare what is left to the owned
+          // text, trimming leading/trailing whitespace only. An extra draft
+          // beside the prompt, a different prompt, or a token name that is not
+          // the one removed first changes the remainder and refuses.
+          const tokenName = tokens[0].textContent?.trim() ?? "";
+          const remainder = text.replace(tokenName, "");
+          if (remainder.trim() !== owned.text) return "owned_text_mismatch";
+          textAdmitted = true;
+        } else {
+          // A sole owned connector token is admissible, not arbitrary text that
+          // happens to contain the connector name.
+          if (text.trim() !== owned.connector) return "connector_token_mismatch";
+          text = "";
+        }
       }
-      if (owned.text !== undefined) {
-        if (text !== owned.text) return "owned_text_mismatch";
-      } else {
-        if (text.trim() || (copy.textContent ?? "").length > 0) return "text_present";
-        if (composer instanceof HTMLTextAreaElement && text.length > 0) return "text_present";
+      if (!textAdmitted) {
+        if (owned.text !== undefined) {
+          if (text !== owned.text) return "owned_text_mismatch";
+        } else {
+          if (text.trim() || (copy.textContent ?? "").length > 0) return "text_present";
+          if (composer instanceof HTMLTextAreaElement && text.length > 0) return "text_present";
+        }
       }
       // Non-control text outside the editable region may be a rich draft chip.
       const walker = document.createTreeWalker(form, NodeFilter.SHOW_TEXT);
@@ -2279,6 +2299,7 @@ export async function sendPrompt(
   preserveExisting = false,
   cancelled?: () => boolean,
   verifySubmission?: () => Promise<void>,
+  ownedConnector?: string,
 ): Promise<number> {
   const assistantCount = async (): Promise<number> => page
     .locator(SELECTORS.assistantMessages.join(", "))
@@ -2338,7 +2359,7 @@ export async function sendPrompt(
     await verifySubmission?.();
   } catch (error) {
     if (error instanceof PreSubmitInteractionError) {
-      await discardOwnedPresubmitDraft(page, composer, prompt, preserveExisting);
+      await discardOwnedPresubmitDraft(page, composer, prompt, preserveExisting, ownedConnector);
     }
     throw error;
   }
@@ -2373,29 +2394,40 @@ export async function sendPrompt(
  * which ownership is provable.
  *
  * Ownership is proven by `assertPreflightDraftSafe`, which admits only when
- * the composer holds exactly this call's owned text. This call places no
- * connector token: `preserveExisting` is true on every connector turn, and it
- * is false here, so the spec is the prompt alone. Anything else -- different
- * text, an extra node, a token, an evaluation failure -- is not proven ours
- * and the composer is left untouched. The refusal is the caller's to re-throw;
- * nothing here may replace or mask it.
+ * the composer holds exactly this call's owned content. On a non-preserving
+ * turn the spec is the prompt alone. On a connector turn `preserveExisting` is
+ * true because the connector mention placed by this same invocation lives
+ * inside the composer; when the caller also names that connector, the spec is
+ * the COMBINED `{ connector, text: prompt }` shape -- the owned token followed
+ * by the prompt and nothing else. Anything else -- different text, a different
+ * token, an extra node, an evaluation failure, a connector turn whose
+ * connector was not passed -- is not proven ours and the composer is left
+ * untouched. The refusal is the caller's to re-throw; nothing here may replace
+ * or mask it.
  *
  * Exactly one content-free line is logged, and it never carries page or
  * prompt text.
  */
 async function discardOwnedPresubmitDraft(
-  page: Page, composer: Locator, prompt: string, preserveExisting: boolean,
+  page: Page, composer: Locator, prompt: string, preserveExisting: boolean, ownedConnector?: string,
 ): Promise<void> {
   try {
-    if (preserveExisting) {
+    // A preserving turn with no owned connector cannot prove ownership from
+    // the prompt alone: the pre-existing content may be someone else's draft.
+    // Only the connector form of a preserving turn is provable, below.
+    if (preserveExisting && ownedConnector === undefined) {
       console.error("[cgpro:presubmit] owned draft cleared=no reason=preserve_existing");
       return;
     }
     let owned = false;
     try {
-      // Admissible only as exactly the text this call inserted. A refusal here
-      // is "not ours", never a reason to clear anything.
-      await assertPreflightDraftSafe(page, { text: prompt });
+      // Admissible only as exactly what this call inserted: the prompt alone,
+      // or the owned connector token followed by the prompt. A refusal here is
+      // "not ours", never a reason to clear anything.
+      await assertPreflightDraftSafe(
+        page,
+        preserveExisting ? { connector: ownedConnector, text: prompt } : { text: prompt },
+      );
       owned = true;
     } catch {
       owned = false;
