@@ -38,7 +38,14 @@ function fixture(initial: Partial<State> = {}) {
   const removedTokens: FixtureToken[] = [];
   const page = {
     url: () => state.url,
-    keyboard: { press: vi.fn(async () => {}) },
+    keyboard: {
+      press: vi.fn(async () => {}),
+      // P-035 2026-09-28 r36. The ordinary preflight must never type into the
+      // live composer, so the fixture records keystrokes: a test can prove the
+      // run issued no `type("@")` (the one `setConnector` types before its
+      // picker click). Nothing else in the mocked preflight types.
+      type: vi.fn(async () => {}),
+    },
     // P-035 2026-09-27 r11. Models the bounded composer visibility wait. The
     // default (composer already present) resolves immediately; hydrationMs
     // makes the composer appear only during the wait; composerNeverHydrates
@@ -302,16 +309,19 @@ describe("draft-safe interaction preflight", () => {
     expect(goHome).toHaveBeenCalledTimes(1);
   });
 
-  it("admits pristine about:blank and completes an empty preflight with its owned connector", async () => {
-    const { state, session } = fixture({ url: "about:blank", count: 0 });
+  it("admits pristine about:blank and completes an empty ordinary preflight without attaching the connector", async () => {
+    const { page, state, session } = fixture({ url: "about:blank", count: 0 });
     goHome.mockImplementation(() => { state.url = "https://chatgpt.com/"; state.count = 1; state.mention = ""; });
-    setConnector.mockImplementation(() => { state.mention = "fixture"; });
-    await expect(runInteractionPreflight(options, session)).resolves.toMatchObject({ connectorVerified: true, power: 4 });
+    // r36: the ordinary preflight no longer attaches the connector, so the
+    // owned-connector chip this case used to simulate never appears and the
+    // result reports `connectorVerified: false`.
+    await expect(runInteractionPreflight(options, session)).resolves.toMatchObject({ connectorVerified: false, power: 4 });
     // P-035 2026-09-28 r20. The protected navigation now also receives the
     // lane's configured connector, so its own home/surface guards admit the
     // lane's chip-only residue instead of refusing `connector_unowned`.
     expect(openConversation).toHaveBeenCalledWith(session.page, expect.any(Object), expect.any(Function), true, "fixture");
-    expect(setConnector).toHaveBeenCalledWith(session.page, "fixture", true);
+    expect(setConnector).not.toHaveBeenCalled();
+    expect(page.keyboard.type).not.toHaveBeenCalled();
     expect(goHome).toHaveBeenCalledTimes(2);
   });
 
@@ -936,6 +946,52 @@ describe("draft-safe interaction preflight", () => {
   });
 });
 
+// P-035 2026-09-28 r36. Maik's decision 2026-09-28 09:32 SGT ("f"): the ordinary
+// watchdog preflight stops at the model check and never attaches the connector.
+// On 2026-09-28 the preflight's `setConnector(page, opts.connector, true)` typed
+// `@` into ChatGPT's live composer, and a failed picker click left that `@`
+// behind twice, blocking Intelli's health checks for over an hour (fixed as
+// r33/r34). A real turn attaches the connector itself before submission
+// (`runAsk`), so a broken picker still fails before anything is sent. The probe
+// path keeps the connector phase unchanged: it exists to exercise exactly the
+// controls a real turn would use. The lane-chip case below (criterion 1's last
+// clause) is the r15 case further down, updated for the skipped phase.
+describe("ordinary preflight stops before the connector (r36)", () => {
+  it("never attaches the connector, never types @, still runs the model phase, and reports connectorVerified: false", async () => {
+    const { page, state, session } = fixture({ url: "about:blank", count: 0 });
+    goHome.mockImplementation(() => { state.url = "https://chatgpt.com/"; state.count = 1; state.mention = ""; });
+    const phases: string[] = [];
+    const result = await runInteractionPreflight(options, session, phase => phases.push(phase));
+    expect(result).toMatchObject({ connectorVerified: false, power: 4 });
+    // No connector phase, no attach, and no `@` typed into the live composer.
+    expect(phases).not.toContain("connector");
+    expect(setConnector).not.toHaveBeenCalled();
+    expect(page.keyboard.type).not.toHaveBeenCalled();
+    // The model phase still ran, after the composer step, so the run stopped at
+    // the model check rather than short-circuiting.
+    expect(phases).toContain("composer");
+    expect(phases).toContain("model");
+    expect(model).toHaveBeenCalledTimes(1);
+    expect(clearComposer).toHaveBeenCalled();
+  });
+
+  it("still attaches the connector before the model phase on a probe preflight and reports connectorVerified: true", async () => {
+    const { state, session } = fixture({ mention: "fixture" });
+    setConnector.mockImplementation(() => { state.mention = "fixture"; });
+    probe.mockResolvedValue({ requestedChars: 5, arrivedChars: 5, complete: true, deliveredBy: "paste" });
+    const phases: string[] = [];
+    const result = await runInteractionPreflight(
+      { ...options, probePrompt: "probe" }, session, phase => phases.push(phase));
+    expect(result).toMatchObject({ connectorVerified: true, power: 4 });
+    // The connector phase ran, and the attach preceded the model phase.
+    expect(phases).toContain("connector");
+    expect(phases.indexOf("connector")).toBeLessThan(phases.indexOf("model"));
+    expect(setConnector).toHaveBeenCalledWith(session.page, "fixture", true);
+    expect(setConnector.mock.invocationCallOrder[0]).toBeLessThan(model.mock.invocationCallOrder[0]);
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+});
+
 // P-035 2026-09-27 r11. Live ms1980 (vendor 9af999b, two fresh daemons): the
 // interaction preflight refused `composer_count:0` at phase `home` about 1.4 s
 // after `goHome`, on a page whose composer had simply not hydrated yet. The
@@ -949,10 +1005,9 @@ describe("home composer hydration wait", () => {
     // goHome lands on chatgpt.com but the composer is NOT there yet, exactly as
     // the live pre-hydration shell was.
     goHome.mockImplementation(() => { state.url = "https://chatgpt.com/"; state.mention = ""; });
-    setConnector.mockImplementation(() => { state.mention = "fixture"; });
     state.composerHydrationMs = 30;
     await expect(runInteractionPreflight(options, session))
-      .resolves.toMatchObject({ connectorVerified: true, power: 4 });
+      .resolves.toMatchObject({ connectorVerified: false, power: 4 });
     // One bounded wait for the home navigation, against the shipped composer
     // selector, at the shipped bound. (r21 adds the same wait to the CLEANUP
     // navigation, so this successful preflight issues two in total; index 0 is
@@ -966,7 +1021,10 @@ describe("home composer hydration wait", () => {
     expect(state.count).toBe(1);
     // Past `home`: the rest of the preflight ran against the hydrated page.
     expect(openConversation).toHaveBeenCalledTimes(1);
-    expect(setConnector).toHaveBeenCalledWith(session.page, "fixture", true);
+    // r36: the ordinary preflight stops at the model check, so no connector
+    // attach happens; the model phase still ran.
+    expect(setConnector).not.toHaveBeenCalled();
+    expect(model).toHaveBeenCalledTimes(1);
     expect(goHome).toHaveBeenCalledTimes(2);
   });
 
@@ -1100,11 +1158,12 @@ describe("cleanup-home composer hydration wait", () => {
       .mockImplementationOnce(() => {
         state.url = "https://chatgpt.com/"; state.mention = ""; state.count = 0; state.composerHydrationMs = 30;
       });
-    setConnector.mockImplementation(() => { state.mention = "fixture"; });
     // Without the cleanup wait the cleanup guard would read `count:0` and refuse,
     // so resolving successfully is itself the proof the guard ran after hydration.
+    // r36: the ordinary preflight skips the connector phase, so no attach sets a
+    // chip here; it reports `connectorVerified: false`.
     await expect(runInteractionPreflight(options, session))
-      .resolves.toMatchObject({ connectorVerified: true, power: 4 });
+      .resolves.toMatchObject({ connectorVerified: false, power: 4 });
     expect(goHome).toHaveBeenCalledTimes(2);
     // A second bounded wait, against the shipped composer selector, at the shipped bound.
     expect(composerWaits).toHaveLength(2);
@@ -1156,21 +1215,27 @@ describe("cleanup-home composer hydration wait", () => {
 describe("lane-owned connector chip residue", () => {
   const laneOptions = { ...options, connector: "lane-x" };
 
-  it("admits the composer's lone lane-owned chip at the pre-attach guards and proceeds past home", async () => {
+  it("still admits and clears the composer's lone lane-owned chip through the composer step", async () => {
     const { state, session } = fixture({ mention: "lane-x" });
     // The chip is present on the home composer from the first read -- exactly
-    // the residue the live lane held -- and it is still there when
-    // `setConnector` leaves it (the mock does not touch the DOM).
+    // the residue the live lane held. r36: the ordinary preflight no longer
+    // attaches the connector, so the chip is not replaced by `setConnector`;
+    // it stays admitted (configured, not owned) through every guard, and the
+    // composer step's Meta+A + Backspace (mocked by `clearComposer`) is what
+    // clears it.
     expect(state.mention).toBe("lane-x");
     const phases: string[] = [];
     await expect(runInteractionPreflight(laneOptions, session, phase => phases.push(phase)))
-      .resolves.toMatchObject({ connectorVerified: true, power: 4 });
+      .resolves.toMatchObject({ connectorVerified: false, power: 4 });
     // Both pre-attach guards admitted it: the preflight recorded `home` and then
     // crossed into `login`, so it proceeded past the phase that used to refuse.
     expect(phases[0]).toBe("home");
     expect(phases).toContain("login");
+    // It crossed the composer phase, where the composer step's clear ran.
+    expect(phases).toContain("composer");
+    expect(clearComposer).toHaveBeenCalled();
     expect(openConversation).toHaveBeenCalledTimes(1);
-    expect(setConnector).toHaveBeenCalledWith(session.page, "lane-x", true);
+    expect(setConnector).not.toHaveBeenCalled();
     expect(goHome).toHaveBeenCalledTimes(2);
   });
 

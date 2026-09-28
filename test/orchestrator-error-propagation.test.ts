@@ -20,6 +20,7 @@ const assertPreflightDraftSafe = vi.fn();
 const readLatestAssistantText = vi.fn();
 const sendPrompt = vi.fn();
 const setConnector = vi.fn();
+const probePromptDelivery = vi.fn();
 const ensureProSixMaximum = vi.fn();
 const setDeepResearch = vi.fn();
 const setWebSearch = vi.fn();
@@ -45,6 +46,11 @@ vi.mock("../src/browser/conversation.js", () => ({
   readLatestAssistantText: (...args: unknown[]) => readLatestAssistantText(...args),
   sendPrompt: (...args: unknown[]) => sendPrompt(...args),
   setConnector: (...args: unknown[]) => setConnector(...args),
+  // r36: the connector phase now runs only on the probe path, so this file's
+  // one connector-phase case drives a probe preflight. The orchestrator imports
+  // `probePromptDelivery` unconditionally, so the mock factory must name it even
+  // though that case fails inside `setConnector` before the probe is reached.
+  probePromptDelivery: (...args: unknown[]) => probePromptDelivery(...args),
   setDeepResearch: (...args: unknown[]) => setDeepResearch(...args),
   setWebSearch: (...args: unknown[]) => setWebSearch(...args),
   stopCurrentTurn: (...args: unknown[]) => stopCurrentTurn(...args),
@@ -89,6 +95,7 @@ beforeEach(() => {
   sendPrompt.mockImplementation(async (_page, _prompt, _preserve, _cancelled, guard) => { await guard?.(); return 0; });
   setWebSearch.mockResolvedValue(true);
   setConnector.mockResolvedValue(undefined);
+  probePromptDelivery.mockReset().mockResolvedValue({ requestedChars: 1, arrivedChars: 1, complete: true });
   setDeepResearch.mockResolvedValue(true);
   stopCurrentTurn.mockResolvedValue("");
   currentConversationId.mockReturnValue(null);
@@ -134,7 +141,11 @@ describe("runInteractionPreflight cleanup", () => {
     const onPhase = vi.fn();
     setConnector.mockRejectedValueOnce(original);
     goHome.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("cleanup navigation failed"));
-    await expect(runInteractionPreflight(options, preflightSession(), onPhase)).rejects.toBe(original);
+    // r36: the ordinary preflight no longer runs the connector phase, so the
+    // connector-phase failure this case pins is driven by the probe path, where
+    // that phase still runs unchanged (same timeline, same expected calls).
+    await expect(runInteractionPreflight({ ...options, probePrompt: "probe" }, preflightSession(), onPhase))
+      .rejects.toBe(original);
     expect(onPhase.mock.calls.map(([phase, failed]) => [phase, failed])).toEqual([
       ["home", undefined], ["login", undefined], ["account-home", undefined],
       ["project", undefined], ["account-project", undefined], ["composer", undefined],

@@ -97,7 +97,8 @@ export interface InteractionPreflightOptions {
 export interface InteractionPreflightResult {
   accountVerified: true;
   projectVerified: true;
-  connectorVerified: true;
+  /** True only when the connector phase ran and succeeded; false when it was skipped. */
+  connectorVerified: boolean;
   model: "gpt-6-pro";
   power: number;
   promptDelivery?: PromptDeliveryProbe;
@@ -168,10 +169,22 @@ export async function runInteractionPreflight(
     await requireAccount(page, opts.expectedAccountEmail);
     mark("composer");
     await clearComposer(page, guard);
-    mark("connector");
-    await guard();
-    await setConnector(page, opts.connector, true);
-    ownedConnector = opts.connector.trim();
+    // P-035 2026-09-28 r36. The ordinary watchdog preflight stops at the model
+    // check and never types into the live composer. `setConnector` typed `@`
+    // into ChatGPT's composer, and a failed picker click left that `@` behind,
+    // which blocked the health checks for over an hour (r33/r34). A real turn
+    // attaches the connector itself before submission (`runAsk`), so a broken
+    // picker still fails before anything is sent. The probe path below keeps the
+    // connector phase unchanged: it exists to exercise exactly the controls a
+    // real turn would use. The single guard after the phase keeps both paths
+    // entering the model phase from a guarded page (`ownedConnector` stays
+    // undefined on the ordinary path, so the configured connector still decides).
+    if (opts.probePrompt !== undefined) {
+      mark("connector");
+      await guard();
+      await setConnector(page, opts.connector, true);
+      ownedConnector = opts.connector.trim();
+    }
     await guard();
     mark("model");
     const selection = await ensureProSixMaximum(page, (next, failed, originalFailure) => {
@@ -189,7 +202,7 @@ export async function runInteractionPreflight(
     return {
       accountVerified: true,
       projectVerified: true,
-      connectorVerified: true,
+      connectorVerified: ownedConnector !== undefined,
       model: "gpt-6-pro",
       power: selection.power,
       ...(promptDelivery === undefined ? {} : { promptDelivery }),
