@@ -4,6 +4,7 @@ import {
   ensureInterceptorInstalled,
   setActiveEmitter,
   setExpectedReloadNavigation,
+  streamBreakCount,
   SseParser,
   StreamEmitter,
 } from "../src/core/stream.js";
@@ -133,7 +134,7 @@ it("deduplicates the same connector call across branch and SSE evidence", async 
   ]);
 });
 
-it("suppresses observer failures only during expected reload navigation", async () => {
+it("treats an observer failure as a break, not a terminal event", async () => {
   const setup = async (): Promise<{
     context: BrowserContext;
     start: (source: unknown, observerId: string) => void;
@@ -155,16 +156,21 @@ it("suppresses observer failures only during expected reload navigation", async 
     return { context, start: start!, done: done!, emitter };
   };
 
+  // P-035 G3 r41. A reader break is counted, never pushed as a terminal event:
+  // the turn's reply can still be on the page (and keep growing) afterwards.
   const normal = await setup();
   normal.start({}, "normal");
   normal.done({}, "normal", { reason: "error" });
-  expect(normal.emitter.isFinished()).toBe(true);
+  expect(normal.emitter.isFinished()).toBe(false);
+  expect(streamBreakCount(normal.context)).toBe(1);
 
+  // A reload that CGPro itself asked for is not a break at all.
   const reloading = await setup();
   setExpectedReloadNavigation(reloading.context, true);
   reloading.start({}, "reloading");
   reloading.done({}, "reloading", { reason: "error" });
   expect(reloading.emitter.isFinished()).toBe(false);
+  expect(streamBreakCount(reloading.context)).toBe(0);
 });
 
 it("does not deliver a late observer error to the next turn", async () => {

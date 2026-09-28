@@ -3,6 +3,7 @@ import type { BrowserContext, Page } from "patchright";
 import {
   ensureInterceptorInstalled,
   setActiveEmitter,
+  streamBreakCount,
   StreamEmitter,
   type StreamEvent,
 } from "../src/core/stream.js";
@@ -55,12 +56,16 @@ it("routes chunks to the emitter of the page they came from and resets pages ind
   expect(deltas(emitterA)).toEqual(["Hel", "lo"]);
   expect(emitterB.events).toEqual([]);
 
-  // B's stream error stays on B.
+  // B's stream error stays on B, and (r41) it counts as a break there instead
+  // of ending B's turn: the reply can still arrive on the page.
   const emitterB2 = new CollectingEmitter();
   setActiveEmitter(pageB, emitterB2);
   start({ page: pageB }, "obs-b");
   done({ page: pageB }, "obs-b", { reason: "error" });
-  expect(emitterB2.events).toEqual([{ type: "error", message: "fetch interceptor caught a stream error" }]);
+  expect(emitterB2.events).toEqual([]);
+  expect(emitterB2.isFinished()).toBe(false);
+  expect(streamBreakCount(pageB)).toBe(1);
+  expect(streamBreakCount(pageA)).toBe(0);
   expect(emitterA.isFinished()).toBe(false);
 
   // A's own reset drops the old observer's chunks (generation guard), as before.

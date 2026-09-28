@@ -139,6 +139,8 @@ class PageStreamState {
   expectedReloadNavigation = false;
   generation = 0;
   observers = new Map<string, number>();
+  /** Breaks of this page's conversation POST reader during the current turn. */
+  streamBreaks = 0;
 }
 
 /**
@@ -192,7 +194,19 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
       if (!state.emitter) return;
       if (payload?.reason === "error") {
         if (!state.expectedReloadNavigation) {
-          state.emitter.push({ type: "error", message: "fetch interceptor caught a stream error" });
+          // P-035 G3 r41 (2026-09-28). A break in the in-page reader of
+          // ChatGPT's own POST /backend-api/conversation SSE is NOT the end of
+          // the turn. Two live Pro turns under r40 (16:40 personal, 17:35
+          // ms1980) had the reader throw 1-2 min after submit while the
+          // assistant bubble was still growing and the stop button was still
+          // there, and the conversation held the reply afterwards. The terminal
+          // error this branch used to push ended the turn at 55-118 bytes and
+          // threw that reply away, so the break is counted and reported on
+          // stderr only and the wait keeps watching the page. The genuinely
+          // frozen turn this leaves open is bounded by the stalled-reply exit
+          // in `waitTurnComplete` (r43).
+          state.streamBreaks += 1;
+          console.error(`[cgpro:stream] break=${state.streamBreaks} reason=error`);
         }
         return;
       }
@@ -274,6 +288,10 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
  * other pages on the same context are untouched.
  *
  * Returns the previous emitter (caller may want to flush or fail it).
+ *
+ * The stream-break counter belongs to one turn, so it restarts here: a page
+ * outlives many turns, and `breaks=N` on a break line has to mean "breaks in
+ * this turn" to be readable.
  */
 export function setActiveEmitter(
   scope: StreamScope,
@@ -284,6 +302,7 @@ export function setActiveEmitter(
   const prev = state.emitter;
   state.generation += 1;
   state.observers.clear();
+  state.streamBreaks = 0;
   state.emitter = emitter;
   state.parser.reset(expectedConnector);
   return prev;
@@ -291,6 +310,16 @@ export function setActiveEmitter(
 
 export function setExpectedReloadNavigation(scope: StreamScope, expected: boolean): void {
   stateFor(scope).expectedReloadNavigation = expected;
+}
+
+/**
+ * How many times this page's conversation-POST reader threw during the current
+ * turn. Content-free (a count, never page text), and read by the stalled-reply
+ * exit so a freeze that followed a stream break is distinguishable from one
+ * that never lost the stream. 0 when the reader never threw.
+ */
+export function streamBreakCount(scope: StreamScope): number {
+  return stateFor(scope).streamBreaks;
 }
 
 /**
