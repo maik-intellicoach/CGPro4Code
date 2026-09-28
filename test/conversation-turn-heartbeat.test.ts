@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Page } from "patchright";
-import { ProUsageLimitAfterSubmitError, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../src/errors.js";
+import type { BrowserContext, Page } from "patchright";
+import { ProUsageLimitAfterSubmitError, ReplyStalledError, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../src/errors.js";
 import { SELECTORS } from "../src/browser/selectors.js";
+import { ensureInterceptorInstalled, setActiveEmitter, StreamEmitter } from "../src/core/stream.js";
 
 /**
  * P-035 G2 r22. The turn waiter prints at most one content-free status line per
@@ -28,7 +29,8 @@ const BUBBLE_TEXT = "Hello there";
 
 const HEALTHY_LINE =
   "[cgpro:turn] t=60 assistant=0/0 msgs=0/- working=no stop=no bubble_len=0 " +
-  "conv=yes composer=no alerts=0 alert_shapes=- error_hint=no limit_hint=no limit_exact=no";
+  "conv=yes composer=no alerts=0 alert_shapes=- error_hint=no limit_hint=no limit_exact=no " +
+  "stall=0/10";
 
 afterEach(() => {
   firstResolved.mockReset();
@@ -46,9 +48,11 @@ type RunOptions = {
   /** Bubble text per read; defaults to one stable `BUBBLE_TEXT`. */
   bubbleText?: () => string;
   /** When true the composer's Stop control resolves, so the turn reads working. */
-  stopVisible?: boolean;
+  stopVisible?: boolean | (() => boolean);
   /** Capture a non-timeout throw instead of rethrowing it, for assertions. */
   captureFailure?: boolean;
+  /** Run against the freshly built page before the wait starts. */
+  onPage?: (page: Page) => Promise<void>;
   /** `SELECTORS.anyMessages` count per read; defaults to `assistantCount`. */
   anyMessages?: () => number;
   /** Pre-submit anyMessages count; omitted means unknown (rule 2 disabled). */
@@ -77,9 +81,10 @@ async function runTurn(options: RunOptions): Promise<RunResult> {
     .mockImplementation((...args: unknown[]) => {
       lines.push(String(args[0]));
     });
-  firstResolved.mockImplementation(async (_page: unknown, selector: unknown) =>
-    options.stopVisible && String(selector).includes("stop-button") ? {} : null,
-  );
+  firstResolved.mockImplementation(async (_page: unknown, selector: unknown) => {
+    const working = typeof options.stopVisible === "function" ? options.stopVisible() : options.stopVisible;
+    return working && String(selector).includes("stop-button") ? {} : null;
+  });
 
   const alertElements = options.alerts ?? [];
   let bubbleSeenAt: number | null = null;
@@ -120,6 +125,8 @@ async function runTurn(options: RunOptions): Promise<RunResult> {
     goto: async () => {},
     context: () => ({}),
   } as unknown as Page;
+
+  await options.onPage?.(page);
 
   let outcome: RunResult["outcome"] = "resolved";
   let failure: unknown;
@@ -178,7 +185,7 @@ describe("waitTurnComplete turn heartbeat", () => {
     expect(result.lines).toEqual([
       "[cgpro:turn] t=60 assistant=0/0 msgs=0/- working=no stop=no bubble_len=0 " +
         "conv=yes composer=no alerts=1 alert_shapes=len:25:limit+reached " +
-        "error_hint=no limit_hint=yes limit_exact=yes",
+        "error_hint=no limit_hint=yes limit_exact=yes stall=0/10",
     ]);
     expect(result.lines[0]).not.toContain(LIMIT_ALERT_TEXT);
   });
@@ -235,7 +242,7 @@ describe("waitTurnComplete post-submit Pro usage limit", () => {
   const limitLine = (seconds: number, errorHint: "yes" | "no"): string =>
     `[cgpro:turn] t=${seconds} assistant=0/0 msgs=0/- working=no stop=no bubble_len=0 ` +
     `conv=yes composer=no alerts=1 alert_shapes=len:56:limit+reached+try-again ` +
-    `error_hint=${errorHint} limit_hint=yes limit_exact=yes`;
+    `error_hint=${errorHint} limit_hint=yes limit_exact=yes stall=0/10`;
   const LIMIT_LINE_AT_60 = limitLine(60, "yes");
   const LIMIT_LINE_AT_120 = limitLine(120, "yes");
 
@@ -287,10 +294,10 @@ describe("waitTurnComplete post-submit Pro usage limit", () => {
     expect(result.lines).toEqual([
       "[cgpro:turn] t=60 assistant=0/0 msgs=0/- working=no stop=no bubble_len=0 " +
         "conv=yes composer=no alerts=1 alert_shapes=len:18:usage+remaining " +
-        "error_hint=no limit_hint=yes limit_exact=no",
+        "error_hint=no limit_hint=yes limit_exact=no stall=0/10",
       "[cgpro:turn] t=120 assistant=0/0 msgs=0/- working=no stop=no bubble_len=0 " +
         "conv=yes composer=no alerts=1 alert_shapes=len:18:usage+remaining " +
-        "error_hint=no limit_hint=yes limit_exact=no",
+        "error_hint=no limit_hint=yes limit_exact=no stall=0/10",
     ]);
   });
 
@@ -329,10 +336,10 @@ describe("waitTurnComplete post-submit Pro usage limit", () => {
     expect(result.lines).toEqual([
       "[cgpro:turn] t=60 assistant=0/0 msgs=0/- working=yes stop=yes bubble_len=0 " +
         "conv=yes composer=no alerts=1 alert_shapes=len:56:limit+reached+try-again " +
-        "error_hint=yes limit_hint=yes limit_exact=yes",
+        "error_hint=yes limit_hint=yes limit_exact=yes stall=0/10",
       "[cgpro:turn] t=120 assistant=0/0 msgs=0/- working=yes stop=yes bubble_len=0 " +
         "conv=yes composer=no alerts=1 alert_shapes=len:56:limit+reached+try-again " +
-        "error_hint=yes limit_hint=yes limit_exact=yes",
+        "error_hint=yes limit_hint=yes limit_exact=yes stall=0/10",
     ]);
   });
 
@@ -381,7 +388,8 @@ describe("waitTurnComplete post-submit Pro usage limit", () => {
 describe("waitTurnComplete submitted turn never rendered", () => {
   const notRenderedLine = (seconds: number, msgs: string): string =>
     `[cgpro:turn] t=${seconds} assistant=0/0 msgs=${msgs} working=no stop=no bubble_len=0 ` +
-    "conv=yes composer=no alerts=0 alert_shapes=- error_hint=no limit_hint=no limit_exact=no";
+    "conv=yes composer=no alerts=0 alert_shapes=- error_hint=no limit_hint=no limit_exact=no " +
+    "stall=0/10";
 
   it("stops on the third not-rendered heartbeat with a content-free error", async () => {
     const result = await runTurn({
@@ -504,5 +512,187 @@ describe("waitTurnComplete submitted turn never rendered", () => {
     expect(result.lines[0]).toContain("alert_shapes=len:18:usage+remaining");
     expect(result.lines[0]).not.toContain(alertText);
     expect(result.lines[0]).not.toContain("usage remaining");
+  });
+});
+
+/** Drive a real in-page reader break on `page`, the way the SSE binding does. */
+async function driveStreamBreak(page: Page): Promise<void> {
+  const bindings: Record<string, (src: { page?: Page }, ...args: unknown[]) => void> = {};
+  const context = {
+    exposeBinding: async (name: string, callback: (typeof bindings)[string]) => {
+      bindings[name] = callback;
+    },
+    addInitScript: async () => {},
+  } as unknown as BrowserContext;
+  await ensureInterceptorInstalled(context);
+  setActiveEmitter(page, new StreamEmitter());
+  bindings["__cgproStart"]({ page }, "obs-1");
+  bindings["__cgproDone"]({ page }, "obs-1", { reason: "error" });
+}
+
+/**
+ * P-035 G3 r43. The frozen reply. r41 restored the rule that an in-page reader
+ * break does not end the turn, because ChatGPT keeps producing the answer while
+ * the page stays; a reply that really never arrives has to be bounded instead.
+ * Ten consecutive heartbeats of (an assistant turn for this submission, not
+ * working, one unchanged trimmed length) end the wait with a typed error, and
+ * any working turn, length change or failed read restarts the streak. The r37
+ * limit and the r38 never-rendered turn keep their exits.
+ */
+describe("waitTurnComplete stalled reply", () => {
+  /** A frozen reply needs the completion path to stay open, or it would return. */
+  const frozenControl = (extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+    confirmComplete: async () => false,
+    ...extra,
+  });
+  const stalledLine = (seconds: number, streak: number, bubbleLength = 12): string =>
+    `[cgpro:turn] t=${seconds} assistant=1/0 msgs=1/- working=no stop=no ` +
+    `bubble_len=${bubbleLength} conv=yes composer=no alerts=0 alert_shapes=- ` +
+    `error_hint=no limit_hint=no limit_exact=no stall=${streak}/10`;
+  /** The `stall=N/10` streak printed on the line for a given elapsed second. */
+  const streakAt = (lines: string[], seconds: number): string | undefined =>
+    lines.find((line) => line.includes(`t=${seconds} `))?.match(/stall=(\d+)\/10/)?.[1];
+
+  it("stops on the tenth frozen heartbeat with a content-free error", async () => {
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 1,
+      bubbleText: () => "Frozen reply",
+      control: frozenControl(),
+      captureFailure: true,
+    });
+
+    expect(result.outcome).toBe("error");
+    expect(result.error).toBeInstanceOf(ReplyStalledError);
+    const error = result.error as ReplyStalledError;
+    expect(error.code).toBe("reply_stalled");
+    // The prompt WAS submitted; this is not a pre-submit refusal.
+    expect(error.promptSubmitted).toBe(true);
+    expect(error.elapsedSeconds).toBe(600);
+    expect(error.bubbleLength).toBe("Frozen reply".length);
+    expect(error.streamBreaks).toBe(0);
+    expect(error.alertShapes).toBe("");
+    // Ten observations were needed, and it stopped there rather than at the
+    // configured 20-minute deadline. The streak is on every line.
+    expect(result.lines).toEqual(
+      Array.from({ length: 10 }, (_, i) => stalledLine((i + 1) * 60, i + 1)),
+    );
+    expect(result.completedAt).toBe(600_100);
+    for (const line of result.lines) expect(line).not.toContain("Frozen reply");
+  });
+
+  it("keeps waiting after only nine frozen heartbeats", async () => {
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 1,
+      bubbleText: () => "Frozen reply",
+      control: frozenControl({ cancelled: () => Date.now() >= 560_000 }),
+    });
+
+    expect(result.outcome).toBe("resolved");
+    expect(result.lines).toHaveLength(9);
+    expect(result.lines[8]).toContain("stall=9/10");
+    expect(result.completedAt).toBeLessThan(600_000);
+  });
+
+  it("restarts the streak when an observation shows the turn working", async () => {
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 1,
+      bubbleText: () => "Frozen reply",
+      // Working for the 300 s observation only: the streak restarts there.
+      stopVisible: () => Date.now() >= 300_000 && Date.now() < 360_000,
+      control: frozenControl({ cancelled: () => Date.now() >= 780_000 }),
+    });
+
+    expect(result.outcome).toBe("resolved");
+    expect(streakAt(result.lines, 240)).toBe("4");
+    expect(streakAt(result.lines, 300)).toBe("0");
+    expect(result.lines.find((line) => line.includes("t=300 "))).toContain("working=yes");
+    expect(streakAt(result.lines, 360)).toBe("1");
+    expect(result.lines.find((line) => line.includes("t=360 "))).toContain("working=no");
+    // Still short of ten when the wait was cancelled, and no error was thrown.
+    expect(streakAt(result.lines, 720)).toBe("7");
+    expect(result.lines.at(-1)).toContain("t=720 ");
+  });
+
+  it("restarts the streak when the bubble's trimmed length changes", async () => {
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 1,
+      // One character longer from the 360 s observation on.
+      bubbleText: () => (Date.now() >= 360_000 ? "Frozen reply!" : "Frozen reply"),
+      control: frozenControl({ cancelled: () => Date.now() >= 720_000 }),
+    });
+
+    expect(result.outcome).toBe("resolved");
+    expect(streakAt(result.lines, 300)).toBe("5");
+    expect(result.lines.find((line) => line.includes("t=300 "))).toContain("bubble_len=12");
+    // The longer text starts a fresh streak rather than extending the old one.
+    expect(streakAt(result.lines, 360)).toBe("1");
+    expect(result.lines.find((line) => line.includes("t=360 "))).toContain("bubble_len=13");
+    expect(streakAt(result.lines, 660)).toBe("6");
+    expect(result.lines.at(-1)).toContain("t=660 ");
+  });
+
+  it("lets a completion before the tenth observation return normally", async () => {
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 1,
+      bubbleText: () => "Frozen reply",
+      // The backend confirms the reply at 300 s, so the loop returns from the
+      // completion path long before the stall rule could fire.
+      control: { confirmComplete: async () => Date.now() >= 300_000 },
+    });
+
+    expect(result.outcome).toBe("resolved");
+    expect(result.error).toBeUndefined();
+    expect(result.lines).toHaveLength(5);
+    expect(result.completedAt).toBeGreaterThanOrEqual(300_000);
+    expect(result.completedAt).toBeLessThan(600_000);
+  });
+
+  it("keeps the r37 limit and the r38 never-rendered exits ahead of it", async () => {
+    // The three rules can never agree on one observation -- r37 and r38 both
+    // need NO assistant turn for this submission (count <= prior) and the stall
+    // rule needs one -- so what the ordering has to preserve is that each keeps
+    // its own typed error while the stall rule is live in the same waiter.
+    const limit = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 0,
+      alerts: [{ visible: true, text: "You've reached your limit" }],
+      priorAnyMessages: 0,
+      captureFailure: true,
+    });
+    const notRendered = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 0,
+      priorAnyMessages: 0,
+      captureFailure: true,
+    });
+
+    expect(limit.error).toBeInstanceOf(ProUsageLimitAfterSubmitError);
+    expect(limit.error).not.toBeInstanceOf(ReplyStalledError);
+    expect(notRendered.error).toBeInstanceOf(SubmittedTurnNotRenderedError);
+    expect(notRendered.error).not.toBeInstanceOf(ReplyStalledError);
+    // Both still stopped on their own rule rather than the stalled-reply one.
+    expect(limit.lines).toHaveLength(2);
+    expect(notRendered.lines).toHaveLength(3);
+  });
+
+  it("carries the in-page stream-break count of the turn", async () => {
+    // The r41 restore is why this exit exists at all, so the freeze after a
+    // reader break has to be distinguishable from a freeze that never lost it.
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 1,
+      bubbleText: () => "Frozen reply",
+      control: frozenControl(),
+      captureFailure: true,
+      onPage: driveStreamBreak,
+    });
+
+    expect(result.error).toBeInstanceOf(ReplyStalledError);
+    expect((result.error as ReplyStalledError).streamBreaks).toBe(1);
   });
 });

@@ -47,6 +47,7 @@ import {
   NotLoggedInError,
   PreSubmitInteractionError,
   ProUsageLimitAfterSubmitError,
+  ReplyStalledError,
   SelectorBrokenError,
   SubmittedTurnNotRenderedError,
 } from "../src/errors.js";
@@ -1462,6 +1463,55 @@ it("carries the submitted-turn-not-rendered code and promptSubmitted on the daem
   expect(sse).not.toContain('"availableAfter"');
   expect(sse).not.toContain('"limitText"');
   expect(classifyInteractionFailure(notRendered)).toEqual({ code: "unclassified_error" });
+  expect(state.interaction.state).not.toBe("degraded");
+});
+
+// P-035 G3 r43. The frozen reply reaches the wire exactly like the never-rendered
+// turn: closed code and `promptSubmitted: true` only. The elapsed seconds, the
+// bubble length, the stream-break count and the alert shapes live in its
+// content-free message, and the thrown error is what makes the daemon's
+// `describeFailure` capture run.
+it("carries the stalled-reply code and promptSubmitted on the daemon error event", async () => {
+  const page = {
+    isClosed: () => false,
+    url: () => "https://chatgpt.com/",
+    screenshot: vi.fn(async () => {}),
+    evaluate: vi.fn(async () => "url=\"https://chatgpt.com/\" viewport=1512x944 overlay=0"),
+    keyboard: { press: vi.fn(async () => {}) },
+    locator: () => ({ count: () => 0, first: () => ({ isVisible: () => false }) }),
+  };
+  const state = fakeState({ session: { page } as unknown as Session });
+  slotsOf(state)[0].page = page as unknown as import("patchright").Page;
+
+  const emitter = new StreamEmitter();
+  emitter.push({ type: "error", message: "reply stalled" });
+  const stalled = new ReplyStalledError({
+    elapsedSeconds: 600,
+    bubbleLength: 118,
+    streamBreaks: 1,
+    alertShapes: "len:18:usage+remaining",
+  });
+  const result = Promise.resolve().then(() => {
+    throw stalled;
+  });
+  result.catch(() => undefined);
+  runAskOnSession.mockReturnValue({ events: emitter, result, cancel: async () => {} });
+
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST" });
+  const pending = handleAsk(req, res as unknown as ServerResponse, state);
+  sendBody(req, { prompt: "hi" });
+  await pending;
+
+  const sse = (res as unknown as FakeRes).writes.join("");
+  expect(sse).toContain("event: error");
+  expect(sse).toContain('"code":"reply_stalled"');
+  expect(sse).toContain('"promptSubmitted":true');
+  // No reset date and no alert text travel on this error either.
+  expect(sse).not.toContain('"availableAfter"');
+  expect(sse).not.toContain('"limitText"');
+  expect(classifyInteractionFailure(stalled)).toEqual({ code: "unclassified_error" });
   expect(state.interaction.state).not.toBe("degraded");
 });
 

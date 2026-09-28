@@ -225,6 +225,58 @@ export class SubmittedTurnNotRenderedError extends Error {
 }
 
 /**
+ * P-035 G3 r43 (2026-09-28). The submitted turn's reply froze.
+ *
+ * r41 stopped treating a break in the in-page reader of ChatGPT's own SSE POST
+ * as terminal, because two live Pro turns (r40: 16:40 personal, 17:35 ms1980)
+ * kept their assistant bubble growing after the reader threw. The price of that
+ * restore is the genuinely frozen reply: an assistant turn exists for this
+ * submission, nothing is working, and its text never changes again -- which
+ * used to be indistinguishable from a long extended-thinking turn and held the
+ * wait for the full timeout. This is the bounded exit for exactly that state:
+ * ten consecutive heartbeat observations (>= 10 minutes).
+ *
+ * Like r37 and r38 this is deliberately NOT a `PreSubmitInteractionError`: the
+ * prompt WAS submitted, so `promptSubmitted` is true. It carries the same
+ * content-free facts the heartbeat already prints -- the elapsed seconds, the
+ * bubble's trimmed length, how many in-page stream breaks preceded it and the
+ * alert shapes -- so the daemon's existing `describeFailure` capture (identity,
+ * screenshot, selector state) is what makes the page state readable after the
+ * fact.
+ */
+export interface ReplyStalledDetails {
+  /** Whole seconds the waiter had been in this turn when the streak confirmed. */
+  elapsedSeconds: number;
+  /** The latest assistant bubble's trimmed text length at that observation. */
+  bubbleLength: number;
+  /** In-page conversation-POST reader breaks counted for this turn; 0 if none. */
+  streamBreaks: number;
+  /** The content-free `alert_shapes` string the heartbeat printed. */
+  alertShapes: string;
+}
+
+export class ReplyStalledError extends Error {
+  readonly code = "reply_stalled";
+  readonly promptSubmitted = true;
+  readonly elapsedSeconds: number;
+  readonly bubbleLength: number;
+  readonly streamBreaks: number;
+  readonly alertShapes: string;
+
+  constructor(details: ReplyStalledDetails) {
+    super(
+      `reply_stalled after ${details.elapsedSeconds}s: bubble_len=${details.bubbleLength} ` +
+      `stream_breaks=${details.streamBreaks} alert_shapes=${details.alertShapes || "-"}`,
+    );
+    this.name = "ReplyStalledError";
+    this.elapsedSeconds = details.elapsedSeconds;
+    this.bubbleLength = details.bubbleLength;
+    this.streamBreaks = details.streamBreaks;
+    this.alertShapes = details.alertShapes;
+  }
+}
+
+/**
  * Content-free refusal: the page must be left exactly as found.
  *
  * P-035 2026-09-27. The guard admits or refuses through a single boolean, so a

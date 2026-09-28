@@ -3,8 +3,8 @@ import { SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
 import { listProjects } from "../api/projects.js";
 import { fetchModelsWithReason, findProModel, type ChatgptModel } from "../api/models.js";
-import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, SelectorBrokenError, type SubmittedTurnNotRenderedDetails, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../errors.js";
-import { setExpectedReloadNavigation } from "../core/stream.js";
+import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, type ReplyStalledDetails, ReplyStalledError, SelectorBrokenError, type SubmittedTurnNotRenderedDetails, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../errors.js";
+import { setExpectedReloadNavigation, streamBreakCount } from "../core/stream.js";
 
 /**
  * Open a chatgpt.com conversation.
@@ -4165,6 +4165,18 @@ const TURN_LIMIT_CONSECUTIVE_OBSERVATIONS = 2;
  */
 const TURN_NOT_RENDERED_CONSECUTIVE_OBSERVATIONS = 3;
 /**
+ * P-035 G3 r43 (2026-09-28). Ten consecutive observations of a frozen reply
+ * before the wait stops. r41 keeps watching the page after an in-page reader
+ * break because ChatGPT keeps producing the answer while the page stays; the
+ * turn that never produces one any more has to be bounded instead of holding
+ * the full timeout. Ten is the deliberately generous side of that trade: the
+ * first heartbeat is at 60 s, so this is >= 10 minutes of an assistant turn
+ * that exists, is not working, and whose trimmed text never changes, and any
+ * observation with a working turn, a changed length or a failed read restarts
+ * the streak.
+ */
+const REPLY_STALL_CONSECUTIVE_OBSERVATIONS = 10;
+/**
  * The fixed, content-free alert vocabulary. A heartbeat shape reports which of
  * these words an alert text matched, case-insensitively, never the text itself.
  * Order here is the order they are joined on the line, so the shape is
@@ -4241,10 +4253,27 @@ interface TurnLimitAfterSubmit {
 }
 
 /**
+ * The stalled-reply facts ONE observation showed: an assistant turn exists for
+ * this submission, nothing is working, and this is the bubble's trimmed length.
+ * Whether the length stopped changing is the heartbeat's question, not this
+ * read's, so the length travels and the streak is counted above.
+ */
+interface TurnStalledObservation {
+  elapsedSeconds: number;
+  bubbleLength: number;
+  streamBreaks: number;
+  alertShapes: string;
+}
+
+/**
  * One heartbeat observation: the diagnostic line to print, the post-submit Pro
- * limit when THIS observation proved it, and the "submitted turn never
- * rendered" facts when this observation showed them. Any read that a page
- * cannot answer propagates to the caller, which owns the try/catch.
+ * limit when THIS observation proved it, the "submitted turn never rendered"
+ * facts when this observation showed them, and the stalled-reply facts when
+ * this observation showed an idle assistant turn. Any read that a page cannot
+ * answer propagates to the caller, which owns the try/catch.
+ *
+ * The line carries every field but the stalled-reply streak; the heartbeat
+ * owner appends `stall=N/10` because it owns that counter.
  *
  * The limit only counts when no assistant turn for this submission has appeared
  * at all -- the assistant count has not moved, no bubble text exists and nothing
@@ -4256,6 +4285,11 @@ interface TurnLimitAfterSubmit {
  * `anyMessages` count has not grown past its pre-submit value. It is only
  * computed when the caller supplied that prior value; an unknown prior count
  * disables the rule rather than guessing.
+ *
+ * P-035 G3 r43 (2026-09-28) adds the stalled-reply observation: an assistant
+ * turn for this submission DOES exist and nothing is working. It is the exact
+ * opposite of the two rules above on the assistant count, which is also why
+ * they can never agree on one observation.
  */
 async function readTurnHeartbeat(
   page: Page,
@@ -4266,6 +4300,7 @@ async function readTurnHeartbeat(
   line: string;
   limit: TurnLimitAfterSubmit | null;
   notRendered: SubmittedTurnNotRenderedDetails | null;
+  stall: TurnStalledObservation | null;
 }> {
   const count = await page.locator(SELECTORS.assistantMessages.join(", ")).count();
   const msgs = await page.locator(SELECTORS.anyMessages.join(", ")).count();
@@ -4321,18 +4356,27 @@ async function readTurnHeartbeat(
           alertShapes,
         }
       : null,
+    stall: count > priorAssistantCount && !working
+      ? {
+          elapsedSeconds: Math.floor(elapsedMs / 1_000),
+          bubbleLength: bubbleText.trim().length,
+          streamBreaks: streamBreakCount(page),
+          alertShapes,
+        }
+      : null,
   };
 }
 
 /**
  * At most one heartbeat line per 60 s of the wait, the first one 60 s after
  * entry. Errors are swallowed here so the heartbeat can never change the turn,
- * and a read that failed is never counted as an observation of either rule.
+ * and a read that failed is never counted as an observation of any rule.
  *
  * The heartbeat records the limit once rule 1's condition holds for two
- * consecutive observations, and the not-rendered facts once rule 2's condition
- * holds for three. `waitTurnComplete` owns the throws, so this stays a
- * diagnostic that cannot itself change the turn.
+ * consecutive observations, the not-rendered facts once rule 2's condition
+ * holds for three, and the stalled-reply facts once rule 3's condition holds
+ * for ten. `waitTurnComplete` owns the throws, so this stays a diagnostic that
+ * cannot itself change the turn.
  */
 function turnHeartbeat(
   page: Page,
@@ -4342,13 +4386,17 @@ function turnHeartbeat(
   tick: () => Promise<void>;
   limitAfterSubmit: () => TurnLimitAfterSubmit | null;
   submittedTurnNotRendered: () => SubmittedTurnNotRenderedDetails | null;
+  replyStalled: () => ReplyStalledDetails | null;
 } {
   const startedAt = Date.now();
   let lastEmittedAt: number | null = null;
   let limitObservations = 0;
   let notRenderedObservations = 0;
+  let stallStreak = 0;
+  let stallLength: number | null = null;
   let confirmed: TurnLimitAfterSubmit | null = null;
   let notRendered: SubmittedTurnNotRenderedDetails | null = null;
+  let stalled: ReplyStalledDetails | null = null;
   const tick = async (): Promise<void> => {
     try {
       const now = Date.now();
@@ -4357,7 +4405,6 @@ function turnHeartbeat(
       if (lastEmittedAt !== null && now - lastEmittedAt < TURN_HEARTBEAT_INTERVAL_MS) return;
       lastEmittedAt = now;
       const read = await readTurnHeartbeat(page, elapsed, priorAssistantCount, priorAnyMessages);
-      console.error(read.line);
       limitObservations = read.limit === null ? 0 : limitObservations + 1;
       if (read.limit !== null && limitObservations >= TURN_LIMIT_CONSECUTIVE_OBSERVATIONS) {
         confirmed = read.limit;
@@ -4366,18 +4413,37 @@ function turnHeartbeat(
       if (read.notRendered !== null && notRenderedObservations >= TURN_NOT_RENDERED_CONSECUTIVE_OBSERVATIONS) {
         notRendered = read.notRendered;
       }
+      // Rule 3 counts observations of one UNCHANGED trimmed length, so the
+      // first observation of a length starts a fresh streak and a different
+      // length does not extend the old one.
+      if (read.stall === null) {
+        stallStreak = 0;
+        stallLength = null;
+      } else if (stallLength !== null && read.stall.bubbleLength === stallLength) {
+        stallStreak += 1;
+      } else {
+        stallLength = read.stall.bubbleLength;
+        stallStreak = 1;
+      }
+      if (read.stall !== null && stallStreak >= REPLY_STALL_CONSECUTIVE_OBSERVATIONS) {
+        stalled = read.stall;
+      }
+      console.error(`${read.line} stall=${stallStreak}/${REPLY_STALL_CONSECUTIVE_OBSERVATIONS}`);
     } catch {
       // Diagnostic only: a page that cannot answer the heartbeat's reads must
       // not change the wait it observes, and an unreadable heartbeat is not an
-      // observation of either rule either.
+      // observation of any rule either.
       limitObservations = 0;
       notRenderedObservations = 0;
+      stallStreak = 0;
+      stallLength = null;
     }
   };
   return {
     tick,
     limitAfterSubmit: () => confirmed,
     submittedTurnNotRendered: () => notRendered,
+    replyStalled: () => stalled,
   };
 }
 
@@ -4406,6 +4472,19 @@ function turnHeartbeat(
  * of a silent 2 h timeout. The prior `anyMessages` count is optional: when the
  * caller cannot supply it, this rule stays off. A proven limit is checked first
  * and wins.
+ *
+ * P-035 G3 r43 (2026-09-28). A fifth way out: the submitted turn whose reply
+ * froze. r41 restored the rule that an in-page reader break does not end the
+ * turn, because ChatGPT keeps producing the answer while the page stays; the
+ * genuinely frozen reply this leaves open is bounded here instead. Ten
+ * consecutive heartbeats (>= 10 minutes) that see an assistant turn for this
+ * submission, NOT working, and one unchanged trimmed length end the wait with
+ * `ReplyStalledError`. Checked after the limit and the never-rendered turn, so
+ * those keep their exits, and before the timeout/reload branch, so the freeze
+ * fails fast instead of waiting out the deadline. A genuine completion returns
+ * from an earlier iteration as soon as its own stability window and backend
+ * confirmation hold, so it always wins: ten unchanged observations cannot
+ * accumulate while the completion path is returning.
  */
 export async function waitTurnComplete(
   page: Page,
@@ -4443,9 +4522,10 @@ export async function waitTurnComplete(
     if (control.cancelled?.()) return;
     if (control.externalComplete?.()) return;
     // Checked after cancel and external completion, so a genuine completion
-    // always wins, and before the timeout/reload branch, so the proven limit or
-    // the never-rendered turn fails fast instead of waiting out the deadline.
-    // The limit is checked first and wins when both rules hold.
+    // always wins, and before the timeout/reload branch, so the proven limit,
+    // the never-rendered turn or the frozen reply fails fast instead of waiting
+    // out the deadline. The limit is checked first and wins when both rules
+    // hold; r37 and r38 stay ahead of r43.
     const postSubmitLimit = heartbeat.limitAfterSubmit();
     if (postSubmitLimit !== null) {
       throw new ProUsageLimitAfterSubmitError(postSubmitLimit);
@@ -4453,6 +4533,10 @@ export async function waitTurnComplete(
     const notRendered = heartbeat.submittedTurnNotRendered();
     if (notRendered !== null) {
       throw new SubmittedTurnNotRenderedError(notRendered);
+    }
+    const stalled = heartbeat.replyStalled();
+    if (stalled !== null) {
+      throw new ReplyStalledError(stalled);
     }
     const requestedConversation = control.consumeReload?.() ?? null;
     const expired = Date.now() >= deadline;

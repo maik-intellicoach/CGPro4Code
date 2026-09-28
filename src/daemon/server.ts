@@ -58,6 +58,7 @@ import {
   PreflightDraftProtectedError,
   PreSubmitInteractionError,
   ProUsageLimitAfterSubmitError,
+  ReplyStalledError,
   SubmittedTurnNotRenderedError,
 } from "../errors.js";
 import { SELECTORS, TURN_CRITICAL_SELECTORS, type SelectorSet } from "../browser/selectors.js";
@@ -1915,6 +1916,17 @@ export async function handleAsk(
           // content-free message, and there is no reset date or alert text to
           // carry. Its `describeFailure` capture above is the point of the error.
           : err instanceof SubmittedTurnNotRenderedError
+            ? {
+                message: err.message,
+                code: err.code,
+                promptSubmitted: err.promptSubmitted,
+              }
+          // P-035 G3 r43. The frozen reply reaches the wire the same way the
+          // never-rendered turn does: closed code and `promptSubmitted: true`
+          // only. The elapsed seconds, bubble length, stream-break count and
+          // alert shapes are already inside its content-free message, and its
+          // `describeFailure` capture above is the point of the error.
+          : err instanceof ReplyStalledError
             ? {
                 message: err.message,
                 code: err.code,
