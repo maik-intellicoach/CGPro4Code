@@ -11,9 +11,9 @@
  *
  * So this module returns names, counts, lengths and a whitelist of small
  * enumerated attribute VALUES (`data-testid`, `role`,
- * `data-message-author-role`, all sanitised). It deliberately does NOT read
- * attribute values for any other attribute, and never reads a text node's
- * content -- only its length.
+ * `data-message-author-role`, `data-conversation-role`, all sanitised). It
+ * deliberately does NOT read attribute values for any other attribute, and
+ * never reads a text node's content -- only its length.
  *
  * `summariseDomShape` is written to run inside `page.evaluate`, so it may not
  * close over anything in module scope: patchright serialises the function with
@@ -56,6 +56,8 @@ export interface DomShapeSummary {
   testids: Array<{ value: string; count: number }>;
   roles: Array<{ value: string; count: number }>;
   author_roles: Array<{ value: string; count: number }>;
+  /** Whitelisted `data-conversation-role` values, sanitised, with counts. */
+  conversation_roles: Array<{ value: string; count: number }>;
   tags: Array<{ match: string; count: number }>;
   candidates: Array<{ key: string; matches: Array<{ selector: string; count: number }> }>;
   turn_containers: Array<{
@@ -64,6 +66,19 @@ export interface DomShapeSummary {
     dataAttrs: string[];
     classCount: number;
     textLength: number;
+  }>;
+  /**
+   * One entry per `[data-content-search-unit-key]` element (the 2026-09 message
+   * unit), in document order. Shape only: no text, and the only attribute value
+   * carried is the sanitised `data-conversation-role`.
+   */
+  units: Array<{
+    index: number;
+    hasUserBubble: boolean;
+    markdownCount: number;
+    markdownCopyCount: number;
+    textLength: number;
+    conversationRole: string;
   }>;
 }
 
@@ -170,6 +185,69 @@ export function summariseDomShape(input: DomShapeInput, root?: DomShapeRoot): Do
     /* an unreadable author-role list is an empty one, never a thrown probe */
   }
 
+  // P-035 2026-09-28 (vendor r40). The 2026-09 message unit carries
+  // `data-conversation-role`; its sanitised values are enumerated here, exactly
+  // like `data-message-author-role` above.
+  const conversationRoleCounts = new Map<string, number>();
+  try {
+    for (const el of Array.from(doc.querySelectorAll("[data-conversation-role]"))) {
+      const value = sanitise(readAttr(el, "data-conversation-role"));
+      if (value) conversationRoleCounts.set(value, (conversationRoleCounts.get(value) ?? 0) + 1);
+    }
+  } catch {
+    /* an unreadable role list is an empty one, never a thrown probe */
+  }
+
+  // One entry per message unit, shape only: counts, lengths and the single
+  // sanitised `data-conversation-role` value, never text. `markdownCopyCount`
+  // and `markdownCount` are descendant counts; `conversationRole` prefers the
+  // unit's own attribute and falls back to its nearest descendant carrying it.
+  const units: Array<{
+    index: number;
+    hasUserBubble: boolean;
+    markdownCount: number;
+    markdownCopyCount: number;
+    textLength: number;
+    conversationRole: string;
+  }> = [];
+  try {
+    const unitElements = Array.from(doc.querySelectorAll("[data-content-search-unit-key]"));
+    unitElements.forEach((unit, index) => {
+      const countDescendants = (selector: string): number => {
+        try {
+          return unit.querySelectorAll(selector).length;
+        } catch {
+          return -1;
+        }
+      };
+      let role: string | null = readAttr(unit, "data-conversation-role");
+      if (!role) {
+        try {
+          for (const descendant of Array.from(unit.querySelectorAll("[data-conversation-role]"))) {
+            const value = readAttr(descendant, "data-conversation-role");
+            if (value) {
+              role = value;
+              break;
+            }
+          }
+        } catch {
+          /* an unreadable descendant list falls through to "-" */
+        }
+      }
+      const cleanRole = role ? sanitise(role) : "";
+      units.push({
+        index,
+        hasUserBubble: countDescendants("[data-user-message-bubble]") > 0,
+        markdownCount: countDescendants('[class*="markdown"]'),
+        markdownCopyCount: countDescendants("[data-markdown-copy]"),
+        textLength: (unit.textContent ?? "").length,
+        conversationRole: cleanRole.length > 0 ? cleanRole : "-",
+      });
+    });
+  } catch {
+    /* an unreadable unit list is an empty one, never a thrown probe */
+  }
+
   const byName = (map: Map<string, number>): Array<{ name: string; count: number }> =>
     Array.from(map.entries())
       .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
@@ -198,11 +276,13 @@ export function summariseDomShape(input: DomShapeInput, root?: DomShapeRoot): Do
     testids: byCount(testidCounts, 40),
     roles: byCount(roleCounts),
     author_roles: byCount(authorRoleCounts),
+    conversation_roles: byCount(conversationRoleCounts),
     tags: input.tagProbes.map((match) => ({ match, count: countIn(match) })),
     candidates: input.candidates.map((entry) => ({
       key: entry.key,
       matches: entry.selectors.map((selector) => ({ selector, count: countAll(selector) })),
     })),
     turn_containers: turnContainers,
+    units,
   };
 }

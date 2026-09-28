@@ -989,6 +989,7 @@ export async function handleRequest(
         `dom-shape probe conversation=${requested.slice(0, 8)} url_path_kind=${summary.url_path_kind} ` +
           `data_attrs=${summary.data_attr_names.length} testids=${summary.testids.length} ` +
           `roles=${summary.roles.length} author_roles=${summary.author_roles.length} ` +
+          `conversation_roles=${summary.conversation_roles.length} units=${summary.units.length} ` +
           `turn_containers=${summary.turn_containers.length} ` +
           `candidate_matches=${summary.candidates.reduce(
             (n, entry) => n + entry.matches.filter((match) => match.count > 0).length,

@@ -239,4 +239,89 @@ describe("summariseDomShape", () => {
     ]);
     expect(JSON.stringify(result)).not.toContain(SENTINEL);
   });
+
+  // P-035 2026-09-28 (vendor r40). The 2026-09 message unit carries
+  // `data-content-search-unit-key` and `data-conversation-role`; the probe now
+  // reports one `units` entry per unit plus the enumerated role values, and
+  // still carries no text.
+  it("reports message units and conversation roles as shape only", () => {
+    const roleSpan = new FakeElement(
+      "SPAN",
+      [{ name: "data-conversation-role", value: "user" }],
+      SENTINEL,
+    );
+    const bubble = new FakeElement("DIV", [{ name: "data-user-message-bubble", value: "" }], SENTINEL);
+    const userUnit = new FakeElement(
+      "DIV",
+      [{ name: "data-content-search-unit-key", value: "unit-1" }],
+      SENTINEL,
+      [bubble, roleSpan],
+      new Map<string, FakeElement[]>([
+        ["[data-user-message-bubble]", [bubble]],
+        ['[class*="markdown"]', []],
+        ["[data-markdown-copy]", []],
+        ["[data-conversation-role]", [roleSpan]],
+      ]),
+    );
+    const md1 = new FakeElement("DIV", [{ name: "class", value: "markdown-block" }], SENTINEL);
+    const md2 = new FakeElement("DIV", [{ name: "class", value: "markdown-body" }], SENTINEL);
+    const copy = new FakeElement("DIV", [{ name: "data-markdown-copy", value: "" }], SENTINEL);
+    const assistantUnit = new FakeElement(
+      "DIV",
+      [
+        { name: "data-content-search-unit-key", value: "unit-2" },
+        { name: "data-conversation-role", value: "assistant" },
+      ],
+      SENTINEL,
+      [md1, md2, copy],
+      new Map<string, FakeElement[]>([
+        ["[data-user-message-bubble]", []],
+        ['[class*="markdown"]', [md1, md2]],
+        ["[data-markdown-copy]", [copy]],
+        ["[data-conversation-role]", []],
+      ]),
+    );
+    const main = new FakeElement(
+      "MAIN",
+      [],
+      "",
+      [userUnit, assistantUnit],
+      new Map<string, FakeElement[]>([["[data-content-search-unit-key]", [userUnit, assistantUnit]]]),
+    );
+    const root = new FakeRoot(
+      main,
+      main,
+      new Map<string, FakeElement[]>([
+        ["[data-content-search-unit-key]", [userUnit, assistantUnit]],
+        ["[data-conversation-role]", [assistantUnit, roleSpan]],
+      ]),
+    );
+
+    const result = summariseDomShape({ conversationPath: true, candidates: [], tagProbes: [] }, root);
+
+    expect(result.units).toEqual([
+      {
+        index: 0,
+        hasUserBubble: true,
+        markdownCount: 0,
+        markdownCopyCount: 0,
+        textLength: SENTINEL.length,
+        conversationRole: "user",
+      },
+      {
+        index: 1,
+        hasUserBubble: false,
+        markdownCount: 2,
+        markdownCopyCount: 1,
+        textLength: SENTINEL.length,
+        conversationRole: "assistant",
+      },
+    ]);
+    expect(result.conversation_roles).toEqual([
+      { value: "assistant", count: 1 },
+      { value: "user", count: 1 },
+    ]);
+    // The whole contract once more: no text node survives in the new fields.
+    expect(JSON.stringify(result)).not.toContain(SENTINEL);
+  });
 });

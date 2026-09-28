@@ -1519,9 +1519,11 @@ describe("daemon-side DOM shape probe", () => {
     testids: [],
     roles: [],
     author_roles: [],
+    conversation_roles: [],
     tags: [],
     candidates: [],
     turn_containers: [],
+    units: [],
   };
 
   function fakeShapePage(overrides: Record<string, unknown> = {}) {

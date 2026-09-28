@@ -175,11 +175,22 @@ export const SELECTORS: SelectorSet = {
     'nav button:has(img[alt])',
   ],
   assistantMessages: [
+    // P-035 2026-09-28 (vendor r40). The 2026-09 conversation markup carries one
+    // element per message under `data-content-search-unit-key` (and
+    // `data-chatgpt-search-unit-key`); the assistant unit is the one WITHOUT a
+    // user bubble (`[data-user-message-bubble]`). `:not(:has(...))` keeps the
+    // match inside a real message unit by construction, so the composer -- which
+    // carries neither unit attribute -- can never match here.
+    "[data-content-search-unit-key]:not(:has([data-user-message-bubble]))",
+    "[data-chatgpt-search-unit-key]:not(:has([data-user-message-bubble]))",
     'div[data-message-author-role="assistant"]',
     '[data-message-author-role="assistant"]',
     'main article:has([data-message-author-role="assistant"])',
   ],
   anyMessages: [
+    // P-035 2026-09-28 (vendor r40): one unit element per message, both roles.
+    "[data-content-search-unit-key]",
+    "[data-chatgpt-search-unit-key]",
     "div[data-message-author-role]",
     "[data-message-author-role]",
     'div[data-testid^="conversation-turn"]',
@@ -191,6 +202,9 @@ export const SELECTORS: SelectorSet = {
     'div[role="group"][aria-label*="Actions"]',
   ],
   assistantMarkdown: [
+    // P-035 2026-09-28 (vendor r40): the markdown body inside the assistant unit.
+    // Scoped to a unit that has no user bubble, so it can only match a message.
+    '[data-content-search-unit-key]:not(:has([data-user-message-bubble])) [class*="markdown"]',
     "div.markdown",
     '[data-message-author-role="assistant"] .markdown',
     '[data-message-author-role="assistant"]',

@@ -4610,12 +4610,59 @@ export async function latestAssistantBubble(page: Page): Promise<Locator | null>
 }
 
 /**
+ * A leading progress header ChatGPT prints above a Pro / Thinking answer:
+ * "Thought for 12s" (older UI) and "Worked for 9m 26s" / "Worked for 45s" (the
+ * 2026-09-28 Pro answer). It is chrome, not answer text, so exactly one leading
+ * such line is stripped -- the way the reader already stripped "Thought for Ns".
+ */
+const LEADING_PROGRESS_LINE_RE =
+  /^(?:Thought for \d+s|Worked for \d+(?:m\s*\d+)?s)\s*\n+/i;
+
+/**
+ * The bubble container that may repeat: the live 2026-09 assistant unit carried
+ * several `[class*="markdown"]` blocks, not one.
+ */
+const MARKDOWN_ANY_SELECTOR = '[class*="markdown"]';
+
+/**
+ * Text of every `[class*="markdown"]` block in the bubble, in document order,
+ * joined with a blank line.
+ *
+ * P-035 2026-09-28 (vendor r40). Reading `.first()` here would return only one
+ * of several markdown blocks (six were counted live). Only the OUTERMOST matched
+ * blocks are read, so a block nested inside another matched block is not counted
+ * twice (which would duplicate its own text in the answer). Each block's text is
+ * trimmed before the join and empty blocks are dropped. Never throws: an
+ * unanswerable block yields empty text and the caller keeps walking fallbacks.
+ */
+async function joinMarkdownBlockText(scope: Locator, count: number): Promise<string> {
+  const all = scope.locator(MARKDOWN_ANY_SELECTOR);
+  const outermost = await all
+    .evaluateAll((elements) =>
+      elements
+        .map((element, index) => ({
+          index,
+          nested: elements.some((other) => other !== element && other.contains(element)),
+        }))
+        .filter((entry) => !entry.nested)
+        .map((entry) => entry.index),
+    )
+    .catch(() => Array.from({ length: count }, (_, index) => index));
+  const parts: string[] = [];
+  for (const index of outermost) {
+    const block = (await all.nth(index).innerText({ timeout: 1_500 }).catch(() => "")) ?? "";
+    if (block.trim().length > 0) parts.push(block.trim());
+  }
+  return parts.join("\n\n");
+}
+
+/**
  * Fall-back content extraction: return the latest assistant bubble's
  * inner text. Used when SSE interception didn't capture text.
  *
- * Strips a leading "Thought for Ns" prefix that the Pro / Thinking models
- * inject before the actual answer. Prefers the deepest markdown container
- * so we don't pick up wrapper chrome.
+ * Strips a leading "Thought for Ns" / "Worked for <duration>" header that the
+ * Pro / Thinking models inject before the actual answer. Prefers the deepest
+ * markdown container so we don't pick up wrapper chrome.
  */
 export async function readLatestAssistantText(page: Page): Promise<string> {
   const debug = process.env.CGPRO_DEBUG === "1";
@@ -4626,8 +4673,12 @@ export async function readLatestAssistantText(page: Page): Promise<string> {
   log(`bubble=${bubble ? "found" : "null"}`);
   if (!bubble) return "";
   // Try several text containers, in priority order.
+  // P-035 2026-09-28 (vendor r40): the live assistant unit renders its answer in
+  // a `[class*="markdown"]` block rather than a `div.markdown`, so that class
+  // match is added right after `div.markdown`, ahead of the older fallbacks.
   const containers = [
     "div.markdown",
+    MARKDOWN_ANY_SELECTOR,
     "[data-message-content]",
     ".prose",
     ":scope", // bubble itself
@@ -4638,13 +4689,15 @@ export async function readLatestAssistantText(page: Page): Promise<string> {
       const cnt = sel === ":scope" ? 1 : await bubble.locator(sel).count();
       log(`${sel}: count=${cnt}`);
       if (cnt === 0) continue;
-      const text = (await loc.innerText({ timeout: 1_500 }).catch((e) => {
-        log(`${sel}: innerText threw: ${(e as Error).message.slice(0, 60)}`);
-        return "";
-      })) ?? "";
+      const text = sel === MARKDOWN_ANY_SELECTOR
+        ? await joinMarkdownBlockText(bubble, cnt)
+        : (await loc.innerText({ timeout: 1_500 }).catch((e) => {
+          log(`${sel}: innerText threw: ${(e as Error).message.slice(0, 60)}`);
+          return "";
+        })) ?? "";
       log(`${sel}: text.length=${text.length} preview=${JSON.stringify(text.slice(0, 60))}`);
       if (text.trim().length === 0) continue;
-      const cleaned = text.replace(/^Thought for \d+s\s*\n+/i, "").trim();
+      const cleaned = text.replace(LEADING_PROGRESS_LINE_RE, "").trim();
       if (cleaned.length > 0) return cleaned;
     } catch (e) {
       log(`${sel}: outer throw: ${(e as Error).message.slice(0, 60)}`);
@@ -4659,7 +4712,7 @@ export async function readLatestAssistantText(page: Page): Promise<string> {
       return "";
     });
   log(`fallback result.length=${txt.length}`);
-  return txt.replace(/^Thought for \d+s\s*\n+/i, "").trim();
+  return txt.replace(LEADING_PROGRESS_LINE_RE, "").trim();
 }
 
 /**
