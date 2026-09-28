@@ -57,6 +57,7 @@ import {
   NotLoggedInError,
   PreflightDraftProtectedError,
   PreSubmitInteractionError,
+  ProUsageLimitAfterSubmitError,
 } from "../errors.js";
 import { SELECTORS, TURN_CRITICAL_SELECTORS, type SelectorSet } from "../browser/selectors.js";
 import {
@@ -1750,7 +1751,21 @@ export async function handleAsk(
               ...(err.availableAfter !== undefined ? { availableAfter: err.availableAfter } : {}),
               ...(err.limitText !== undefined ? { limitText: err.limitText } : {}),
             }
-          : { message: (err as Error).message });
+          // P-035 G3 r37. The limit ChatGPT reveals only AFTER submission gets
+          // the same two facts on the wire, from the daemon's own error event.
+          // It is deliberately not a `PreSubmitInteractionError`: the prompt was
+          // submitted, so `promptSubmitted` is true and the closed pre-submit
+          // code list is untouched. Unlike the pre-submit branch both fields are
+          // always present, null when the alert named no parsable reset.
+          : err instanceof ProUsageLimitAfterSubmitError
+            ? {
+                message: err.message,
+                code: err.code,
+                promptSubmitted: err.promptSubmitted,
+                availableAfter: err.availableAfter,
+                limitText: err.limitText,
+              }
+            : { message: (err as Error).message });
         res.end();
       }
     } finally {

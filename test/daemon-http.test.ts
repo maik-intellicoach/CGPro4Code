@@ -42,7 +42,13 @@ const {
 import type { ServerState } from "../src/daemon/server.js";
 import type { Session } from "../src/browser/session.js";
 import { StreamEmitter } from "../src/core/stream.js";
-import { PreSubmitInteractionError, SelectorBrokenError, NotLoggedInError } from "../src/errors.js";
+import {
+  classifyInteractionFailure,
+  NotLoggedInError,
+  PreSubmitInteractionError,
+  ProUsageLimitAfterSubmitError,
+  SelectorBrokenError,
+} from "../src/errors.js";
 
 function fakeState(overrides: Partial<ServerState> = {}): ServerState {
   return {
@@ -1358,6 +1364,55 @@ it("carries the Pro usage limit fields on the daemon error event", async () => {
   expect(sse).toContain('"promptSubmitted":false');
   expect(sse).toContain('"availableAfter":"2026-09-30T00:00:00+08:00"');
   expect(sse).toContain('"limitText":"Limit reached. Try again after Sep 30, 2026."');
+});
+
+// P-035 G3 r37. The limit ChatGPT reveals only AFTER submission reaches the
+// wire the same way: code plus both facts, on the daemon's own error event,
+// and it stays OUT of the pre-submit classification (the prompt was submitted).
+it("carries the post-submit Pro usage limit fields on the daemon error event", async () => {
+  const page = {
+    isClosed: () => false,
+    url: () => "https://chatgpt.com/",
+    screenshot: vi.fn(async () => {}),
+    evaluate: vi.fn(async () => "url=\"https://chatgpt.com/\" viewport=1512x944 overlay=0"),
+    keyboard: { press: vi.fn(async () => {}) },
+    locator: () => ({ count: () => 0, first: () => ({ isVisible: () => false }) }),
+  };
+  const state = fakeState({ session: { page } as unknown as Session });
+  slotsOf(state)[0].page = page as unknown as import("patchright").Page;
+
+  // A terminal event ends the async iteration; the rejection then takes the
+  // daemon's own error-event path under test.
+  const emitter = new StreamEmitter();
+  emitter.push({ type: "error", message: "pro usage limit after submit" });
+  const limitText = "You've reached your limit. Try again after Sep 30, 2026.";
+  const limited = new ProUsageLimitAfterSubmitError({
+    availableAfter: "2026-09-30T00:00:00+08:00",
+    limitText,
+  });
+  const result = Promise.resolve().then(() => {
+    throw limited;
+  });
+  result.catch(() => undefined);
+  runAskOnSession.mockReturnValue({ events: emitter, result, cancel: async () => {} });
+
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST" });
+  const pending = handleAsk(req, res as unknown as ServerResponse, state);
+  sendBody(req, { prompt: "hi" });
+  await pending;
+
+  const sse = (res as unknown as FakeRes).writes.join("");
+  expect(sse).toContain("event: error");
+  expect(sse).toContain('"code":"pro_usage_limit_after_submit"');
+  expect(sse).toContain('"promptSubmitted":true');
+  expect(sse).toContain('"availableAfter":"2026-09-30T00:00:00+08:00"');
+  expect(sse).toContain(JSON.stringify(limitText));
+  // The pre-submit classification is left alone: it is not a PreSubmit code,
+  // so the daemon's interaction status is never marked degraded by it.
+  expect(classifyInteractionFailure(limited)).toEqual({ code: "unclassified_error" });
+  expect(state.interaction.state).not.toBe("degraded");
 });
 
 // P-035 2026-09-28 r35. The preflight 409 is built from a CLASSIFIED failure,

@@ -3,7 +3,7 @@ import { SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
 import { listProjects } from "../api/projects.js";
 import { fetchModelsWithReason, findProModel, type ChatgptModel } from "../api/models.js";
-import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, SelectorBrokenError, TurnTimeoutError } from "../errors.js";
+import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, SelectorBrokenError, TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation } from "../core/stream.js";
 
 /**
@@ -4116,47 +4116,88 @@ export function currentConversationId(page: Page): string | null {
  * state are indistinguishable from outside. One bounded diagnostic line per
  * minute makes the next turn readable without another paid probe.
  *
- * Observation only: it never admits, refuses, navigates, reloads, cancels or
- * extends the wait, and every page read is swallowed on failure, so a page
- * that cannot answer any of these questions leaves the pre-existing behaviour
- * exactly as it was. It never prints page text, an attribute value, a
- * conversation id or a URL -- only counts and yes/no flags.
+ * Still observation only where the page is concerned: it never admits, refuses,
+ * navigates, reloads, cancels or extends the wait, and every read the page
+ * cannot answer is swallowed, so such a page leaves the pre-existing behaviour
+ * exactly as it was. The printed line never carries page text, an attribute
+ * value, a conversation id or a URL -- only counts and yes/no flags. G3 r37
+ * added one refusal built ON these observations (the post-submit Pro limit,
+ * below); the alert text travels only on that typed error.
  */
 const TURN_HEARTBEAT_INTERVAL_MS = 60_000;
 const TURN_ALERT_SELECTOR = '[role="alert"], [role="status"], [data-testid*="toast"]';
 const TURN_ERROR_HINT_RE = /something went wrong|error|network|try again|regenerate/i;
 const TURN_LIMIT_HINT_RE = /limit|usage|reached|upgrade|try again after/i;
+/**
+ * P-035 G3 r37 (2026-09-28). The limit spells itself in its own words, and the
+ * loose hint above is far too wide to act on: `usage` alone matches a healthy
+ * "4% usage remaining" counter. These are the phrases the limit screen actually
+ * uses, and `parseProAvailableAfter` covers the explicit reset date.
+ */
+const TURN_LIMIT_EXACT_RE = /limit reached|reached your limit|usage limit/i;
+/**
+ * Consecutive heartbeat observations of the limit before the wait stops. One is
+ * not enough: the alert may be a stale toast from the previous turn, and the
+ * whole point of the early exit is to be right about a paid lane.
+ */
+const TURN_LIMIT_CONSECUTIVE_OBSERVATIONS = 2;
 
 /**
- * Visible alert/status/toast elements on the page, plus their concatenated
- * text. The text stays local: only the visible count and two hint booleans
- * derived from it ever leave this function. Hidden matches are skipped for
- * both the count and the text, so the count and the hints describe the same
- * set of elements.
+ * Visible alert/status/toast elements on the page, plus their individual texts.
+ * The texts stay local: only the visible count and two hint booleans derived
+ * from them ever leave this function unless the limit is proven. Hidden matches
+ * are skipped for both the count and the texts, so the count and the hints
+ * describe the same set of elements.
  */
-async function readTurnAlerts(page: Page): Promise<{ count: number; text: string }> {
+async function readTurnAlerts(page: Page): Promise<{ count: number; texts: string[] }> {
   const alerts = page.locator(TURN_ALERT_SELECTOR);
   const total = await alerts.count();
-  let visible = 0;
-  let text = "";
+  const texts: string[] = [];
   for (let i = 0; i < total; i++) {
     const el = alerts.nth(i);
     if (!(await el.isVisible())) continue;
-    visible++;
-    text += `${(await el.innerText().catch(() => "")) ?? ""}\n`;
+    texts.push((await el.innerText().catch(() => "")) ?? "");
   }
-  return { count: visible, text };
+  return { count: texts.length, texts };
 }
 
 /**
- * Build the single diagnostic line from counts and flags only. Any read that a
- * page cannot answer propagates to the caller, which owns the try/catch.
+ * The trimmed alert text that named the Pro limit, or null when none did. The
+ * text is returned whole so the reset date is parsed from what the page really
+ * said; callers cap it for the error.
  */
-async function readTurnHeartbeatLine(
+function matchTurnLimitAlert(texts: string[]): string | null {
+  for (const text of texts) {
+    const trimmed = text.trim();
+    if (!trimmed) continue;
+    if (parseProAvailableAfter(trimmed) !== null || TURN_LIMIT_EXACT_RE.test(trimmed)) {
+      return trimmed;
+    }
+  }
+  return null;
+}
+
+/** The post-submit Pro limit, proven by two consecutive heartbeat observations. */
+interface TurnLimitAfterSubmit {
+  availableAfter: string | null;
+  limitText: string;
+}
+
+/**
+ * One heartbeat observation: the diagnostic line to print, plus the post-submit
+ * Pro limit when THIS observation proved it. Any read that a page cannot answer
+ * propagates to the caller, which owns the try/catch.
+ *
+ * The limit only counts when no assistant turn for this submission has appeared
+ * at all -- the assistant count has not moved, no bubble text exists and nothing
+ * is working. A matching alert beside a live or finished turn is left to the
+ * pre-existing completion path.
+ */
+async function readTurnHeartbeat(
   page: Page,
   elapsedMs: number,
   priorAssistantCount: number,
-): Promise<string> {
+): Promise<{ line: string; limit: TurnLimitAfterSubmit | null }> {
   const count = await page.locator(SELECTORS.assistantMessages.join(", ")).count();
   const stop = (await firstResolved(page, SELECTORS.stopButton)) !== null;
   const bubble = await latestAssistantBubble(page);
@@ -4170,43 +4211,74 @@ async function readTurnHeartbeatLine(
   const conversation = currentConversationId(page) !== null;
   // Hints come from the alert/status/toast text and the latest assistant
   // bubble only, and leave this function as booleans.
-  const haystack = `${alerts.text}\n${bubbleText}`;
+  const alertText = alerts.texts.join("\n");
+  const haystack = `${alertText}\n${bubbleText}`;
+  const working = stop || streaming === "true";
+  const limitMatch = matchTurnLimitAlert(alerts.texts);
+  const noAssistantTurn = count <= priorAssistantCount && bubbleText.trim().length === 0 && !working;
   const yesNo = (value: boolean): string => (value ? "yes" : "no");
-  return [
-    "[cgpro:turn]",
-    `t=${Math.floor(elapsedMs / 1_000)}`,
-    `assistant=${count}/${priorAssistantCount}`,
-    `working=${yesNo(stop || streaming === "true")}`,
-    `stop=${yesNo(stop)}`,
-    `bubble_len=${count > priorAssistantCount ? bubbleText.trim().length : 0}`,
-    `conv=${yesNo(conversation)}`,
-    `composer=${yesNo(composer)}`,
-    `alerts=${alerts.count}`,
-    `error_hint=${yesNo(TURN_ERROR_HINT_RE.test(haystack))}`,
-    `limit_hint=${yesNo(TURN_LIMIT_HINT_RE.test(haystack))}`,
-  ].join(" ");
+  return {
+    line: [
+      "[cgpro:turn]",
+      `t=${Math.floor(elapsedMs / 1_000)}`,
+      `assistant=${count}/${priorAssistantCount}`,
+      `working=${yesNo(working)}`,
+      `stop=${yesNo(stop)}`,
+      `bubble_len=${count > priorAssistantCount ? bubbleText.trim().length : 0}`,
+      `conv=${yesNo(conversation)}`,
+      `composer=${yesNo(composer)}`,
+      `alerts=${alerts.count}`,
+      `error_hint=${yesNo(TURN_ERROR_HINT_RE.test(haystack))}`,
+      `limit_hint=${yesNo(TURN_LIMIT_HINT_RE.test(haystack))}`,
+      `limit_exact=${yesNo(limitMatch !== null)}`,
+    ].join(" "),
+    limit: noAssistantTurn && limitMatch !== null
+      ? {
+          availableAfter: parseProAvailableAfter(limitMatch),
+          limitText: limitMatch.slice(0, PRO_LIMIT_TEXT_MAX),
+        }
+      : null,
+  };
 }
 
 /**
  * At most one heartbeat line per 60 s of the wait, the first one 60 s after
- * entry. Errors are swallowed here so the heartbeat can never change the turn.
+ * entry. Errors are swallowed here so the heartbeat can never change the turn,
+ * and a read that failed is never counted as an observation of the limit.
+ *
+ * The heartbeat records the limit once rule 1's condition holds for two
+ * consecutive observations; `waitTurnComplete` owns the throw, so this stays a
+ * diagnostic that cannot itself change the turn.
  */
-function turnHeartbeat(page: Page, priorAssistantCount: number): () => Promise<void> {
+function turnHeartbeat(
+  page: Page,
+  priorAssistantCount: number,
+): { tick: () => Promise<void>; limitAfterSubmit: () => TurnLimitAfterSubmit | null } {
   const startedAt = Date.now();
   let lastEmittedAt: number | null = null;
-  return async (): Promise<void> => {
+  let consecutiveObservations = 0;
+  let confirmed: TurnLimitAfterSubmit | null = null;
+  const tick = async (): Promise<void> => {
     try {
       const now = Date.now();
       const elapsed = now - startedAt;
       if (elapsed < TURN_HEARTBEAT_INTERVAL_MS) return;
       if (lastEmittedAt !== null && now - lastEmittedAt < TURN_HEARTBEAT_INTERVAL_MS) return;
       lastEmittedAt = now;
-      console.error(await readTurnHeartbeatLine(page, elapsed, priorAssistantCount));
+      const read = await readTurnHeartbeat(page, elapsed, priorAssistantCount);
+      console.error(read.line);
+      consecutiveObservations = read.limit === null ? 0 : consecutiveObservations + 1;
+      if (read.limit !== null && consecutiveObservations >= TURN_LIMIT_CONSECUTIVE_OBSERVATIONS) {
+        confirmed = read.limit;
+      }
     } catch {
       // Diagnostic only: a page that cannot answer the heartbeat's reads must
-      // not change the wait it observes.
+      // not change the wait it observes, and an unreadable heartbeat is not an
+      // observation of the limit either.
+      consecutiveObservations = 0;
     }
   };
+  return { tick, limitAfterSubmit: () => confirmed };
 }
 
 /**
@@ -4219,6 +4291,12 @@ function turnHeartbeat(page: Page, priorAssistantCount: number): () => Promise<v
  * Text-stability is the bulletproof completion signal — it doesn't
  * depend on chatgpt.com's ever-shifting action-bar / data-attribute
  * selectors.
+ *
+ * P-035 G3 r37 (2026-09-28). A third way out: the Pro usage limit that ChatGPT
+ * reveals only after the prompt was submitted. Two consecutive heartbeats that
+ * see a limit alert while no assistant turn exists end the wait with
+ * `ProUsageLimitAfterSubmitError` instead of holding the full timeout. Every
+ * other stall still waits the configured timeout, unchanged.
  */
 export async function waitTurnComplete(
   page: Page,
@@ -4246,10 +4324,17 @@ export async function waitTurnComplete(
 
   for (;;) {
     if (control.cancelled?.()) return;
-    await heartbeat();
+    await heartbeat.tick();
     await control.pollEvidence?.(Date.now() >= deadline);
     if (control.cancelled?.()) return;
     if (control.externalComplete?.()) return;
+    // Checked after cancel and external completion, so a genuine completion
+    // always wins, and before the timeout/reload branch, so the proven limit
+    // fails fast instead of waiting out the deadline.
+    const postSubmitLimit = heartbeat.limitAfterSubmit();
+    if (postSubmitLimit !== null) {
+      throw new ProUsageLimitAfterSubmitError(postSubmitLimit);
+    }
     const requestedConversation = control.consumeReload?.() ?? null;
     const expired = Date.now() >= deadline;
     if (requestedConversation || expired) {

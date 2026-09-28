@@ -132,6 +132,42 @@ export class PreSubmitInteractionError extends Error {
 
 
 /**
+ * P-035 G3 r37 (2026-09-28). The Pro usage limit ChatGPT reveals only AFTER
+ * the prompt was submitted.
+ *
+ * Live ms1980 (vendor f118295, acceptance 80f0899c): the pre-submit model-menu
+ * check passed, the prompt was submitted, and then no assistant turn ever
+ * started -- `assistant=0/0 ... alerts=7 limit_hint=yes` for 45+ minutes while
+ * the waiter held its full 2 h budget. The limit sentence is only put on the
+ * page once the turn has been accepted, so a pre-submit check cannot see it.
+ *
+ * This is deliberately NOT a `PreSubmitInteractionError`: the prompt WAS
+ * submitted, so `promptSubmitted` is true, and the closed pre-submit code list
+ * is left alone. It carries the same two facts the pre-submit refusal carries
+ * -- when Pro returns and the capped alert text it read -- because the caller
+ * must wait on the reset rather than re-route a submitted prompt.
+ */
+export class ProUsageLimitAfterSubmitError extends Error {
+  readonly code = "pro_usage_limit_after_submit";
+  readonly promptSubmitted = true;
+  /** ISO 8601 local instant Pro becomes available, or null when not parsed. */
+  readonly availableAfter: string | null;
+  /** The capped alert text that named the limit. */
+  readonly limitText: string | null;
+
+  constructor(limit: { availableAfter: string | null; limitText: string | null }) {
+    super(
+      limit.limitText
+        ? `ChatGPT Pro usage limit reached after submission: ${limit.limitText}`
+        : "ChatGPT Pro usage limit reached after submission",
+    );
+    this.name = "ProUsageLimitAfterSubmitError";
+    this.availableAfter = limit.availableAfter;
+    this.limitText = limit.limitText;
+  }
+}
+
+/**
  * Content-free refusal: the page must be left exactly as found.
  *
  * P-035 2026-09-27. The guard admits or refuses through a single boolean, so a
