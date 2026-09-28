@@ -170,6 +170,47 @@ describe("extractLatestTurnConnectorState", () => {
       currentIsThinkingPreamble: true,
     });
   });
+
+  // P-035 G3 r44. The 2026-09 markup dropped the bubble's model attribute, so
+  // the conversation record's own metadata is the only surviving model identity.
+  it("prefers the resolved model slug over the requested one", () => {
+    const state = (metadata: Record<string, unknown>) =>
+      extractLatestTurnConnectorState({
+        current_node: "assistant",
+        mapping: { assistant: { parent: null, message: { author: { role: "assistant" }, metadata } } },
+      }).currentModelSlug;
+
+    expect(state({ model_slug: "gpt-5-thinking", resolved_model_slug: "gpt-6-pro" })).toBe("gpt-6-pro");
+    expect(state({ model_slug: "gpt-5-thinking" })).toBe("gpt-5-thinking");
+    expect(state({ resolved_model_slug: 42, model_slug: "gpt-5-thinking" })).toBe("gpt-5-thinking");
+    expect(state({})).toBeNull();
+    expect(state({ model_slug: null })).toBeNull();
+  });
+
+  it("joins the string content parts as the record's stored reply text", () => {
+    const state = (content: unknown) =>
+      extractLatestTurnConnectorState({
+        current_node: "assistant",
+        mapping: { assistant: { parent: null, message: { author: { role: "assistant" }, content } } },
+      }).currentText;
+
+    expect(state({ content_type: "text", parts: ["/tmp/path.md", "> quote", "OK"] })).toBe("/tmp/path.md\n> quote\nOK");
+    // Non-string parts are dropped, not stringified into the reply.
+    expect(state({ content_type: "text", parts: ["path", { asset_pointer: "file-service://x" }, "OK"] })).toBe("path\nOK");
+    expect(state({ content_type: "text" })).toBe("");
+  });
+
+  it("reports no stored reply text for non-text content", () => {
+    const state = (content: unknown) =>
+      extractLatestTurnConnectorState({
+        current_node: "assistant",
+        mapping: { assistant: { parent: null, message: { author: { role: "assistant" }, content } } },
+      }).currentText;
+
+    expect(state({ content_type: "multimodal_text", parts: ["a", "b"] })).toBeNull();
+    expect(state({ parts: ["a", "b"] })).toBeNull();
+    expect(state(undefined)).toBeNull();
+  });
 });
 
 describe("exact connector picker matching", () => {

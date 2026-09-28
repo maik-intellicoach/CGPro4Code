@@ -686,6 +686,90 @@ describe("runAskOnSession connector contract", () => {
     });
     expect(events).not.toContainEqual(expect.objectContaining({ type: "tool", name: "prompt-submitted" }));
   });
+
+  // P-035 G3 r44. Live 2026-09-28: the acceptance turn completed but the
+  // facade got only the 62-char file path and a null model, because the DOM
+  // bubble lost both. The conversation record's own message holds them.
+  const BACKEND_REPLY = "/tmp/path.md\n> quote\nOK";
+  function finishedBackendMessage(overrides: Record<string, unknown> = {}) {
+    return {
+      currentUserNodeId: "new-user",
+      calls: [],
+      currentRole: "assistant",
+      currentStatus: "finished_successfully",
+      currentEndTurn: true,
+      currentContentType: "text",
+      currentIsThinkingPreamble: false,
+      currentModelSlug: "gpt-6-pro",
+      currentText: BACKEND_REPLY,
+      ...overrides,
+    };
+  }
+
+  it("takes a finished connector turn's reply and model from the conversation record", async () => {
+    waitTurnComplete.mockResolvedValueOnce(undefined);
+    currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
+    latestAssistantModelSlug.mockResolvedValue(null);
+    readLatestAssistantText.mockResolvedValue("/tmp/path.md");
+    fetchLatestTurnConnectorState.mockResolvedValue(finishedBackendMessage());
+
+    const runner = runAskOnSession(
+      { prompt: "accept", model: "gpt-6-pro", connector: "p035-low-risk-workstation", timeoutSec: 1_200, headless: false },
+      session(),
+    );
+    const events = await collect(runner.events);
+    await expect(runner.result).resolves.toMatchObject({ finalText: BACKEND_REPLY });
+    expect(events).toContainEqual({ type: "done", finalText: BACKEND_REPLY });
+    expect(events.some((event) => event.type === "tool" && event.name === "model-mismatch")).toBe(false);
+  });
+
+  it("keeps today's DOM path when the connector record's reply is unfinished", async () => {
+    waitTurnComplete.mockResolvedValueOnce(undefined);
+    currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
+    latestAssistantModelSlug.mockResolvedValue(null);
+    readLatestAssistantText.mockResolvedValue("/tmp/path.md");
+    fetchLatestTurnConnectorState.mockResolvedValue(
+      finishedBackendMessage({ currentStatus: "in_progress", currentEndTurn: false }),
+    );
+
+    const runner = runAskOnSession(
+      { prompt: "accept", model: "gpt-6-pro", connector: "p035-low-risk-workstation", timeoutSec: 1_200, headless: false },
+      session(),
+    );
+    const events = await collect(runner.events);
+    await expect(runner.result).resolves.toMatchObject({ finalText: "/tmp/path.md" });
+    expect(events).toContainEqual({ type: "done", finalText: "/tmp/path.md" });
+    // No DOM slug and no finished record -> the r43 mismatch still fires.
+    expect(events).toContainEqual({ type: "tool", name: "model-mismatch", meta: { wanted: "gpt-6-pro", got: null } });
+  });
+
+  it("records the final-text source in one content-free stderr line", async () => {
+    waitTurnComplete.mockResolvedValueOnce(undefined);
+    currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
+    latestAssistantModelSlug.mockResolvedValue(null);
+    readLatestAssistantText.mockResolvedValue("/tmp/path.md");
+    fetchLatestTurnConnectorState.mockResolvedValue(finishedBackendMessage());
+
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      lines.push(args.map((arg) => String(arg)).join(" "));
+    });
+    try {
+      const runner = runAskOnSession(
+        { prompt: "accept", model: "gpt-6-pro", connector: "p035-low-risk-workstation", timeoutSec: 1_200, headless: false },
+        session(),
+      );
+      await collect(runner.events);
+      await runner.result;
+    } finally {
+      spy.mockRestore();
+    }
+
+    const line = lines.find((entry) => entry.startsWith("[cgpro:final] "));
+    expect(line).toBe(`[cgpro:final] source=backend len=${BACKEND_REPLY.length} model=gpt-6-pro`);
+    expect(line).not.toContain("quote");
+    expect(line).not.toContain("/tmp/path.md");
+  });
 });
 
 describe("runAskOnSession wait failure propagation", () => {

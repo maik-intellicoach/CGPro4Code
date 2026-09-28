@@ -509,17 +509,27 @@ function runAskInner(
         await connectorEvidencePollInFlight;
       };
 
+      // The conversation record's latest assistant message is the turn's own
+      // stored reply. A finished, non-preamble text message is both the
+      // completion proof and (r44) the authority for the reply text and the
+      // model slug the DOM markup no longer carries.
+      const finishedConnectorMessage = (): LatestTurnConnectorState | null => {
+        const state = connectorSnapshot;
+        if (!state) return null;
+        return state.currentRole === "assistant" &&
+          state.currentStatus === "finished_successfully" &&
+          state.currentEndTurn === true &&
+          state.currentContentType === "text" &&
+          !state.currentIsThinkingPreamble
+          ? state
+          : null;
+      };
+
       const confirmConnectorCompletion = async (): Promise<boolean> => {
         if (opts.connector === undefined || cancelled) return true;
         // Tools and DOM-completion candidates share one bounded GET and backoff.
         await pollConnectorEvidence();
-        const state = connectorSnapshot;
-        connectorCompletionConfirmed = state !== null &&
-          state.currentRole === "assistant" &&
-          state.currentStatus === "finished_successfully" &&
-          state.currentEndTurn === true &&
-          state.currentContentType === "text" &&
-          !state.currentIsThinkingPreamble;
+        connectorCompletionConfirmed = finishedConnectorMessage() !== null;
         return connectorCompletionConfirmed;
       };
 
@@ -644,9 +654,6 @@ function runAskInner(
           conversationId = startedEv.conversationId;
         }
       }
-      const actualModel = nativeState.report ? nativeState.report.model : await latestAssistantModelSlug(page);
-      log(`actualModel=${actualModel ?? "(unknown)"} conv=${conversationId ?? "(none)"}`);
-
       if (opts.connector !== undefined && conversationId) {
         try { await pollConnectorEvidence(true); }
         catch (error) {
@@ -657,6 +664,16 @@ function runAskInner(
           throw error;
         }
       }
+
+      // The forced read above has just refreshed the conversation record, so the
+      // finished connector message is now the fallback identity for the model.
+      // The DOM slug is tried first; when the markup dropped
+      // `data-message-model-slug`, the record's own slug answers instead.
+      const finishedMessage = finishedConnectorMessage();
+      const actualModel = nativeState.report
+        ? nativeState.report.model
+        : (await latestAssistantModelSlug(page)) ?? finishedMessage?.currentModelSlug ?? null;
+      log(`actualModel=${actualModel ?? "(unknown)"} conv=${conversationId ?? "(none)"}`);
 
       // Native research uses a separate app engine. Maik approved the verified
       // maximum UI setting as its acceptance basis (2026-09-09); retain the
@@ -681,17 +698,33 @@ function runAskInner(
         emitter.push({ type: "tool", name: "native-research-report", meta: { model: nativeState.report.model, source: "widget_state", selectionBasis: "verified-ui-maximum", uiModel: "gpt-6-pro" } });
       }
 
+      // r44. A finished connector turn's reply is ChatGPT's own stored message,
+      // which is complete where the DOM bubble is not (the r43 acceptance turn
+      // returned only the 62-char file path while the quote and "OK" sat outside
+      // every markdown block). Prefer it over the DOM scrape; every other turn
+      // keeps today's DOM path untouched.
+      const backendReply = opts.connector !== undefined && finishedMessage?.currentText
+        ? finishedMessage.currentText
+        : null;
+      const preferredText = backendReply ?? domText;
+
       if (!emitter.isFinished()) {
-        emitter.push({ type: "done", finalText: domText });
+        emitter.push({ type: "done", finalText: preferredText });
       }
 
       const finalEvent = collected
         .slice()
         .reverse()
         .find((e) => e.type === "done") as { finalText?: string } | undefined;
-      const finalText = nativeState.report?.text ?? ((finalEvent?.finalText && finalEvent.finalText.length > 0)
+      const finalText = backendReply ?? nativeState.report?.text ?? ((finalEvent?.finalText && finalEvent.finalText.length > 0)
         ? finalEvent.finalText
         : domText);
+
+      if (opts.connector !== undefined) {
+        // Content-free provenance: which reading produced the reply the facade
+        // will deliver, how long it is, and the model it was attributed to.
+        console.error(`[cgpro:final] source=${backendReply !== null ? "backend" : "dom"} len=${finalText.length} model=${actualModel ?? "unknown"}`);
+      }
 
       const filing = conversationId && opts.gizmoId && opts.expectedAccountEmail
         ? await verifyFiling(page, conversationId, opts.gizmoId, opts.expectedAccountEmail)

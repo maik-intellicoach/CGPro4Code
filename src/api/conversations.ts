@@ -47,6 +47,22 @@ export interface LatestTurnConnectorState {
   currentEndTurn: boolean | null;
   currentContentType: string | null;
   currentIsThinkingPreamble: boolean;
+  /**
+   * The model that produced the current assistant message, from the
+   * conversation record. The r39 probe found chatgpt.com's 2026-09 markup no
+   * longer exposes `data-message-model-slug` on the bubble, so the record is
+   * the only place this identity survives. Resolved slug wins over the
+   * requested slug; absent metadata is null.
+   */
+  currentModelSlug: string | null;
+  /**
+   * The current assistant message's stored reply text when its content is
+   * text, with the string parts joined by newlines. The DOM bubble can hold
+   * only a fragment of the reply (a file path) with the rest outside markdown
+   * containers, so this is the authoritative full reply. Null for non-text
+   * content (a thinking preamble, a widget, etc.).
+   */
+  currentText: string | null;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -109,6 +125,8 @@ export function extractLatestTurnConnectorState(
   const currentAuthor = asObject(currentMessage?.author);
   const currentContent = asObject(currentMessage?.content);
   const currentMetadata = asObject(currentMessage?.metadata);
+  const currentContentType = typeof currentContent?.content_type === "string" ? currentContent.content_type : null;
+  const currentParts = currentContent?.parts;
   let userNodeId = currentNodeId;
   const seen = new Set<string>();
   while (mapping && userNodeId && !seen.has(userNodeId)) {
@@ -124,8 +142,18 @@ export function extractLatestTurnConnectorState(
     currentRole: typeof currentAuthor?.role === "string" ? currentAuthor.role : null,
     currentStatus: typeof currentMessage?.status === "string" ? currentMessage.status : null,
     currentEndTurn: typeof currentMessage?.end_turn === "boolean" ? currentMessage.end_turn : null,
-    currentContentType: typeof currentContent?.content_type === "string" ? currentContent.content_type : null,
+    currentContentType,
     currentIsThinkingPreamble: currentMetadata?.is_thinking_preamble_message === true,
+    currentModelSlug: typeof currentMetadata?.resolved_model_slug === "string"
+      ? currentMetadata.resolved_model_slug
+      : typeof currentMetadata?.model_slug === "string"
+        ? currentMetadata.model_slug
+        : null,
+    currentText: currentContentType === "text"
+      ? (Array.isArray(currentParts)
+          ? currentParts.filter((part): part is string => typeof part === "string").join("\n")
+          : "")
+      : null,
   };
 }
 
