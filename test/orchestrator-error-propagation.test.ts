@@ -689,6 +689,35 @@ describe("runAskOnSession connector contract", () => {
 });
 
 describe("runAskOnSession wait failure propagation", () => {
+  it("forwards the pre-submit anyMessages count captured by sendPrompt into the wait", async () => {
+    sendPrompt.mockImplementationOnce(
+      async (_page, _prompt, _preserve, _cancelled, guard, _connector, submitCounts) => {
+        await guard?.();
+        // The real sendPrompt fills this slot next to priorAssistantCount.
+        if (submitCounts) submitCounts.priorAnyMessages = 4;
+        return 0;
+      },
+    );
+    waitTurnComplete.mockResolvedValueOnce(undefined);
+    const activeSession = session();
+    const runner = runAskOnSession(
+      { prompt: "test", timeoutSec: 1_200, headless: false },
+      activeSession,
+    );
+    const events = await collect(runner.events);
+    await runner.result;
+
+    expect(events).toContainEqual({ type: "tool", name: "prompt-submitted", meta: {} });
+    expect(waitTurnComplete).toHaveBeenCalledWith(
+      activeSession.page,
+      1_200_000,
+      0,
+      undefined,
+      expect.objectContaining({ consumeReload: undefined }),
+      4,
+    );
+  });
+
   it("keeps the 588-second browser closure distinct from a configured 1200-second timeout", async () => {
     const closed = new Error("Target page, context or browser has been closed");
     waitTurnComplete.mockRejectedValueOnce(closed);
@@ -709,6 +738,9 @@ describe("runAskOnSession wait failure propagation", () => {
       0,
       undefined,
       expect.objectContaining({ consumeReload: undefined }),
+      // P-035 G3 r38. The mock `sendPrompt` never fills the pre-submit
+      // anyMessages slot, so the turn passes unknown and rule 2 stays off.
+      null,
     );
   });
 

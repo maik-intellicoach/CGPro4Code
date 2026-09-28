@@ -48,6 +48,7 @@ import {
   PreSubmitInteractionError,
   ProUsageLimitAfterSubmitError,
   SelectorBrokenError,
+  SubmittedTurnNotRenderedError,
 } from "../src/errors.js";
 
 function fakeState(overrides: Partial<ServerState> = {}): ServerState {
@@ -1412,6 +1413,55 @@ it("carries the post-submit Pro usage limit fields on the daemon error event", a
   // The pre-submit classification is left alone: it is not a PreSubmit code,
   // so the daemon's interaction status is never marked degraded by it.
   expect(classifyInteractionFailure(limited)).toEqual({ code: "unclassified_error" });
+  expect(state.interaction.state).not.toBe("degraded");
+});
+
+// P-035 G3 r38. The submitted turn that never rendered reaches the wire with its
+// closed code and `promptSubmitted: true` only -- the content-free facts live in
+// its message -- and it too stays OUT of the pre-submit classification.
+it("carries the submitted-turn-not-rendered code and promptSubmitted on the daemon error event", async () => {
+  const page = {
+    isClosed: () => false,
+    url: () => "https://chatgpt.com/",
+    screenshot: vi.fn(async () => {}),
+    evaluate: vi.fn(async () => "url=\"https://chatgpt.com/\" viewport=1512x944 overlay=0"),
+    keyboard: { press: vi.fn(async () => {}) },
+    locator: () => ({ count: () => 0, first: () => ({ isVisible: () => false }) }),
+  };
+  const state = fakeState({ session: { page } as unknown as Session });
+  slotsOf(state)[0].page = page as unknown as import("patchright").Page;
+
+  const emitter = new StreamEmitter();
+  emitter.push({ type: "error", message: "submitted turn not rendered" });
+  const notRendered = new SubmittedTurnNotRenderedError({
+    elapsedSeconds: 180,
+    msgs: 0,
+    priorMsgs: 0,
+    alertCount: 8,
+    alertShapes: "len:18:usage+remaining",
+  });
+  const result = Promise.resolve().then(() => {
+    throw notRendered;
+  });
+  result.catch(() => undefined);
+  runAskOnSession.mockReturnValue({ events: emitter, result, cancel: async () => {} });
+
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST" });
+  const pending = handleAsk(req, res as unknown as ServerResponse, state);
+  sendBody(req, { prompt: "hi" });
+  await pending;
+
+  const sse = (res as unknown as FakeRes).writes.join("");
+  expect(sse).toContain("event: error");
+  expect(sse).toContain('"code":"submitted_turn_not_rendered"');
+  expect(sse).toContain('"promptSubmitted":true');
+  // No reset date and no alert text travel on this error; the content-free
+  // message is all it carries.
+  expect(sse).not.toContain('"availableAfter"');
+  expect(sse).not.toContain('"limitText"');
+  expect(classifyInteractionFailure(notRendered)).toEqual({ code: "unclassified_error" });
   expect(state.interaction.state).not.toBe("degraded");
 });
 

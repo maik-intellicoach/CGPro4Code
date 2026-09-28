@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "patchright";
-import { ProUsageLimitAfterSubmitError, TurnTimeoutError } from "../src/errors.js";
+import { ProUsageLimitAfterSubmitError, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../src/errors.js";
+import { SELECTORS } from "../src/browser/selectors.js";
 
 /**
  * P-035 G2 r22. The turn waiter prints at most one content-free status line per
@@ -26,8 +27,8 @@ const LIMIT_ALERT_TEXT = "You've reached your limit";
 const BUBBLE_TEXT = "Hello there";
 
 const HEALTHY_LINE =
-  "[cgpro:turn] t=60 assistant=0/0 working=no stop=no bubble_len=0 " +
-  "conv=yes composer=no alerts=0 error_hint=no limit_hint=no limit_exact=no";
+  "[cgpro:turn] t=60 assistant=0/0 msgs=0/- working=no stop=no bubble_len=0 " +
+  "conv=yes composer=no alerts=0 alert_shapes=- error_hint=no limit_hint=no limit_exact=no";
 
 afterEach(() => {
   firstResolved.mockReset();
@@ -48,6 +49,10 @@ type RunOptions = {
   stopVisible?: boolean;
   /** Capture a non-timeout throw instead of rethrowing it, for assertions. */
   captureFailure?: boolean;
+  /** `SELECTORS.anyMessages` count per read; defaults to `assistantCount`. */
+  anyMessages?: () => number;
+  /** Pre-submit anyMessages count; omitted means unknown (rule 2 disabled). */
+  priorAnyMessages?: number | null;
 };
 
 type RunResult = {
@@ -98,9 +103,16 @@ async function runTurn(options: RunOptions): Promise<RunResult> {
       innerText: async () => alertElements[index]?.text ?? "",
     }),
   };
+  const anyMessagesLocator = {
+    count: async (): Promise<number> => options.anyMessages?.() ?? options.assistantCount(),
+  };
   const page = {
     locator: (selector: string) =>
-      selector.includes('role="alert"') ? alertLocator : assistantLocator,
+      selector === SELECTORS.anyMessages.join(", ")
+        ? anyMessagesLocator
+        : selector.includes('role="alert"')
+          ? alertLocator
+          : assistantLocator,
     waitForTimeout: async (ms: number) => {
       await vi.advanceTimersByTimeAsync(ms);
     },
@@ -112,7 +124,9 @@ async function runTurn(options: RunOptions): Promise<RunResult> {
   let outcome: RunResult["outcome"] = "resolved";
   let failure: unknown;
   try {
-    await waitTurnComplete(page, options.timeoutMs, 0, 100, options.control ?? {});
+    await waitTurnComplete(
+      page, options.timeoutMs, 0, 100, options.control ?? {}, options.priorAnyMessages ?? null,
+    );
   } catch (error) {
     if (error instanceof TurnTimeoutError) outcome = "timeout";
     else {
@@ -162,8 +176,9 @@ describe("waitTurnComplete turn heartbeat", () => {
 
     expect(result.outcome).toBe("timeout");
     expect(result.lines).toEqual([
-      "[cgpro:turn] t=60 assistant=0/0 working=no stop=no bubble_len=0 " +
-        "conv=yes composer=no alerts=1 error_hint=no limit_hint=yes limit_exact=yes",
+      "[cgpro:turn] t=60 assistant=0/0 msgs=0/- working=no stop=no bubble_len=0 " +
+        "conv=yes composer=no alerts=1 alert_shapes=len:25:limit+reached " +
+        "error_hint=no limit_hint=yes limit_exact=yes",
     ]);
     expect(result.lines[0]).not.toContain(LIMIT_ALERT_TEXT);
   });
@@ -218,8 +233,9 @@ describe("waitTurnComplete post-submit Pro usage limit", () => {
   // `error_hint` follows the pre-existing loose regex, which "try again" trips;
   // `limit_exact` is G3's own, narrower match.
   const limitLine = (seconds: number, errorHint: "yes" | "no"): string =>
-    `[cgpro:turn] t=${seconds} assistant=0/0 working=no stop=no bubble_len=0 ` +
-    `conv=yes composer=no alerts=1 error_hint=${errorHint} limit_hint=yes limit_exact=yes`;
+    `[cgpro:turn] t=${seconds} assistant=0/0 msgs=0/- working=no stop=no bubble_len=0 ` +
+    `conv=yes composer=no alerts=1 alert_shapes=len:56:limit+reached+try-again ` +
+    `error_hint=${errorHint} limit_hint=yes limit_exact=yes`;
   const LIMIT_LINE_AT_60 = limitLine(60, "yes");
   const LIMIT_LINE_AT_120 = limitLine(120, "yes");
 
@@ -269,10 +285,12 @@ describe("waitTurnComplete post-submit Pro usage limit", () => {
 
     expect(result.outcome).toBe("resolved");
     expect(result.lines).toEqual([
-      "[cgpro:turn] t=60 assistant=0/0 working=no stop=no bubble_len=0 " +
-        "conv=yes composer=no alerts=1 error_hint=no limit_hint=yes limit_exact=no",
-      "[cgpro:turn] t=120 assistant=0/0 working=no stop=no bubble_len=0 " +
-        "conv=yes composer=no alerts=1 error_hint=no limit_hint=yes limit_exact=no",
+      "[cgpro:turn] t=60 assistant=0/0 msgs=0/- working=no stop=no bubble_len=0 " +
+        "conv=yes composer=no alerts=1 alert_shapes=len:18:usage+remaining " +
+        "error_hint=no limit_hint=yes limit_exact=no",
+      "[cgpro:turn] t=120 assistant=0/0 msgs=0/- working=no stop=no bubble_len=0 " +
+        "conv=yes composer=no alerts=1 alert_shapes=len:18:usage+remaining " +
+        "error_hint=no limit_hint=yes limit_exact=no",
     ]);
   });
 
@@ -309,10 +327,12 @@ describe("waitTurnComplete post-submit Pro usage limit", () => {
 
     expect(result.outcome).toBe("resolved");
     expect(result.lines).toEqual([
-      "[cgpro:turn] t=60 assistant=0/0 working=yes stop=yes bubble_len=0 " +
-        "conv=yes composer=no alerts=1 error_hint=yes limit_hint=yes limit_exact=yes",
-      "[cgpro:turn] t=120 assistant=0/0 working=yes stop=yes bubble_len=0 " +
-        "conv=yes composer=no alerts=1 error_hint=yes limit_hint=yes limit_exact=yes",
+      "[cgpro:turn] t=60 assistant=0/0 msgs=0/- working=yes stop=yes bubble_len=0 " +
+        "conv=yes composer=no alerts=1 alert_shapes=len:56:limit+reached+try-again " +
+        "error_hint=yes limit_hint=yes limit_exact=yes",
+      "[cgpro:turn] t=120 assistant=0/0 msgs=0/- working=yes stop=yes bubble_len=0 " +
+        "conv=yes composer=no alerts=1 alert_shapes=len:56:limit+reached+try-again " +
+        "error_hint=yes limit_hint=yes limit_exact=yes",
     ]);
   });
 
@@ -346,5 +366,143 @@ describe("waitTurnComplete post-submit Pro usage limit", () => {
     expect(error.limitText).toBe("x".repeat(200));
     expect(Date.parse(error.availableAfter!)).toBe(new Date(2026, 8, 30, 0, 0, 0, 0).getTime());
     for (const line of result.lines) expect(line).not.toContain("x".repeat(20));
+  });
+});
+
+/**
+ * P-035 G3 r38. The submitted turn that never rendered anything -- the user's
+ * own message included (live ms1980 80f0899c: `anyMessages` and
+ * `assistantMessages` were both "not on this surface"). Three consecutive
+ * heartbeats with no assistant turn and no growth in the anyMessages count end
+ * the wait with a typed error so the daemon's failure capture runs instead of a
+ * silent timeout. An unknown pre-submit count disables the rule; a proven r37
+ * limit still wins.
+ */
+describe("waitTurnComplete submitted turn never rendered", () => {
+  const notRenderedLine = (seconds: number, msgs: string): string =>
+    `[cgpro:turn] t=${seconds} assistant=0/0 msgs=${msgs} working=no stop=no bubble_len=0 ` +
+    "conv=yes composer=no alerts=0 alert_shapes=- error_hint=no limit_hint=no limit_exact=no";
+
+  it("stops on the third not-rendered heartbeat with a content-free error", async () => {
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 0,
+      priorAnyMessages: 0,
+      captureFailure: true,
+    });
+
+    expect(result.outcome).toBe("error");
+    expect(result.error).toBeInstanceOf(SubmittedTurnNotRenderedError);
+    const error = result.error as SubmittedTurnNotRenderedError;
+    expect(error.code).toBe("submitted_turn_not_rendered");
+    // The prompt WAS submitted; this is not a pre-submit refusal.
+    expect(error.promptSubmitted).toBe(true);
+    expect(error.elapsedSeconds).toBe(180);
+    expect(error.msgs).toBe(0);
+    expect(error.priorMsgs).toBe(0);
+    expect(error.alertCount).toBe(0);
+    expect(error.alertShapes).toBe("");
+    // Three observations were needed, and it stopped there rather than at the
+    // configured 20-minute deadline.
+    expect(result.lines).toEqual([
+      notRenderedLine(60, "0/0"),
+      notRenderedLine(120, "0/0"),
+      notRenderedLine(180, "0/0"),
+    ]);
+    expect(result.completedAt).toBe(180_000);
+  });
+
+  it("keeps waiting after only two not-rendered observations", async () => {
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 0,
+      priorAnyMessages: 0,
+      control: { cancelled: () => Date.now() >= 130_000 },
+    });
+
+    expect(result.outcome).toBe("resolved");
+    expect(result.lines).toEqual([notRenderedLine(60, "0/0"), notRenderedLine(120, "0/0")]);
+  });
+
+  it("resets the streak when the user's own message renders", async () => {
+    // msgs grows only at the 120 s observation, so the streak restarts there
+    // and the third observation is the first one after it.
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 0,
+      anyMessages: () => (Date.now() >= 120_000 && Date.now() < 180_000 ? 1 : 0),
+      priorAnyMessages: 0,
+      control: { cancelled: () => Date.now() >= 200_000 },
+    });
+
+    expect(result.outcome).toBe("resolved");
+    expect(result.lines).toEqual([
+      notRenderedLine(60, "0/0"),
+      notRenderedLine(120, "1/0"),
+      notRenderedLine(180, "0/0"),
+    ]);
+  });
+
+  it("never triggers while the turn is working", async () => {
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 0,
+      priorAnyMessages: 0,
+      stopVisible: true,
+      control: { cancelled: () => Date.now() >= 200_000 },
+    });
+
+    expect(result.outcome).toBe("resolved");
+    expect(result.lines).toHaveLength(3);
+    for (const line of result.lines) expect(line).toContain("working=yes");
+  });
+
+  it("never triggers when the pre-submit anyMessages count is unknown", async () => {
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 0,
+      // No priorAnyMessages: unknown, so the rule stays off entirely.
+      control: { cancelled: () => Date.now() >= 200_000 },
+    });
+
+    expect(result.outcome).toBe("resolved");
+    expect(result.lines).toHaveLength(3);
+    for (const line of result.lines) expect(line).toContain("msgs=0/-");
+  });
+
+  it("throws the r37 limit error instead when the limit also holds", async () => {
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 0,
+      alerts: [{ visible: true, text: "You've reached your limit" }],
+      priorAnyMessages: 0,
+      captureFailure: true,
+    });
+
+    expect(result.outcome).toBe("error");
+    expect(result.error).toBeInstanceOf(ProUsageLimitAfterSubmitError);
+    expect(result.error).not.toBeInstanceOf(SubmittedTurnNotRenderedError);
+    // The limit needs two observations, the not-rendered rule three, so the
+    // limit's throw is what the caller sees.
+    expect(result.lines).toHaveLength(2);
+    expect(result.completedAt).toBe(120_000);
+  });
+
+  it("describes each visible alert without its text and reports msgs counts", async () => {
+    const alertText = "4% usage remaining";
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 0,
+      alerts: [{ visible: true, text: alertText }],
+      priorAnyMessages: 0,
+      control: { cancelled: () => Date.now() >= 70_000 },
+    });
+
+    expect(result.outcome).toBe("resolved");
+    expect(result.lines).toHaveLength(1);
+    expect(result.lines[0]).toContain("msgs=0/0");
+    expect(result.lines[0]).toContain("alert_shapes=len:18:usage+remaining");
+    expect(result.lines[0]).not.toContain(alertText);
+    expect(result.lines[0]).not.toContain("usage remaining");
   });
 });

@@ -168,6 +168,63 @@ export class ProUsageLimitAfterSubmitError extends Error {
 }
 
 /**
+ * P-035 G3 r38 (2026-09-28). The submitted turn never rendered anything: not
+ * even the user's own message.
+ *
+ * Live ms1980 (vendor ed1b93a, planning turn 80f0899c): the prompt was accepted
+ * and submitted, then every 60 s heartbeat for two hours showed
+ * `assistant=0/0 working=no stop=no bubble_len=0 conv=yes composer=yes alerts=8`
+ * while the waiter held its full budget. A read-only `doctor --via-daemon` audit
+ * on the same daemon found `composer` resolved but `anyMessages` and
+ * `assistantMessages` "not on this surface", so the page never rendered the
+ * user's own turn either. The 2 h client timeout left no failure screenshot, so
+ * the page state and the alert wording are unknown.
+ *
+ * This is deliberately NOT a `PreSubmitInteractionError`: the prompt WAS
+ * submitted (`promptSubmitted` true). It carries only content-free facts -- the
+ * elapsed seconds, the anyMessages counts, the visible alert count and the
+ * alert shapes string the heartbeat already prints -- so the daemon's existing
+ * `describeFailure` capture (identity, screenshot, selector state) is what makes
+ * the page state readable after the fact.
+ */
+export interface SubmittedTurnNotRenderedDetails {
+  /** Whole seconds the waiter had been in this turn when the streak confirmed. */
+  elapsedSeconds: number;
+  /** `SELECTORS.anyMessages` count at the confirming observation. */
+  msgs: number;
+  /** The same count captured before submit. */
+  priorMsgs: number;
+  /** Visible alert/status/toast elements at the confirming observation. */
+  alertCount: number;
+  /** The content-free `alert_shapes` string the heartbeat printed. */
+  alertShapes: string;
+}
+
+export class SubmittedTurnNotRenderedError extends Error {
+  readonly code = "submitted_turn_not_rendered";
+  readonly promptSubmitted = true;
+  readonly elapsedSeconds: number;
+  readonly msgs: number;
+  readonly priorMsgs: number;
+  readonly alertCount: number;
+  readonly alertShapes: string;
+
+  constructor(details: SubmittedTurnNotRenderedDetails) {
+    super(
+      `submitted_turn_not_rendered after ${details.elapsedSeconds}s: ` +
+      `msgs=${details.msgs}/${details.priorMsgs} alerts=${details.alertCount} ` +
+      `alert_shapes=${details.alertShapes || "-"}`,
+    );
+    this.name = "SubmittedTurnNotRenderedError";
+    this.elapsedSeconds = details.elapsedSeconds;
+    this.msgs = details.msgs;
+    this.priorMsgs = details.priorMsgs;
+    this.alertCount = details.alertCount;
+    this.alertShapes = details.alertShapes;
+  }
+}
+
+/**
  * Content-free refusal: the page must be left exactly as found.
  *
  * P-035 2026-09-27. The guard admits or refuses through a single boolean, so a

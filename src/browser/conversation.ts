@@ -3,7 +3,7 @@ import { SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
 import { listProjects } from "../api/projects.js";
 import { fetchModelsWithReason, findProModel, type ChatgptModel } from "../api/models.js";
-import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, SelectorBrokenError, TurnTimeoutError } from "../errors.js";
+import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, SelectorBrokenError, type SubmittedTurnNotRenderedDetails, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation } from "../core/stream.js";
 
 /**
@@ -3188,9 +3188,22 @@ export async function sendPrompt(
   cancelled?: () => boolean,
   verifySubmission?: () => Promise<void>,
   ownedConnector?: string,
+  /**
+   * P-035 G3 r38 (2026-09-28). Optional output slot for the pre-submit
+   * `SELECTORS.anyMessages` count, captured next to `priorAssistantCount` below.
+   * `waitTurnComplete` needs it to tell "the user's own message never rendered"
+   * from "only the assistant turn is missing". Left untouched on the early
+   * returns, so a caller that reads it after a cancelled call sees `undefined`
+   * and its own unknown-prior path (the rule stays off).
+   */
+  submitCounts?: { priorAnyMessages?: number },
 ): Promise<number> {
   const assistantCount = async (): Promise<number> => page
     .locator(SELECTORS.assistantMessages.join(", "))
+    .count()
+    .catch(() => 0);
+  const anyMessageCount = async (): Promise<number> => page
+    .locator(SELECTORS.anyMessages.join(", "))
     .count()
     .catch(() => 0);
   if (cancelled?.()) return assistantCount();
@@ -3231,6 +3244,10 @@ export async function sendPrompt(
     await insertComposerText(page, prompt);
   }
   const priorAssistantCount = await assistantCount();
+  // P-035 G3 r38. Captured next to the assistant count, before the send: the
+  // not-rendered rule compares the live anyMessages count against this to prove
+  // the submitted turn (the user's own message included) never rendered.
+  if (submitCounts) submitCounts.priorAnyMessages = await anyMessageCount();
   if (cancelled?.()) return priorAssistantCount;
 
   // Typing may change inline modes. Verify the composed request, not just
@@ -4141,6 +4158,46 @@ const TURN_LIMIT_EXACT_RE = /limit reached|reached your limit|usage limit/i;
  * whole point of the early exit is to be right about a paid lane.
  */
 const TURN_LIMIT_CONSECUTIVE_OBSERVATIONS = 2;
+/**
+ * P-035 G3 r38 (2026-09-28). Three consecutive observations that the submitted
+ * turn rendered nothing at all before the wait stops. The first heartbeat is at
+ * 60 s, so this is >= 3 minutes after submit.
+ */
+const TURN_NOT_RENDERED_CONSECUTIVE_OBSERVATIONS = 3;
+/**
+ * The fixed, content-free alert vocabulary. A heartbeat shape reports which of
+ * these words an alert text matched, case-insensitively, never the text itself.
+ * Order here is the order they are joined on the line, so the shape is
+ * deterministic for one alert text.
+ */
+const TURN_ALERT_TOKENS: ReadonlyArray<readonly [token: string, pattern: RegExp]> = [
+  ["limit", /limit/i],
+  ["usage", /usage/i],
+  ["reached", /reached/i],
+  ["upgrade", /upgrade/i],
+  ["try-again", /try again/i],
+  ["error", /error/i],
+  ["network", /network/i],
+  ["remaining", /remaining/i],
+  ["reset", /reset/i],
+  ["plan", /plan/i],
+  ["pro", /pro/i],
+  ["unable", /unable/i],
+  ["rate", /rate/i],
+];
+
+/**
+ * One visible alert's content-free shape: the length of its trimmed text and
+ * the fixed-vocabulary tokens it matched, or `none`. The text is never returned
+ * or logged, only its length and these fixed words.
+ */
+function alertShape(text: string): string {
+  const trimmed = text.trim();
+  const matched = TURN_ALERT_TOKENS
+    .filter(([, pattern]) => pattern.test(trimmed))
+    .map(([token]) => token);
+  return `len:${trimmed.length}:${matched.length > 0 ? matched.join("+") : "none"}`;
+}
 
 /**
  * Visible alert/status/toast elements on the page, plus their individual texts.
@@ -4184,21 +4241,34 @@ interface TurnLimitAfterSubmit {
 }
 
 /**
- * One heartbeat observation: the diagnostic line to print, plus the post-submit
- * Pro limit when THIS observation proved it. Any read that a page cannot answer
- * propagates to the caller, which owns the try/catch.
+ * One heartbeat observation: the diagnostic line to print, the post-submit Pro
+ * limit when THIS observation proved it, and the "submitted turn never
+ * rendered" facts when this observation showed them. Any read that a page
+ * cannot answer propagates to the caller, which owns the try/catch.
  *
  * The limit only counts when no assistant turn for this submission has appeared
  * at all -- the assistant count has not moved, no bubble text exists and nothing
  * is working. A matching alert beside a live or finished turn is left to the
  * pre-existing completion path.
+ *
+ * P-035 G3 r38 (2026-09-28) adds the not-rendered observation: nothing rendered
+ * for this submission at all, the user's own message included -- the
+ * `anyMessages` count has not grown past its pre-submit value. It is only
+ * computed when the caller supplied that prior value; an unknown prior count
+ * disables the rule rather than guessing.
  */
 async function readTurnHeartbeat(
   page: Page,
   elapsedMs: number,
   priorAssistantCount: number,
-): Promise<{ line: string; limit: TurnLimitAfterSubmit | null }> {
+  priorAnyMessages: number | null,
+): Promise<{
+  line: string;
+  limit: TurnLimitAfterSubmit | null;
+  notRendered: SubmittedTurnNotRenderedDetails | null;
+}> {
   const count = await page.locator(SELECTORS.assistantMessages.join(", ")).count();
+  const msgs = await page.locator(SELECTORS.anyMessages.join(", ")).count();
   const stop = (await firstResolved(page, SELECTORS.stopButton)) !== null;
   const bubble = await latestAssistantBubble(page);
   const streaming =
@@ -4216,18 +4286,22 @@ async function readTurnHeartbeat(
   const working = stop || streaming === "true";
   const limitMatch = matchTurnLimitAlert(alerts.texts);
   const noAssistantTurn = count <= priorAssistantCount && bubbleText.trim().length === 0 && !working;
+  // Content-free: the visible alert count plus one shape per visible alert.
+  const alertShapes = alerts.texts.map(alertShape).join(",");
   const yesNo = (value: boolean): string => (value ? "yes" : "no");
   return {
     line: [
       "[cgpro:turn]",
       `t=${Math.floor(elapsedMs / 1_000)}`,
       `assistant=${count}/${priorAssistantCount}`,
+      `msgs=${msgs}/${priorAnyMessages === null ? "-" : priorAnyMessages}`,
       `working=${yesNo(working)}`,
       `stop=${yesNo(stop)}`,
       `bubble_len=${count > priorAssistantCount ? bubbleText.trim().length : 0}`,
       `conv=${yesNo(conversation)}`,
       `composer=${yesNo(composer)}`,
       `alerts=${alerts.count}`,
+      `alert_shapes=${alertShapes || "-"}`,
       `error_hint=${yesNo(TURN_ERROR_HINT_RE.test(haystack))}`,
       `limit_hint=${yesNo(TURN_LIMIT_HINT_RE.test(haystack))}`,
       `limit_exact=${yesNo(limitMatch !== null)}`,
@@ -4238,26 +4312,43 @@ async function readTurnHeartbeat(
           limitText: limitMatch.slice(0, PRO_LIMIT_TEXT_MAX),
         }
       : null,
+    notRendered: priorAnyMessages !== null && msgs <= priorAnyMessages && noAssistantTurn
+      ? {
+          elapsedSeconds: Math.floor(elapsedMs / 1_000),
+          msgs,
+          priorMsgs: priorAnyMessages,
+          alertCount: alerts.count,
+          alertShapes,
+        }
+      : null,
   };
 }
 
 /**
  * At most one heartbeat line per 60 s of the wait, the first one 60 s after
  * entry. Errors are swallowed here so the heartbeat can never change the turn,
- * and a read that failed is never counted as an observation of the limit.
+ * and a read that failed is never counted as an observation of either rule.
  *
  * The heartbeat records the limit once rule 1's condition holds for two
- * consecutive observations; `waitTurnComplete` owns the throw, so this stays a
+ * consecutive observations, and the not-rendered facts once rule 2's condition
+ * holds for three. `waitTurnComplete` owns the throws, so this stays a
  * diagnostic that cannot itself change the turn.
  */
 function turnHeartbeat(
   page: Page,
   priorAssistantCount: number,
-): { tick: () => Promise<void>; limitAfterSubmit: () => TurnLimitAfterSubmit | null } {
+  priorAnyMessages: number | null,
+): {
+  tick: () => Promise<void>;
+  limitAfterSubmit: () => TurnLimitAfterSubmit | null;
+  submittedTurnNotRendered: () => SubmittedTurnNotRenderedDetails | null;
+} {
   const startedAt = Date.now();
   let lastEmittedAt: number | null = null;
-  let consecutiveObservations = 0;
+  let limitObservations = 0;
+  let notRenderedObservations = 0;
   let confirmed: TurnLimitAfterSubmit | null = null;
+  let notRendered: SubmittedTurnNotRenderedDetails | null = null;
   const tick = async (): Promise<void> => {
     try {
       const now = Date.now();
@@ -4265,20 +4356,29 @@ function turnHeartbeat(
       if (elapsed < TURN_HEARTBEAT_INTERVAL_MS) return;
       if (lastEmittedAt !== null && now - lastEmittedAt < TURN_HEARTBEAT_INTERVAL_MS) return;
       lastEmittedAt = now;
-      const read = await readTurnHeartbeat(page, elapsed, priorAssistantCount);
+      const read = await readTurnHeartbeat(page, elapsed, priorAssistantCount, priorAnyMessages);
       console.error(read.line);
-      consecutiveObservations = read.limit === null ? 0 : consecutiveObservations + 1;
-      if (read.limit !== null && consecutiveObservations >= TURN_LIMIT_CONSECUTIVE_OBSERVATIONS) {
+      limitObservations = read.limit === null ? 0 : limitObservations + 1;
+      if (read.limit !== null && limitObservations >= TURN_LIMIT_CONSECUTIVE_OBSERVATIONS) {
         confirmed = read.limit;
+      }
+      notRenderedObservations = read.notRendered === null ? 0 : notRenderedObservations + 1;
+      if (read.notRendered !== null && notRenderedObservations >= TURN_NOT_RENDERED_CONSECUTIVE_OBSERVATIONS) {
+        notRendered = read.notRendered;
       }
     } catch {
       // Diagnostic only: a page that cannot answer the heartbeat's reads must
       // not change the wait it observes, and an unreadable heartbeat is not an
-      // observation of the limit either.
-      consecutiveObservations = 0;
+      // observation of either rule either.
+      limitObservations = 0;
+      notRenderedObservations = 0;
     }
   };
-  return { tick, limitAfterSubmit: () => confirmed };
+  return {
+    tick,
+    limitAfterSubmit: () => confirmed,
+    submittedTurnNotRendered: () => notRendered,
+  };
 }
 
 /**
@@ -4297,6 +4397,15 @@ function turnHeartbeat(
  * see a limit alert while no assistant turn exists end the wait with
  * `ProUsageLimitAfterSubmitError` instead of holding the full timeout. Every
  * other stall still waits the configured timeout, unchanged.
+ *
+ * P-035 G3 r38 (2026-09-28). A fourth way out: the submitted turn that never
+ * rendered anything, the user's own message included. Three consecutive
+ * heartbeats (>= 3 minutes) that see no assistant turn AND no growth in the
+ * `anyMessages` count past its pre-submit value end the wait with
+ * `SubmittedTurnNotRenderedError`, so the daemon's failure capture runs instead
+ * of a silent 2 h timeout. The prior `anyMessages` count is optional: when the
+ * caller cannot supply it, this rule stays off. A proven limit is checked first
+ * and wins.
  */
 export async function waitTurnComplete(
   page: Page,
@@ -4316,11 +4425,16 @@ export async function waitTurnComplete(
     externalComplete?: () => boolean;
     confirmComplete?: () => Promise<boolean>;
   } = {},
+  /**
+   * `SELECTORS.anyMessages` count captured before submit. Optional: null (the
+   * default) means unknown, which disables the not-rendered rule entirely.
+   */
+  priorAnyMessages: number | null = null,
 ): Promise<void> {
   let deadline = Date.now() + timeoutMs;
   let lastText = "";
   let lastChangedAt = Date.now();
-  const heartbeat = turnHeartbeat(page, priorAssistantCount);
+  const heartbeat = turnHeartbeat(page, priorAssistantCount, priorAnyMessages);
 
   for (;;) {
     if (control.cancelled?.()) return;
@@ -4329,11 +4443,16 @@ export async function waitTurnComplete(
     if (control.cancelled?.()) return;
     if (control.externalComplete?.()) return;
     // Checked after cancel and external completion, so a genuine completion
-    // always wins, and before the timeout/reload branch, so the proven limit
-    // fails fast instead of waiting out the deadline.
+    // always wins, and before the timeout/reload branch, so the proven limit or
+    // the never-rendered turn fails fast instead of waiting out the deadline.
+    // The limit is checked first and wins when both rules hold.
     const postSubmitLimit = heartbeat.limitAfterSubmit();
     if (postSubmitLimit !== null) {
       throw new ProUsageLimitAfterSubmitError(postSubmitLimit);
+    }
+    const notRendered = heartbeat.submittedTurnNotRendered();
+    if (notRendered !== null) {
+      throw new SubmittedTurnNotRenderedError(notRendered);
     }
     const requestedConversation = control.consumeReload?.() ?? null;
     const expired = Date.now() >= deadline;

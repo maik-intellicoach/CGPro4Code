@@ -385,6 +385,12 @@ function runAskInner(
         ? await fetchNativeResearchUserNodes(page, existingNativeConversation) : new Set<string>();
 
       log("sendPrompt…");
+      // P-035 G3 r38. The pre-submit `anyMessages` count travels out of
+      // `sendPrompt` next to `priorBubbles` (via this slot) so `waitTurnComplete`
+      // can prove the submitted turn -- the user's message included -- never
+      // rendered. Absent when the send was cancelled before the capture, which
+      // leaves the not-rendered rule off for this turn.
+      const submitCounts: { priorAnyMessages?: number } = {};
       const priorBubbles = await sendPrompt(
         page, opts.prompt, opts.connector !== undefined || opts.deepResearch === true, () => cancelled,
         async () => {
@@ -398,6 +404,7 @@ function runAskInner(
           }
         },
         ownedConnector,
+        submitCounts,
       );
       if (opts.deepResearch && !cancelled && !nativeMaximumVerified) {
         throw new Error("Native research maximum UI setting was not verified before submission");
@@ -557,7 +564,7 @@ function runAskInner(
           },
           externalComplete: opts.deepResearch ? () => nativeState.report !== null : undefined,
           confirmComplete: opts.deepResearch ? async () => nativeState.report !== null : confirmConnectorCompletion,
-        });
+        }, submitCounts.priorAnyMessages ?? null);
       } catch (err) {
         if (debug) {
           try {

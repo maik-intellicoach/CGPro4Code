@@ -58,6 +58,7 @@ import {
   PreflightDraftProtectedError,
   PreSubmitInteractionError,
   ProUsageLimitAfterSubmitError,
+  SubmittedTurnNotRenderedError,
 } from "../errors.js";
 import { SELECTORS, TURN_CRITICAL_SELECTORS, type SelectorSet } from "../browser/selectors.js";
 import {
@@ -1764,6 +1765,17 @@ export async function handleAsk(
                 promptSubmitted: err.promptSubmitted,
                 availableAfter: err.availableAfter,
                 limitText: err.limitText,
+              }
+          // P-035 G3 r38. The submitted turn that never rendered reaches the wire
+          // with its closed code and `promptSubmitted: true` only: the elapsed
+          // seconds, msgs counts and alert shapes are already inside its
+          // content-free message, and there is no reset date or alert text to
+          // carry. Its `describeFailure` capture above is the point of the error.
+          : err instanceof SubmittedTurnNotRenderedError
+            ? {
+                message: err.message,
+                code: err.code,
+                promptSubmitted: err.promptSubmitted,
               }
             : { message: (err as Error).message });
         res.end();
