@@ -37,6 +37,8 @@ afterEach(() => {
   requireSelector.mockReset();
   vi.useRealTimers();
   vi.restoreAllMocks();
+  // A usage-panel test stubs `document`/`window` for the shipped callback.
+  vi.unstubAllGlobals();
 });
 
 type RunOptions = {
@@ -57,6 +59,17 @@ type RunOptions = {
   anyMessages?: () => number;
   /** Pre-submit anyMessages count; omitted means unknown (rule 2 disabled). */
   priorAnyMessages?: number | null;
+  /**
+   * P-035 G3 r45. Text of the account usage panel the post-submit reset-date
+   * fallback reads. When set, the page double answers `evaluate` by running the
+   * SHIPPED callback against a one-element stand-in for the panel.
+   */
+  usagePanelText?: string;
+  /**
+   * P-035 G3 r45. Epoch ms the scripted clock starts at. The usage panel names
+   * no year, so a test that wants the panel's own year must not run in 1970.
+   */
+  now?: number;
 };
 
 type RunResult = {
@@ -74,7 +87,7 @@ type RunResult = {
  */
 async function runTurn(options: RunOptions): Promise<RunResult> {
   vi.useFakeTimers();
-  vi.setSystemTime(0);
+  vi.setSystemTime(options.now ?? 0);
   const lines: string[] = [];
   const spy = vi
     .spyOn(console, "error")
@@ -125,6 +138,28 @@ async function runTurn(options: RunOptions): Promise<RunResult> {
     goto: async () => {},
     context: () => ({}),
   } as unknown as Page;
+
+  // P-035 G3 r45. The usage-panel fallback reads through `evaluate`, which this
+  // page double otherwise does not carry. When a test supplies a panel, the
+  // shipped callback runs against a minimal read-only element holding the panel
+  // text, so the fallback is exercised as written.
+  if (options.usagePanelText !== undefined) {
+    const panelElement = {
+      innerText: options.usagePanelText,
+      textContent: options.usagePanelText,
+      getAttribute: () => null,
+      attributes: [],
+      getBoundingClientRect: () => ({ x: 0, y: 0, width: 160, height: 24 }),
+    };
+    vi.stubGlobal("document", {
+      querySelectorAll: (selector: string): unknown[] => (selector === "body *" ? [panelElement] : []),
+    });
+    vi.stubGlobal("window", {
+      getComputedStyle: () => ({ visibility: "visible", display: "block", opacity: "1" }),
+    });
+    (page as unknown as { evaluate: (fn: unknown, arg: unknown) => Promise<unknown> }).evaluate =
+      async (fn: unknown, arg: unknown) => (fn as (value: unknown) => unknown)(arg);
+  }
 
   await options.onPage?.(page);
 
@@ -373,6 +408,54 @@ describe("waitTurnComplete post-submit Pro usage limit", () => {
     expect(error.limitText).toBe("x".repeat(200));
     expect(Date.parse(error.availableAfter!)).toBe(new Date(2026, 8, 30, 0, 0, 0, 0).getTime());
     for (const line of result.lines) expect(line).not.toContain("x".repeat(20));
+  });
+
+  // P-035 G3 r45 (2026-09-28). The post-submit notice can name no date either,
+  // so the account usage panel is the fallback source here too -- read once, at
+  // the confirming observation.
+  const PANEL_TEXT =
+    "6% usage remaining · Resets every week · Next reset is on Oct 4 at 12:58 AM";
+  const PANEL_RESET_MS = new Date(2026, 9, 4, 0, 58, 0, 0).getTime();
+
+  it("fills the post-submit reset instant from the usage panel when the alert names none", async () => {
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 0,
+      alerts: [{ visible: true, text: "Limit reached" }],
+      usagePanelText: PANEL_TEXT,
+      // The panel names no year, so the scripted clock must sit in the panel's
+      // own year for the fallback's year-less date to read as 2026.
+      now: new Date(2026, 8, 28, 15, 25, 0, 0).getTime(),
+      captureFailure: true,
+    });
+
+    expect(result.outcome).toBe("error");
+    const error = result.error as ProUsageLimitAfterSubmitError;
+    expect(error.code).toBe("pro_usage_limit_after_submit");
+    expect(error.promptSubmitted).toBe(true);
+    expect(error.limitText).toBe("Limit reached");
+    expect(error.availableAfter).toMatch(/^2026-10-04T00:58:00[+-]\d{2}:\d{2}$/);
+    expect(Date.parse(error.availableAfter!)).toBe(PANEL_RESET_MS);
+    // One content-free line records the fallback, and only once.
+    const used = result.lines.filter((line) => line.includes("reset from usage panel"));
+    expect(used).toHaveLength(1);
+    expect(used[0]).toContain("percent=6");
+    expect(used[0]).not.toContain("usage remaining");
+    expect(used[0]).not.toContain("Oct 4");
+  });
+
+  it("keeps the post-submit alert's own date and reads no usage panel", async () => {
+    const result = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 0,
+      alerts: [{ visible: true, text: LIMIT_WITH_DATE }],
+      usagePanelText: PANEL_TEXT,
+      captureFailure: true,
+    });
+
+    const error = result.error as ProUsageLimitAfterSubmitError;
+    expect(Date.parse(error.availableAfter!)).toBe(new Date(2026, 8, 30, 0, 0, 0, 0).getTime());
+    expect(result.lines.filter((line) => line.includes("reset from usage panel"))).toHaveLength(0);
   });
 });
 

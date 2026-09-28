@@ -179,6 +179,10 @@ function setup(options: {
   ancestorHoverRejects?: boolean;
   /** The sentence appears only after the stepped Playwright-mouse move. */
   steppedHoverOnly?: boolean;
+  /** Text of the account usage panel the reset-date fallback reads. */
+  usagePanelText?: string;
+  /** Split that text across sibling lines under one container (the r42 shape). */
+  usagePanelSplit?: boolean;
 } = {}) {
   let value = "1";
   const model = {
@@ -228,6 +232,21 @@ function setup(options: {
   if (proRow && options.describedByText !== undefined) {
     proRow.setAttribute("aria-describedby", "limit-tip");
     body.append(new FakeElement("div", { id: "limit-tip" }, options.describedByText));
+  }
+  // P-035 G3 r45 (2026-09-28). The account usage panel the reset-date fallback
+  // reads. Its live shape puts the percent line and the reset line in two SIBLING
+  // elements, so `usagePanelSplit` builds exactly that: one container holding
+  // both lines. Their concatenation stays the whole panel text.
+  if (options.usagePanelText !== undefined) {
+    const panelText = options.usagePanelText;
+    if (options.usagePanelSplit) {
+      const boundary = panelText.lastIndexOf(" · ");
+      const container = body.append(new FakeElement("div"));
+      container.append(new FakeElement("span", {}, panelText.slice(0, boundary)));
+      container.append(new FakeElement("span", {}, panelText.slice(boundary)));
+    } else {
+      body.append(new FakeElement("div", {}, panelText));
+    }
   }
   const fakeDocument = makeFakeDocument(body);
   (globalThis as Record<string, unknown>).document = fakeDocument;
@@ -326,6 +345,11 @@ function setup(options: {
       if (keys.includes("proLimitProbe")) return options.proIndex ?? -1;
       if (keys.includes("selectedSelector")) return "row=\"6 Pro\" menus=1 menuItems=[] sliders=[4/4]";
       if (keys.includes("proLimitPassiveAt") || keys.includes("proLimitScan") || keys.includes("proLimitEvidence")) {
+        return (fn as (value: unknown) => unknown)(arg);
+      }
+      // P-035 G3 r45. The usage-panel read runs the SHIPPED callback against the
+      // fake DOM installed above, so the fallback is tested as written.
+      if (keys.includes("usagePanelProbe")) {
         return (fn as (value: unknown) => unknown)(arg);
       }
       if (options.pickerEmpty) return { entries: [], checkedIndex: -1 };
@@ -929,6 +953,66 @@ describe("Pro usage limit in the model picker", () => {
       expect(probe[0]).toContain("source=passive-title");
       expect(probe[0]).toContain("rowHover=skipped");
       expect(probe[0]).toContain("ancestorHover=skipped");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // P-035 G3 r45 (2026-09-28). The account usage panel states the real reset, and
+  // the picker tooltip can name none at all. The panel is the fallback source for
+  // the refusal's `availableAfter`, and the notice's own date still wins when it
+  // has one.
+  const PANEL_TEXT =
+    "6% usage remaining · Resets every week · Next reset is on Oct 4 at 12:58 AM";
+  const PANEL_RESET_MS = new Date(2026, 9, 4, 0, 58, 0, 0).getTime();
+
+  it("fills the pre-submit reset instant from the usage panel when the notice names none", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const s = setup({
+        pickerEntries: ["Latest", "Pro"],
+        proIndex: 1,
+        tooltipVisible: false,
+        usagePanelText: PANEL_TEXT,
+        // The live shape: the percent line and the reset line are SIBLINGS under
+        // the panel container, which is why r42 read no reset at all.
+        usagePanelSplit: true,
+      });
+      const error = await rejection(s.page);
+
+      expect(error.code).toBe("pro_usage_limit_reached");
+      expect(error.limitText).toBeNull();
+      expect(error.availableAfter).toMatch(/^2026-10-04T00:58:00[+-]\d{2}:\d{2}$/);
+      expect(Date.parse(error.availableAfter!)).toBe(PANEL_RESET_MS);
+      // One content-free line records the fallback; no panel text travels.
+      const used = spy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("reset from usage panel"));
+      expect(used).toHaveLength(1);
+      expect(used[0]).toContain("percent=6");
+      expect(used[0]).not.toContain("usage remaining");
+      expect(used[0]).not.toContain("Oct 4");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("keeps the notice's own date and reads no usage panel", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const s = setup({
+        pickerEntries: ["Latest", "Pro"],
+        proIndex: 1,
+        usagePanelText: PANEL_TEXT,
+      });
+      const error = await rejection(s.page);
+
+      // The tooltip's own Sep 30 wins over the panel's Oct 4.
+      expect(Date.parse(error.availableAfter!)).toBe(new Date(2026, 8, 30, 0, 0, 0, 0).getTime());
+      const used = spy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("reset from usage panel"));
+      expect(used).toHaveLength(0);
     } finally {
       spy.mockRestore();
     }

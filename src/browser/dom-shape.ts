@@ -300,10 +300,16 @@ export function summariseDomShape(input: DomShapeInput, root?: DomShapeRoot): Do
   };
 
   // (1) The usage panel, anywhere in the document: the panel is a popover, so it
-  // may live outside `<main>`. The SMALLEST visible element whose text carries
-  // "NN% usage remaining" is the panel itself; every larger match is one of its
-  // ancestors. Only percent, the period word and the reset line are read out.
+  // may live outside `<main>`. P-035 G3 r45 (2026-09-28): the reset sentence is a
+  // SIBLING of the percent line, so the SMALLEST visible element holding BOTH
+  // "NN% usage remaining" and "Next reset is on" is the panel itself -- for two
+  // sibling lines that is their lowest common ancestor, the panel container --
+  // and every larger match is one of its ancestors. A panel that carries the
+  // percent and no reset line keeps its r42 reading (found, resets "-"), so the
+  // probe never regresses. Only percent, the period word and the reset line are
+  // read out.
   const USAGE_RE = /(\d{1,3})%\s*usage remaining/i;
+  const USAGE_RESET_RE = /next reset is on/i;
   const usage_panel: { found: boolean; percent: number; resets: string; period: string } = {
     found: false,
     percent: 0,
@@ -312,14 +318,20 @@ export function summariseDomShape(input: DomShapeInput, root?: DomShapeRoot): Do
   };
   try {
     let smallest: { text: string } | null = null;
+    let percentOnly: { text: string } | null = null;
     for (const el of Array.from(doc.querySelectorAll("*"))) {
       const text = el.textContent ?? "";
       if (!USAGE_RE.test(text)) continue;
       if (!isVisible(el)) continue;
-      if (smallest === null || text.length < smallest.text.length) smallest = { text };
+      if (USAGE_RESET_RE.test(text)) {
+        if (smallest === null || text.length < smallest.text.length) smallest = { text };
+      } else if (percentOnly === null || text.length < percentOnly.text.length) {
+        percentOnly = { text };
+      }
     }
-    if (smallest !== null) {
-      const text = smallest.text;
+    const panel = smallest ?? percentOnly;
+    if (panel !== null) {
+      const text = panel.text;
       const percentMatch = USAGE_RE.exec(text);
       const periodMatch = /resets every\s+(week|day|month)/i.exec(text);
       const resetMatch = /next reset is on\s*([\s\S]*)$/i.exec(text);

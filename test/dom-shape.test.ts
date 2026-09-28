@@ -402,6 +402,41 @@ describe("summariseDomShape", () => {
     expect(JSON.stringify(result)).not.toContain("footer");
   });
 
+  // P-035 G3 r45 (2026-09-28). The r42 live probe read the percent but `resets:
+  // "-"`, because the reset sentence is a SIBLING of the percent line: the old
+  // "smallest element holding the percent" rule stopped at the percent line. The
+  // panel is now the smallest element holding BOTH phrases -- for two sibling
+  // lines that is their container -- so both fields come from one unit.
+  it("reads a panel whose percent and reset lines are siblings under one container", () => {
+    const percentLine = new FakeElement("DIV", [], "6% usage remaining · Resets every week");
+    const resetLine = new FakeElement("DIV", [], "Next reset is on Oct 4 at 12:58 AM");
+    const container = new FakeElement(
+      "DIV",
+      [{ name: "title", value: SENTINEL }],
+      `${SENTINEL} ${percentLine.textContent} · ${resetLine.textContent}`,
+      [percentLine, resetLine],
+    );
+    const body = new FakeElement("BODY", [], "", [container]);
+    const root = new FakeRoot(
+      null,
+      body,
+      new Map<string, FakeElement[]>([["*", [container, percentLine, resetLine]]]),
+    );
+
+    const result = summariseDomShape({ conversationPath: true, candidates: [], tagProbes: [] }, root);
+
+    // The reset is reported as the panel's own text ("Oct 4 at 12:58 AM"), not as
+    // an ISO instant, matching the r42 field contract.
+    expect(result.usage_panel).toEqual({
+      found: true,
+      percent: 6,
+      resets: "Oct 4 at 12:58 AM",
+      period: "week",
+    });
+    // The sentinel sat beside the numbers and in a non-whitelisted attribute.
+    expect(JSON.stringify(result)).not.toContain(SENTINEL);
+  });
+
   it("reports an absent usage panel and an absent reply unit without inventing values", () => {
     const body = new FakeElement("BODY", [], "a conversation with no usage panel and no reply chrome");
     const root = new FakeRoot(null, body, new Map<string, FakeElement[]>([["*", [body]]]));

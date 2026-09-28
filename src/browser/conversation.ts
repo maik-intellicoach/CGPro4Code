@@ -659,6 +659,144 @@ export function parseProAvailableAfter(text: string): string | null {
   return formatLocalIso(date);
 }
 
+/** The account usage panel's own reading: percent, period and reset instant. */
+export interface UsagePanelRead {
+  percent: number | null;
+  period: "week" | "day" | "month" | null;
+  resetAt: string | null;
+}
+
+/**
+ * How far a year-less panel date may sit in the past before it is read as next
+ * year's. The panel names the NEXT reset, so a date just behind us is a page
+ * rendered mid-day, not a year-old instant.
+ */
+const USAGE_PANEL_PAST_GRACE_MS = 24 * 60 * 60 * 1_000;
+
+const USAGE_PANEL_PERCENT_RE = /(\d{1,3})%\s*usage remaining/i;
+const USAGE_PANEL_PERIOD_RE = /resets every\s+(week|day|month)/i;
+/**
+ * `Next reset is on <Mon> <d> at <h:mm> <AM|PM>`, with the year and the time both
+ * optional. The live panel (2026-09-28 15:25) read `Next reset is on Oct 4 at
+ * 12:58 AM` -- no year at all.
+ */
+const USAGE_PANEL_RESET_RE =
+  /next reset is on\s+([A-Za-z]+)\s+(\d{1,2})(?:,?\s+(\d{4}))?(?:\s+at\s+(\d{1,2}):(\d{2})\s*([AaPp][Mm]))?/i;
+
+/**
+ * The usage panel's text -> its percent, period and reset instant.
+ *
+ * P-035 G3 r45 (2026-09-28). The live panel read `6% usage remaining · Resets
+ * every week · Next reset is on Oct 4 at 12:58 AM`. The reset line carries no
+ * year, so the current local year is used; a date that would sit more than 24 h
+ * in the past rolls to the next year. A missing time means the start of that
+ * local day (`T00:00:00`), the same convention `parseProAvailableAfter` uses.
+ * Anything else returns null, which the caller reports as no known availability
+ * rather than inventing one.
+ *
+ * Pure and page-free, so the parser is unit-testable without a browser.
+ */
+export function parseUsagePanelText(text: string, now: Date = new Date()): UsagePanelRead | null {
+  const match = USAGE_PANEL_RESET_RE.exec(text);
+  if (!match) return null;
+  const month = PRO_MONTHS[match[1].toLowerCase()];
+  if (month === undefined) return null;
+  const day = Number(match[2]);
+  let hour = 0;
+  let minute = 0;
+  if (match[4] !== undefined) {
+    hour = Number(match[4]);
+    minute = Number(match[5]);
+    if (hour < 1 || hour > 12 || minute < 0 || minute > 59) return null;
+    if (match[6].toLowerCase() === "pm" && hour !== 12) hour += 12;
+    if (match[6].toLowerCase() === "am" && hour === 12) hour = 0;
+  }
+  let year = match[3] === undefined ? now.getFullYear() : Number(match[3]);
+  let date = new Date(year, month, day, hour, minute, 0, 0);
+  // Reject a rolled-over day (Feb 30 -> Mar 2): the panel must name a real date.
+  if (date.getFullYear() !== year || date.getMonth() !== month || date.getDate() !== day) return null;
+  if (match[3] === undefined && date.getTime() < now.getTime() - USAGE_PANEL_PAST_GRACE_MS) {
+    year += 1;
+    date = new Date(year, month, day, hour, minute, 0, 0);
+    if (date.getFullYear() !== year || date.getMonth() !== month || date.getDate() !== day) return null;
+  }
+  const percentMatch = USAGE_PANEL_PERCENT_RE.exec(text);
+  const periodMatch = USAGE_PANEL_PERIOD_RE.exec(text);
+  return {
+    percent: percentMatch ? Number(percentMatch[1]) : null,
+    period: periodMatch ? (periodMatch[1].toLowerCase() as "week" | "day" | "month") : null,
+    resetAt: formatLocalIso(date),
+  };
+}
+
+/**
+ * The account usage panel as ONE unit: percent, period and reset instant.
+ *
+ * P-035 G3 r45 (2026-09-28). The r42 probe found the percent but no reset, be-
+ * cause the reset sentence lives in a SIBLING of the percent line. The panel is
+ * therefore the SMALLEST visible element whose text carries BOTH phrases -- for
+ * two sibling lines that is their lowest common ancestor, the panel container --
+ * and only that element's text is parsed. Read-only through the page's own
+ * `evaluate`; only the three parsed fields leave the page. Never throws: an
+ * absent, hidden or unreadable panel is null.
+ */
+export async function readUsagePanel(page: Page): Promise<UsagePanelRead | null> {
+  try {
+    const found = await page.evaluate(
+      ({ usagePanelProbe }: { usagePanelProbe: boolean }) => {
+        void usagePanelProbe;
+        const percentRe = /(\d{1,3})%\s*usage remaining/i;
+        const resetRe = /next reset is on/i;
+        const visible = (element: Element): boolean => {
+          const style = window.getComputedStyle(element);
+          if (style.visibility === "hidden" || style.display === "none") return false;
+          if (Number.parseFloat(style.opacity || "1") === 0) return false;
+          const rect = element.getBoundingClientRect();
+          return !(rect.width === 0 && rect.height === 0);
+        };
+        let smallest: string | null = null;
+        for (const element of Array.from(document.querySelectorAll("body *"))) {
+          const html = element as HTMLElement;
+          const text =
+            typeof html.innerText === "string" && html.innerText.length > 0
+              ? html.innerText
+              : (element.textContent ?? "");
+          if (!percentRe.test(text) || !resetRe.test(text)) continue;
+          if (!visible(element)) continue;
+          if (smallest === null || text.length < smallest.length) smallest = text;
+        }
+        return smallest;
+      },
+      { usagePanelProbe: true },
+    );
+    if (typeof found !== "string" || found.length === 0) return null;
+    return parseUsagePanelText(found);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The reset instant for a limit notice, falling back to the account usage panel.
+ *
+ * P-035 G3 r45 (2026-09-28). The notice's own date always wins; the panel is
+ * read only when the notice names none (today's intelli record carried
+ * `limit_text: null`). The Python side then read a six-hour guess, where the
+ * panel states the real weekly reset. One content-free stderr line records the
+ * fallback; the panel's text never appears in it.
+ */
+async function availableAfterOrUsagePanel(page: Page, noticeDate: string | null): Promise<string | null> {
+  if (noticeDate !== null) return noticeDate;
+  const panel = await readUsagePanel(page);
+  if (panel?.resetAt) {
+    console.error(
+      `[cgpro:limit] reset from usage panel resetAt=${panel.resetAt} percent=${panel.percent ?? "-"}`,
+    );
+    return panel.resetAt;
+  }
+  return null;
+}
+
 /**
  * Index of the disabled `Pro` picker row, or -1 when it is absent or enabled.
  *
@@ -1251,8 +1389,13 @@ export async function ensureProSixMaximum(
     // in the composer for `sendPrompt` to remove.
     const proLimit = await detectProUsageLimit(page);
     if (proLimit) {
+      // P-035 G3 r45 (2026-09-28). The notice can name no date at all (today's
+      // intelli record: limit_text null), and the old fallback was a six-hour
+      // guess. The account usage panel states the real reset, so it is read here
+      // and only when the notice itself carries nothing.
+      const availableAfter = await availableAfterOrUsagePanel(page, proLimit.availableAfter);
       console.error(
-        `[cgpro:model] pro usage limit: availableAfter=${proLimit.availableAfter ?? "null"}`,
+        `[cgpro:model] pro usage limit: availableAfter=${availableAfter ?? "null"}`,
       );
       const limited = new PreSubmitInteractionError(
         "pro_usage_limit_reached",
@@ -1260,7 +1403,7 @@ export async function ensureProSixMaximum(
         proLimit.limitText
           ? `ChatGPT Pro usage limit reached before submission: ${proLimit.limitText}`
           : "ChatGPT Pro usage limit reached before submission",
-        { availableAfter: proLimit.availableAfter, limitText: proLimit.limitText },
+        { availableAfter, limitText: proLimit.limitText },
       );
       failedPhase = phase;
       failure = classifyInteractionFailure(limited);
@@ -4406,8 +4549,15 @@ function turnHeartbeat(
       lastEmittedAt = now;
       const read = await readTurnHeartbeat(page, elapsed, priorAssistantCount, priorAnyMessages);
       limitObservations = read.limit === null ? 0 : limitObservations + 1;
-      if (read.limit !== null && limitObservations >= TURN_LIMIT_CONSECUTIVE_OBSERVATIONS) {
-        confirmed = read.limit;
+      if (read.limit !== null && limitObservations >= TURN_LIMIT_CONSECUTIVE_OBSERVATIONS && confirmed === null) {
+        // P-035 G3 r45 (2026-09-28). The post-submit notice can name no date,
+        // exactly like the pre-send one. The account usage panel is read ONCE,
+        // here at the confirming observation -- never on every heartbeat -- and
+        // only when the notice itself carries no date.
+        confirmed = {
+          ...read.limit,
+          availableAfter: await availableAfterOrUsagePanel(page, read.limit.availableAfter),
+        };
       }
       notRenderedObservations = read.notRendered === null ? 0 : notRenderedObservations + 1;
       if (read.notRendered !== null && notRenderedObservations >= TURN_NOT_RENDERED_CONSECUTIVE_OBSERVATIONS) {
