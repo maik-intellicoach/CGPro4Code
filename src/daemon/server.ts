@@ -61,6 +61,7 @@ import {
   SubmittedTurnNotRenderedError,
 } from "../errors.js";
 import { SELECTORS, TURN_CRITICAL_SELECTORS, type SelectorSet } from "../browser/selectors.js";
+import { summariseDomShape, type DomShapeInput, type DomShapeSummary } from "../browser/dom-shape.js";
 import {
   clearDaemonInfo,
   DAEMON_FILE,
@@ -128,6 +129,44 @@ class BodyDisconnectedError extends Error {
 // never occupy a queue slot (see handleAsk). Exported for tests.
 export const BODY_READ_TIMEOUT_MS = Math.max(1, Number(process.env.CGPRO_DAEMON_BODY_TIMEOUT_MS) || 30_000);
 export const BODY_MAX_BYTES = Math.max(1, Number(process.env.CGPRO_DAEMON_BODY_MAX_BYTES) || 20 * 1024 * 1024);
+
+// P-035 2026-09-28 (vendor r39). Bounds on the read-only DOM shape probe.
+// The settle budget is the 20s the brief allows for the page to render its
+// conversation: wait for `main` (15s, best-effort) then let it sit for 5s so a
+// streamed reply's markup is present before the single evaluate reads it.
+const DOM_SHAPE_SETTLE_TIMEOUT_MS = 15_000;
+const DOM_SHAPE_SETTLE_MS = 5_000;
+/**
+ * The SELECTORS keys the probe counts candidate-by-candidate. These are the
+ * keys whose failure to resolve lost every answer on 2026-09-28 (`msgs=0/0`),
+ * plus the markdown body and the action bar that travel with them.
+ */
+const DOM_SHAPE_CANDIDATE_KEYS: Array<keyof SelectorSet> = [
+  "anyMessages",
+  "assistantMessages",
+  "assistantMarkdown",
+  "assistantActionBar",
+  "stopButton",
+];
+/** Fixed tag probes, all resolved inside `main` (or `document.body`). */
+const DOM_SHAPE_TAG_PROBES = [
+  "article",
+  "section",
+  '[class*="markdown"]',
+  '[class*="prose"]',
+  "h1, h2, h3, h4, h5, h6",
+  "pre",
+  "button",
+];
+
+/** `url_path_kind` for a page URL: a conversation lives under `/c/`. */
+function urlPathIsConversation(rawUrl: string): boolean {
+  try {
+    return new URL(rawUrl).pathname.includes("/c/");
+  } catch {
+    return false;
+  }
+}
 
 // C-092 P-026 xfam r2 B1: bound only the PRE-response phase (receiving
 // headers, then the request body) — Node clears both timers once the full
@@ -870,6 +909,109 @@ export async function handleRequest(
     res.end(JSON.stringify({
       ok: true, inFlight, results, critical: TURN_CRITICAL_SELECTORS, missingCritical, pageIdentity,
     }));
+    return;
+  }
+
+  // P-035 2026-09-28 (vendor r39). Read-only, content-free DOM shape probe of one
+  // existing conversation.
+  //
+  // On 2026-09-28 every answer was lost: a turn was answered by ChatGPT while
+  // the heartbeat read `msgs=0/0`, because none of SELECTORS.anyMessages /
+  // SELECTORS.assistantMessages matched the current conversation markup. The
+  // audit above can only say a selector stopped resolving; it cannot say what
+  // the markup became. This route opens one conversation id on an idle slot and
+  // returns the new markup's SHAPE -- names, counts, lengths and a small
+  // whitelist of enumerated attribute values, never text -- so the selector fix
+  // can be written from evidence instead of a guess.
+  //
+  // It navigates, so it must hold the lane exactly like the /reload idle path:
+  // same queue admission, same lease, same release in `finally`. It changes no
+  // selector and no turn logic; it only reads.
+  if (method === "POST" && url.pathname === "/dom-shape") {
+    let body: { conversationId?: string } | null;
+    try {
+      state.readerBudget.acquire();
+    } catch (err) {
+      if (err instanceof ReaderBudgetExceededError) {
+        res.writeHead(429, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "reader_budget_exceeded", active: err.active }));
+        return;
+      }
+      throw err;
+    }
+    try {
+      body = await readJsonBody<{ conversationId?: string }>(req);
+    } catch (err) {
+      const status = err instanceof BodyTimeoutError ? 408 : err instanceof BodyTooLargeError ? 413 : 400;
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: status === 408 ? "body_timeout" : status === 413 ? "body_too_large" : "invalid_request" }));
+      return;
+    } finally {
+      state.readerBudget.release();
+    }
+    // Unlike /reload, the conversation id is the whole request: the probe has
+    // nothing to open without it. Same shape check, no fallback to the slot's
+    // last conversation.
+    const requested = body?.conversationId?.trim();
+    if (!requested || !/^[0-9a-f-]{36}$/i.test(requested)) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_conversation_id" }));
+      return;
+    }
+    const slots = slotsOf(state);
+    const slot = slots.find((candidate) => !candidate.busy);
+    if (!slot || !state.queue.tryAcquire()) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "busy" }));
+      return;
+    }
+    slot.busy = true;
+    slot.leasedBy = "dom-shape";
+    applyWorkPosture(state, slot, true);
+    log.info(`slot leased slot=${slot.id} by=dom-shape`);
+    try {
+      const page = await slotPage(state, slot);
+      await page.goto(`https://chatgpt.com/c/${requested}`, { waitUntil: "domcontentloaded" });
+      await page.waitForSelector("main", { timeout: DOM_SHAPE_SETTLE_TIMEOUT_MS }).catch(() => undefined);
+      await page.waitForTimeout(DOM_SHAPE_SETTLE_MS);
+      const input: DomShapeInput = {
+        conversationPath: urlPathIsConversation(page.url()),
+        candidates: DOM_SHAPE_CANDIDATE_KEYS.map((key) => ({
+          key: key.toString(),
+          selectors: SELECTORS[key],
+        })),
+        tagProbes: DOM_SHAPE_TAG_PROBES,
+      };
+      // ONE evaluate, and it returns only counts, names, lengths and sanitised
+      // enumerated values (see browser/dom-shape.ts).
+      const summary: DomShapeSummary = await page.evaluate(summariseDomShape, input);
+      log.info(
+        `dom-shape probe conversation=${requested.slice(0, 8)} url_path_kind=${summary.url_path_kind} ` +
+          `data_attrs=${summary.data_attr_names.length} testids=${summary.testids.length} ` +
+          `roles=${summary.roles.length} author_roles=${summary.author_roles.length} ` +
+          `turn_containers=${summary.turn_containers.length} ` +
+          `candidate_matches=${summary.candidates.reduce(
+            (n, entry) => n + entry.matches.filter((match) => match.count > 0).length,
+            0,
+          )}`,
+      );
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(summary));
+    } catch (error) {
+      // The probe is a diagnostic, so it may fail; it may never leak a page's
+      // text on the way out. Only a single-line, bounded error message travels.
+      const message = String((error as Error)?.message ?? "unknown error")
+        .replace(/\s+/g, " ")
+        .slice(0, 200);
+      log.error(`dom-shape probe failed conversation=${requested.slice(0, 8)}: ${message}`);
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "dom_shape_failed", detail: message }));
+      }
+    } finally {
+      releaseSlot(state, slot, "dom-shape");
+      state.queue.release();
+    }
     return;
   }
 

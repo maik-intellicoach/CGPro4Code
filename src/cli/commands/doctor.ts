@@ -3,7 +3,7 @@ import ora from "ora";
 import { openSession } from "../../browser/session.js";
 import { goHome, isLoggedIn } from "../../browser/chatgpt.js";
 import { SELECTORS, TURN_CRITICAL_SELECTORS, type SelectorSet } from "../../browser/selectors.js";
-import { assertNoDaemon, fetchSelectorAudit, getLiveDaemon } from "../../daemon/client.js";
+import { assertNoDaemon, fetchSelectorAudit, getLiveDaemon, probeDomShape } from "../../daemon/client.js";
 import { readDaemonInfo } from "../../daemon/protocol.js";
 
 export interface DoctorOptions {
@@ -11,6 +11,8 @@ export interface DoctorOptions {
   headed?: boolean;
   /** Audit the running daemon's own page instead of opening a browser. */
   viaDaemon?: boolean;
+  /** Probe one conversation's DOM shape through the daemon (read-only, content-free). */
+  domShape?: string;
 }
 
 /**
@@ -126,7 +128,65 @@ async function doctorViaDaemon(): Promise<number> {
   );
 }
 
+/**
+ * Probe the shape of one conversation's DOM through the daemon
+ * (P-035 2026-09-28, vendor r39).
+ *
+ * Prints the daemon's content-free JSON summary and exits 0. Every failure --
+ * no daemon, a refusal (409 `busy`, 400 `invalid_conversation_id`) or a failed
+ * probe (502 `dom_shape_failed`) -- prints the route's own error code and exits
+ * non-zero, so a caller can script it.
+ */
+async function doctorDomShape(conversationId: string): Promise<number> {
+  const info = readDaemonInfo();
+  if (!info) {
+    console.error(
+      chalk.red("✖ No daemon is registered. Start a lane first: cgpro daemon start"),
+    );
+    return 6;
+  }
+  const live = await getLiveDaemon();
+  if (!live) {
+    console.error(chalk.red("✖ The registered daemon is not answering."));
+    return 6;
+  }
+  const spinner = ora(`Probing the DOM shape of conversation ${conversationId.slice(0, 8)}…`).start();
+  // Failures are written to stderr, not to the spinner: the route's error code
+  // is the part a caller scripts on, so it must not be swallowed by an
+  // interactive spinner line.
+  const fail = (message: string): number => {
+    spinner.stop();
+    console.error(chalk.red(`✖ ${message}`));
+    return 6;
+  };
+  const result = await probeDomShape(live, conversationId);
+  if (result.status === 0) return fail("The daemon never answered the probe.");
+  if (result.status !== 200) {
+    let code = `http_${result.status}`;
+    try {
+      const parsed = JSON.parse(result.text) as { error?: string };
+      if (parsed?.error) code = parsed.error;
+    } catch {
+      /* keep the http_<status> fallback */
+    }
+    return fail(`The daemon refused the dom-shape probe: ${code}`);
+  }
+  let summary: unknown;
+  try {
+    summary = JSON.parse(result.text);
+  } catch {
+    return fail("The daemon returned a probe result that is not JSON.");
+  }
+  spinner.succeed(`Probed conversation ${conversationId.slice(0, 8)} — content-free summary follows.`);
+  console.log(JSON.stringify(summary, null, 2));
+  return 0;
+}
+
 export async function doctorCommand(opts: DoctorOptions): Promise<number> {
+  // P-035 2026-09-28 (vendor r39). The probe runs on the daemon's own
+  // authenticated page, so `--dom-shape` implies the daemon path whether or not
+  // `--via-daemon` was passed with it.
+  if (opts.domShape) return await doctorDomShape(opts.domShape);
   if (opts.viaDaemon) return await doctorViaDaemon();
 
   await assertNoDaemon("doctor", opts.profile);

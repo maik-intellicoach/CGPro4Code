@@ -173,6 +173,24 @@ export async function getDaemonStatus(info: DaemonInfo): Promise<StatusResponse 
   return await jsonRequest<StatusResponse>(info, "GET", "/status", null);
 }
 
+/**
+ * Read-only, content-free DOM shape probe of one conversation
+ * (P-035 2026-09-28, vendor r39).
+ *
+ * Returns the raw HTTP result rather than a parsed body so the caller can tell
+ * a refusal (409 `busy`, 400 `invalid_conversation_id`) from a failed probe
+ * (502 `dom_shape_failed`) and name the route's own error code. `status: 0`
+ * means the request never completed.
+ */
+export async function probeDomShape(
+  info: DaemonInfo,
+  conversationId: string,
+): Promise<{ status: number; text: string }> {
+  // The route opens the conversation and lets the page settle (<=20s) before
+  // its one evaluate, so it needs far more than the 5s control-request default.
+  return await rawRequest(info, "POST", "/dom-shape", { conversationId }, 120_000);
+}
+
 export async function requestDaemonReload(
   info: DaemonInfo,
   conversationId?: string,

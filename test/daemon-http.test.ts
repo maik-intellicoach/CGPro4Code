@@ -1506,3 +1506,144 @@ it("carries the Pro usage limit fields on the preflight 409", async () => {
     failureCode: "pro_usage_limit_reached",
   });
 });
+
+describe("daemon-side DOM shape probe", () => {
+  // P-035 2026-09-28 (vendor r39). The r38 heartbeat read `msgs=0/0` on a
+  // conversation ChatGPT had answered, because no SELECTORS message candidate
+  // matched the current markup. This route is the evidence-gathering half: one
+  // existing conversation, one evaluate, a content-free structural summary.
+  const conversationId = "6aba1a07-ab94-83ec-b213-ebac061f4e2d";
+  const SUMMARY = {
+    url_path_kind: "conversation",
+    data_attr_names: [],
+    testids: [],
+    roles: [],
+    author_roles: [],
+    tags: [],
+    candidates: [],
+    turn_containers: [],
+  };
+
+  function fakeShapePage(overrides: Record<string, unknown> = {}) {
+    return {
+      isClosed: () => false,
+      url: () => `https://chatgpt.com/c/${conversationId}`,
+      goto: vi.fn(async () => null),
+      waitForSelector: vi.fn(async () => null),
+      waitForTimeout: vi.fn(async () => undefined),
+      evaluate: vi.fn(async () => SUMMARY),
+      ...overrides,
+    };
+  }
+
+  async function probe(state: ServerState, body: unknown): Promise<FakeRes> {
+    const req = new FakeReq() as unknown as IncomingMessage;
+    const res = new FakeRes() as unknown as ServerResponse;
+    Object.assign(req, {
+      method: "POST",
+      url: "/dom-shape",
+      headers: { authorization: "Bearer test-token" },
+    });
+    const pending = handleRequest(req, res, state);
+    sendBody(req, body);
+    await pending;
+    return res as unknown as FakeRes;
+  }
+
+  it("validates the conversation id before it touches a slot", async () => {
+    const page = fakeShapePage();
+    const state = fakeState({ session: { page } as unknown as Session });
+    const res = await probe(state, { conversationId: "not-a-uuid" });
+    expect(res.statusCode).toBe(400);
+    expect(parseJsonBody(res)).toEqual({ error: "invalid_conversation_id" });
+    expect(page.goto).not.toHaveBeenCalled();
+    expect(state.queue.busy).toBe(false);
+  });
+
+  it("requires a conversation id", async () => {
+    const page = fakeShapePage();
+    const state = fakeState({ session: { page } as unknown as Session });
+    const res = await probe(state, {});
+    expect(res.statusCode).toBe(400);
+    expect(parseJsonBody(res)).toEqual({ error: "invalid_conversation_id" });
+    expect(page.goto).not.toHaveBeenCalled();
+  });
+
+  it("refuses with 409 busy when no slot is idle", async () => {
+    const page = fakeShapePage();
+    const state = fakeState({ session: { page } as unknown as Session });
+    const slot = slotsOf(state)[0];
+    slot.busy = true;
+    slot.leasedBy = "ask";
+    const res = await probe(state, { conversationId });
+    expect(res.statusCode).toBe(409);
+    expect(parseJsonBody(res)).toEqual({ error: "busy" });
+    expect(page.goto).not.toHaveBeenCalled();
+  });
+
+  it("leases an idle slot, opens the conversation and returns the summary", async () => {
+    const page = fakeShapePage();
+    const state = fakeState({ session: { page } as unknown as Session });
+    const res = await probe(state, { conversationId });
+
+    expect(res.statusCode).toBe(200);
+    expect(parseJsonBody(res)).toEqual(SUMMARY);
+    expect(page.goto).toHaveBeenCalledWith(`https://chatgpt.com/c/${conversationId}`, {
+      waitUntil: "domcontentloaded",
+    });
+    // ONE evaluate, as the route promises: the summary is read once, not per key.
+    expect(page.evaluate).toHaveBeenCalledTimes(1);
+    expect(slotsOf(state)[0].busy).toBe(false);
+    expect(slotsOf(state)[0].leasedBy).toBeNull();
+    expect(state.queue.busy).toBe(false);
+  });
+
+  it("releases the slot and the queue when the evaluate fails", async () => {
+    const page = fakeShapePage({
+      evaluate: vi.fn(async () => {
+        throw new Error("Execution context was destroyed");
+      }),
+    });
+    const state = fakeState({ session: { page } as unknown as Session });
+    const res = await probe(state, { conversationId });
+
+    expect(res.statusCode).toBe(502);
+    expect(parseJsonBody(res)).toMatchObject({ error: "dom_shape_failed" });
+    expect(slotsOf(state)[0].busy).toBe(false);
+    expect(state.queue.busy).toBe(false);
+  });
+
+  it("releases the slot and the queue when the navigation fails", async () => {
+    const page = fakeShapePage({
+      goto: vi.fn(async () => {
+        throw new Error("net::ERR_ABORTED");
+      }),
+    });
+    const state = fakeState({ session: { page } as unknown as Session });
+    const res = await probe(state, { conversationId });
+
+    expect(res.statusCode).toBe(502);
+    expect(parseJsonBody(res)).toMatchObject({ error: "dom_shape_failed" });
+    expect(slotsOf(state)[0].busy).toBe(false);
+    expect(state.queue.busy).toBe(false);
+  });
+
+  it("logs one line naming only the conversation prefix and counts", async () => {
+    const { readFileSync } = await import("node:fs");
+    const page = fakeShapePage();
+    const state = fakeState({ session: { page } as unknown as Session });
+    await probe(state, { conversationId });
+
+    const log = readFileSync(process.env.CGPRO_DAEMON_LOG as string, "utf-8");
+    const line = log
+      .split("\n")
+      .filter((entry) => entry.includes("dom-shape probe"))
+      .pop();
+    expect(line).toBeDefined();
+    expect(line).toContain(`conversation=${conversationId.slice(0, 8)}`);
+    // The full id never lands in a shared log; counts do.
+    expect(line).not.toContain(conversationId);
+    expect(line).toContain("url_path_kind=conversation");
+    expect(line).toContain("data_attrs=0");
+  });
+});

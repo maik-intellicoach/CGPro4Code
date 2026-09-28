@@ -124,6 +124,10 @@ program
     "--via-daemon",
     "audit the running daemon's own page (already signed in) instead of opening a browser",
   )
+  .option(
+    "--dom-shape <conversationId>",
+    "read-only, content-free DOM shape probe of one conversation, served by the daemon",
+  )
   .action(async (opts) => {
     const code = await runOrExit(() => doctorCommand(opts));
     process.exit(code);
