@@ -144,6 +144,40 @@ describe("summariseDomShape", () => {
     const user = new FakeElement("DIV", [{ name: "data-message-author-role", value: "user" }], "hi");
     const assistantA = new FakeElement("DIV", [{ name: "data-message-author-role", value: "assistant" }], "a");
     const assistantB = new FakeElement("DIV", [{ name: "data-message-author-role", value: "assistant" }], "b");
+    // P-035 2026-09-28 (vendor r42). The two new reads are seeded too, each with
+    // the sentinel in a NON-whitelisted position: beside the percent and before
+    // "Next reset is on", inside a notice's text, after the worked-for line and
+    // in attributes nothing reads. The last assertion in this test proves none of
+    // it survives.
+    const usagePanel = new FakeElement(
+      "DIV",
+      [{ name: "aria-label", value: SENTINEL }],
+      `${SENTINEL} 6% usage remaining · Resets every week · Next reset is on Oct 4 at 12:58 AM`,
+    );
+    const sentinelNotice = new FakeElement(
+      "DIV",
+      [
+        { name: "role", value: "alert" },
+        { name: "title", value: SENTINEL },
+      ],
+      `Something went wrong ${SENTINEL}`,
+    );
+    const sentinelUnit = new FakeElement(
+      "DIV",
+      [
+        { name: "data-content-search-unit-key", value: "unit-sentinel" },
+        { name: "data-conversation-role", value: "assistant" },
+        { name: "class", value: `markdown ${SENTINEL}` },
+        { name: "title", value: SENTINEL },
+      ],
+      `Worked for 2m 9s ${SENTINEL}`,
+      [sentinelNotice],
+      new Map<string, FakeElement[]>([
+        ["*", [sentinelNotice]],
+        ["button", []],
+        ["[data-user-message-bubble]", []],
+      ]),
+    );
     const root = new FakeRoot(
       main,
       main,
@@ -152,6 +186,9 @@ describe("summariseDomShape", () => {
         ["div[data-message-author-role]", [user, assistantA, assistantB]],
         ['div[data-message-author-role="assistant"]', [assistantA, assistantB]],
         ["main article", [turn3]],
+        ["*", [usagePanel, sentinelUnit]],
+        ["[data-content-search-unit-key]", [sentinelUnit]],
+        ["[data-content-search-unit-key]:not(:has([data-user-message-bubble]))", [sentinelUnit]],
       ]),
       new Set(['button:has-text("Stop generating")']),
     );
@@ -213,6 +250,20 @@ describe("summariseDomShape", () => {
     });
     expect(result.turn_containers[1].tag).toBe("div");
     expect(result.turn_containers[1].classCount).toBe(2);
+
+    // The r42 reads are populated (so an empty implementation cannot pass this
+    // test by accident) and are still content-free.
+    expect(result.usage_panel).toEqual({
+      found: true,
+      percent: 6,
+      resets: "Oct 4 at 12:58 AM",
+      period: "week",
+    });
+    expect(result.reply_chrome.buttons).toEqual([]);
+    expect(result.reply_chrome.notices).toEqual([
+      { len: `Something went wrong ${SENTINEL}`.length, tokens: ["went-wrong"] },
+    ]);
+    expect(result.reply_chrome.header).toEqual({ exists: true, duration: "2m 9s" });
 
     // The contract, in one assertion: no text node and no non-whitelisted
     // attribute value survives anywhere in the payload.
@@ -323,5 +374,117 @@ describe("summariseDomShape", () => {
     ]);
     // The whole contract once more: no text node survives in the new fields.
     expect(JSON.stringify(result)).not.toContain(SENTINEL);
+  });
+
+  // P-035 2026-09-28 (vendor r42). The live question was WHY a Pro reply stopped
+  // at 220 characters. Two candidates: the account's weekly allowance ran out
+  // (the page shows a usage panel) or the reply carried an error notice with a
+  // retry control. Both are read here as numbers and fixed words only.
+  it("reports the usage panel as percent, period and reset line only", () => {
+    const panelText = "6% usage remaining · Resets every week · Next reset is on Oct 4 at 12:58 AM";
+    const panel = new FakeElement("DIV", [], panelText);
+    // Every ancestor matches too, with the panel's text plus more. The SMALLEST
+    // match is the panel itself, so the ancestor's extra words must not reach
+    // `resets`.
+    const outer = new FakeElement("DIV", [], `${panelText} and then a footer`);
+    const body = new FakeElement("BODY", [], "", [outer, panel]);
+    const root = new FakeRoot(null, body, new Map<string, FakeElement[]>([["*", [outer, panel]]]));
+
+    const result = summariseDomShape({ conversationPath: true, candidates: [], tagProbes: [] }, root);
+
+    expect(result.usage_panel).toEqual({
+      found: true,
+      percent: 6,
+      resets: "Oct 4 at 12:58 AM",
+      period: "week",
+    });
+    // The ancestor's extra text is not part of any reported field.
+    expect(JSON.stringify(result)).not.toContain("footer");
+  });
+
+  it("reports an absent usage panel and an absent reply unit without inventing values", () => {
+    const body = new FakeElement("BODY", [], "a conversation with no usage panel and no reply chrome");
+    const root = new FakeRoot(null, body, new Map<string, FakeElement[]>([["*", [body]]]));
+
+    const result = summariseDomShape({ conversationPath: true, candidates: [], tagProbes: [] }, root);
+
+    expect(result.usage_panel).toEqual({ found: false, percent: 0, resets: "-", period: "-" });
+    expect(result.reply_chrome).toEqual({
+      buttons: [],
+      notices: [],
+      header: { exists: false, duration: "-" },
+    });
+  });
+
+  it("reports reply buttons, notice shapes and the worked-for header as chrome only", () => {
+    const copy = new FakeElement("BUTTON", [{ name: "aria-label", value: "Copy" }], "Copy");
+    const retry = new FakeElement("BUTTON", [{ name: "aria-label", value: "Try again" }], "Try again");
+    const innerNotice = new FakeElement("SPAN", [], "Something went wrong. Try again later");
+    // The outer wrapper matches the notice predicate too, but it holds a matching
+    // child, so it is a container: only the innermost notice is reported.
+    const outerNotice = new FakeElement(
+      "DIV",
+      [{ name: "role", value: "status" }],
+      "Something went wrong. Try again later",
+      [innerNotice],
+      new Map<string, FakeElement[]>([["*", [innerNotice]]]),
+    );
+    const answer = new FakeElement("DIV", [{ name: "class", value: "markdown" }], "The answer itself");
+    const replyUnit = new FakeElement(
+      "DIV",
+      [
+        { name: "data-content-search-unit-key", value: "unit-2" },
+        { name: "data-conversation-role", value: "assistant" },
+      ],
+      "Worked for 2m 9s",
+      [copy, retry, outerNotice, innerNotice, answer],
+      new Map<string, FakeElement[]>([
+        ["button", [copy, retry]],
+        ["*", [copy, retry, outerNotice, innerNotice, answer]],
+        ["[data-user-message-bubble]", []],
+        ['[class*="markdown"]', [answer]],
+        ["[data-markdown-copy]", []],
+        ["[data-conversation-role]", []],
+      ]),
+    );
+    const userUnit = new FakeElement(
+      "DIV",
+      [
+        { name: "data-content-search-unit-key", value: "unit-1" },
+        { name: "data-conversation-role", value: "user" },
+      ],
+      "the question",
+      [],
+      new Map<string, FakeElement[]>([
+        ["[data-user-message-bubble]", [new FakeElement("DIV", [], "the question")]],
+      ]),
+    );
+    const body = new FakeElement("BODY", [], "", [userUnit, replyUnit]);
+    const root = new FakeRoot(
+      null,
+      body,
+      new Map<string, FakeElement[]>([
+        ["[data-content-search-unit-key]", [userUnit, replyUnit]],
+        ["[data-content-search-unit-key]:not(:has([data-user-message-bubble]))", [replyUnit]],
+      ]),
+    );
+
+    const result = summariseDomShape({ conversationPath: true, candidates: [], tagProbes: [] }, root);
+
+    // Labels only, sanitised; the buttons' own text never travels.
+    expect(result.reply_chrome.buttons).toEqual(["Copy", "Try again"]);
+    // The shape of each notice, in document order: its length and the fixed
+    // vocabulary words it matched -- "try again" (r38) plus "went wrong" (r42) --
+    // never text. The "Try again" button is a notice candidate too, because its
+    // own text matches the predicate; the outer `role="status"` wrapper is not,
+    // because it holds a matching child.
+    expect(result.reply_chrome.notices).toEqual([
+      { len: "Try again".length, tokens: ["try-again"] },
+      { len: "Something went wrong. Try again later".length, tokens: ["try-again", "went-wrong"] },
+    ]);
+    expect(result.reply_chrome.header).toEqual({ exists: true, duration: "2m 9s" });
+    // The answer body sits inside the reply unit and must not surface anywhere.
+    expect(JSON.stringify(result)).not.toContain("The answer itself");
+    expect(JSON.stringify(result)).not.toContain("Something went wrong");
   });
 });

@@ -80,6 +80,32 @@ export interface DomShapeSummary {
     textLength: number;
     conversationRole: string;
   }>;
+  /**
+   * P-035 2026-09-28 (vendor r42). The account usage panel -- "6% usage
+   * remaining · Resets every week · Next reset is on Oct 4 at 12:58 AM" --
+   * read content-free: the percent, the period word and the sanitised text that
+   * follows "Next reset is on". Nothing else from the element travels, so a
+   * sentinel sitting beside the numbers never leaves the page.
+   */
+  usage_panel: {
+    found: boolean;
+    percent: number;
+    resets: string;
+    period: string;
+  };
+  /**
+   * P-035 2026-09-28 (vendor r42). The LAST assistant message unit's own chrome:
+   * the sanitised `aria-label` of every button inside it, a content-free shape
+   * (length + fixed-vocabulary tokens) per alert/status/error-ish notice, and
+   * whether the unit leads with a "Worked for"/"Thought for" line. Buttons are
+   * labels only, notices are lengths and fixed words only, header is a boolean
+   * and a duration -- no notice text, no answer text.
+   */
+  reply_chrome: {
+    buttons: string[];
+    notices: Array<{ len: number; tokens: string[] }>;
+    header: { exists: boolean; duration: string };
+  };
 }
 
 /**
@@ -210,8 +236,9 @@ export function summariseDomShape(input: DomShapeInput, root?: DomShapeRoot): Do
     textLength: number;
     conversationRole: string;
   }> = [];
+  let unitElements: DomShapeNode[] = [];
   try {
-    const unitElements = Array.from(doc.querySelectorAll("[data-content-search-unit-key]"));
+    unitElements = Array.from(doc.querySelectorAll("[data-content-search-unit-key]"));
     unitElements.forEach((unit, index) => {
       const countDescendants = (selector: string): number => {
         try {
@@ -246,6 +273,179 @@ export function summariseDomShape(input: DomShapeInput, root?: DomShapeRoot): Do
     });
   } catch {
     /* an unreadable unit list is an empty one, never a thrown probe */
+  }
+
+  // P-035 2026-09-28 (vendor r42). Two new content-free reads. The probe itself
+  // is unchanged: still one `page.evaluate`, still no text. `isVisible` is
+  // element-local and answers `true` whenever the page cannot answer (a fake DOM
+  // has no `style`/`checkVisibility`), so it can only ever narrow a set that the
+  // page itself says is hidden.
+  const isVisible = (el: DomShapeNode): boolean => {
+    try {
+      const node = el as unknown as {
+        hidden?: boolean;
+        style?: { display?: string; visibility?: string };
+        checkVisibility?: () => boolean;
+      };
+      if (node.hidden === true) return false;
+      if (readAttr(el, "hidden") !== null) return false;
+      if (readAttr(el, "aria-hidden") === "true") return false;
+      const style = node.style;
+      if (style && (style.display === "none" || style.visibility === "hidden")) return false;
+      if (typeof node.checkVisibility === "function") return node.checkVisibility() === true;
+      return true;
+    } catch {
+      return true;
+    }
+  };
+
+  // (1) The usage panel, anywhere in the document: the panel is a popover, so it
+  // may live outside `<main>`. The SMALLEST visible element whose text carries
+  // "NN% usage remaining" is the panel itself; every larger match is one of its
+  // ancestors. Only percent, the period word and the reset line are read out.
+  const USAGE_RE = /(\d{1,3})%\s*usage remaining/i;
+  const usage_panel: { found: boolean; percent: number; resets: string; period: string } = {
+    found: false,
+    percent: 0,
+    resets: "-",
+    period: "-",
+  };
+  try {
+    let smallest: { text: string } | null = null;
+    for (const el of Array.from(doc.querySelectorAll("*"))) {
+      const text = el.textContent ?? "";
+      if (!USAGE_RE.test(text)) continue;
+      if (!isVisible(el)) continue;
+      if (smallest === null || text.length < smallest.text.length) smallest = { text };
+    }
+    if (smallest !== null) {
+      const text = smallest.text;
+      const percentMatch = USAGE_RE.exec(text);
+      const periodMatch = /resets every\s+(week|day|month)/i.exec(text);
+      const resetMatch = /next reset is on\s*([\s\S]*)$/i.exec(text);
+      let resets = "-";
+      if (resetMatch && resetMatch[1]) {
+        const clean = sanitise(resetMatch[1]).trim();
+        if (clean.length > 0) resets = clean.slice(0, 40);
+      }
+      usage_panel.found = true;
+      usage_panel.percent = percentMatch ? Number(percentMatch[1]) : 0;
+      usage_panel.period = periodMatch ? periodMatch[1].toLowerCase() : "-";
+      usage_panel.resets = resets;
+    }
+  } catch {
+    /* an unreadable document is an unfound panel, never a thrown probe */
+  }
+
+  // (2) The last ASSISTANT unit's chrome. The unit is `data-content-search-unit-key`
+  // without a user bubble inside it; `:has()` may be unanswerable in an old
+  // engine, so the same filter is recomputed from the unit list as a fallback.
+  const REPLY_NOTICE_RE = /something went wrong|error|try again|retry|limit|usage|network|stopped|interrupted/i;
+  const NOTICE_TOKENS: ReadonlyArray<readonly [token: string, pattern: RegExp]> = [
+    ["limit", /limit/i],
+    ["usage", /usage/i],
+    ["reached", /reached/i],
+    ["upgrade", /upgrade/i],
+    ["try-again", /try again/i],
+    ["error", /error/i],
+    ["network", /network/i],
+    ["remaining", /remaining/i],
+    ["reset", /reset/i],
+    ["plan", /plan/i],
+    ["pro", /pro/i],
+    ["unable", /unable/i],
+    ["rate", /rate/i],
+    ["went-wrong", /went wrong/i],
+    ["retry", /retry/i],
+    ["stopped", /stopped/i],
+    ["interrupted", /interrupted/i],
+  ];
+  const reply_chrome: {
+    buttons: string[];
+    notices: Array<{ len: number; tokens: string[] }>;
+    header: { exists: boolean; duration: string };
+  } = {
+    buttons: [],
+    notices: [],
+    header: { exists: false, duration: "-" },
+  };
+  try {
+    let replyUnit: DomShapeNode | null = null;
+    try {
+      const matches = Array.from(
+        doc.querySelectorAll("[data-content-search-unit-key]:not(:has([data-user-message-bubble]))"),
+      );
+      if (matches.length > 0) replyUnit = matches[matches.length - 1] ?? null;
+    } catch {
+      replyUnit = null;
+    }
+    if (!replyUnit) {
+      for (const unit of unitElements) {
+        let hasBubble = false;
+        try {
+          hasBubble = unit.querySelectorAll("[data-user-message-bubble]").length > 0;
+        } catch {
+          hasBubble = false;
+        }
+        if (!hasBubble) replyUnit = unit;
+      }
+    }
+    if (replyUnit) {
+      const unit: DomShapeNode = replyUnit;
+      // (a) Button labels, sanitised, 40 chars each, at most 20 of them.
+      try {
+        const labels: string[] = [];
+        for (const button of Array.from(unit.querySelectorAll("button"))) {
+          if (!isVisible(button)) continue;
+          const label = sanitise(readAttr(button, "aria-label")).slice(0, 40);
+          if (label.length > 0) labels.push(label);
+          if (labels.length >= 20) break;
+        }
+        reply_chrome.buttons = labels;
+      } catch {
+        /* an unreadable button list is an empty one */
+      }
+      // (b) Notices: role alert/status or an error-ish text, innermost only. The
+      // shape is the trimmed length plus the fixed-vocabulary tokens, never text.
+      try {
+        const matchesNotice = (el: DomShapeNode): boolean => {
+          const role = (readAttr(el, "role") ?? "").toLowerCase();
+          if (role === "alert" || role === "status") return true;
+          return REPLY_NOTICE_RE.test(el.textContent ?? "");
+        };
+        for (const el of Array.from(unit.querySelectorAll("*"))) {
+          if (!matchesNotice(el)) continue;
+          if (!isVisible(el)) continue;
+          let hasMatchingChild = false;
+          try {
+            hasMatchingChild = Array.from(el.querySelectorAll("*")).some((child) => matchesNotice(child));
+          } catch {
+            hasMatchingChild = false;
+          }
+          if (hasMatchingChild) continue;
+          const trimmed = (el.textContent ?? "").trim();
+          reply_chrome.notices.push({
+            len: trimmed.length,
+            tokens: NOTICE_TOKENS.filter(([, pattern]) => pattern.test(trimmed)).map(([token]) => token),
+          });
+        }
+      } catch {
+        /* an unreadable notice list is an empty one */
+      }
+      // (c) The leading "Worked for"/"Thought for" line, if the unit opens with one.
+      try {
+        const leading = (unit.textContent ?? "").replace(/^\s+/, "");
+        const headerMatch = /^(worked|thought) for\s+((?:\d+\s*[hms]\s*){1,3})/i.exec(leading);
+        if (headerMatch) {
+          const duration = sanitise(headerMatch[2]).trim().slice(0, 20);
+          reply_chrome.header = { exists: true, duration: duration.length > 0 ? duration : "-" };
+        }
+      } catch {
+        /* a unit whose text cannot be read has no header */
+      }
+    }
+  } catch {
+    /* an unreadable document leaves the reply chrome empty, never a thrown probe */
   }
 
   const byName = (map: Map<string, number>): Array<{ name: string; count: number }> =>
@@ -284,5 +484,7 @@ export function summariseDomShape(input: DomShapeInput, root?: DomShapeRoot): Do
     })),
     turn_containers: turnContainers,
     units,
+    usage_panel,
+    reply_chrome,
   };
 }
