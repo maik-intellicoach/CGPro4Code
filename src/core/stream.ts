@@ -139,6 +139,8 @@ class PageStreamState {
   expectedReloadNavigation = false;
   generation = 0;
   observers = new Map<string, number>();
+  /** Interceptor stream breaks seen for this page; completion is DOM-owned. */
+  streamBreaks = 0;
 }
 
 /**
@@ -191,8 +193,17 @@ export async function ensureInterceptorInstalled(context: BrowserContext): Promi
       state.observers.delete(observerId);
       if (!state.emitter) return;
       if (payload?.reason === "error") {
+        // P-035 G3 r41 (2026-09-28). A stream break is not the end of the turn:
+        // the orchestrator's DOM wait still owns the one terminal event (done
+        // with the DOM-read answer, or a typed error/timeout). Pushing a
+        // terminal error here finished the emitter and truncated a live turn
+        // at 118 partial bytes while ChatGPT kept working. Record the break and
+        // return, exactly like a normal network end.
         if (!state.expectedReloadNavigation) {
-          state.emitter.push({ type: "error", message: "fetch interceptor caught a stream error" });
+          state.streamBreaks += 1;
+          console.error(
+            `[cgpro:stream] interceptor stream error; DOM completion continues breaks=${state.streamBreaks}`,
+          );
         }
         return;
       }

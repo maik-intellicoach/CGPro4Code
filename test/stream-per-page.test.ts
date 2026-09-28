@@ -55,12 +55,16 @@ it("routes chunks to the emitter of the page they came from and resets pages ind
   expect(deltas(emitterA)).toEqual(["Hel", "lo"]);
   expect(emitterB.events).toEqual([]);
 
-  // B's stream error stays on B.
+  // B's stream break stays on B and does NOT finish B's emitter: the turn
+  // continues and the orchestrator's later `done` is still delivered.
   const emitterB2 = new CollectingEmitter();
   setActiveEmitter(pageB, emitterB2);
   start({ page: pageB }, "obs-b");
   done({ page: pageB }, "obs-b", { reason: "error" });
-  expect(emitterB2.events).toEqual([{ type: "error", message: "fetch interceptor caught a stream error" }]);
+  expect(emitterB2.events).toEqual([]);
+  expect(emitterB2.isFinished()).toBe(false);
+  emitterB2.push({ type: "done", finalText: "DOM answer" });
+  expect(emitterB2.events).toEqual([{ type: "done", finalText: "DOM answer" }]);
   expect(emitterA.isFinished()).toBe(false);
 
   // A's own reset drops the old observer's chunks (generation guard), as before.

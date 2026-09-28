@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { BrowserContext } from "patchright";
 import {
   ensureInterceptorInstalled,
@@ -133,7 +133,8 @@ it("deduplicates the same connector call across branch and SSE evidence", async 
   ]);
 });
 
-it("suppresses observer failures only during expected reload navigation", async () => {
+it("treats an observer stream break as non-terminal and suppresses it only during expected reload navigation", async () => {
+  const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
   const setup = async (): Promise<{
     context: BrowserContext;
     start: (source: unknown, observerId: string) => void;
@@ -155,16 +156,38 @@ it("suppresses observer failures only during expected reload navigation", async 
     return { context, start: start!, done: done!, emitter };
   };
 
-  const normal = await setup();
-  normal.start({}, "normal");
-  normal.done({}, "normal", { reason: "error" });
-  expect(normal.emitter.isFinished()).toBe(true);
+  try {
+    // A stream break is not the end of the turn: no terminal event, the
+    // emitter stays open, and ONE content-free stderr line records it. The
+    // orchestrator's later `done` is still delivered.
+    const normal = await setup();
+    normal.start({}, "normal");
+    normal.done({}, "normal", { reason: "error" });
+    expect(normal.emitter.isFinished()).toBe(false);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy.mock.calls[0]?.[0]).toBe(
+      "[cgpro:stream] interceptor stream error; DOM completion continues breaks=1",
+    );
+    normal.emitter.push({ type: "done", finalText: "DOM answer" });
+    expect(normal.emitter.isFinished()).toBe(true);
 
-  const reloading = await setup();
-  setExpectedReloadNavigation(reloading.context, true);
-  reloading.start({}, "reloading");
-  reloading.done({}, "reloading", { reason: "error" });
-  expect(reloading.emitter.isFinished()).toBe(false);
+    // A normal network end behaves exactly as today: no event, no line.
+    const quiet = await setup();
+    quiet.start({}, "quiet");
+    quiet.done({}, "quiet");
+    expect(quiet.emitter.isFinished()).toBe(false);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+
+    // The expected-reload suppression stays as today: no event and no line.
+    const reloading = await setup();
+    setExpectedReloadNavigation(reloading.context, true);
+    reloading.start({}, "reloading");
+    reloading.done({}, "reloading", { reason: "error" });
+    expect(reloading.emitter.isFinished()).toBe(false);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+  } finally {
+    errorSpy.mockRestore();
+  }
 });
 
 it("does not deliver a late observer error to the next turn", async () => {
