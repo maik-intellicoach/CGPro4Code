@@ -224,6 +224,21 @@ describe("native Deep Research selection", () => {
     );
   });
 
+  // P-035 2026-10-03: r3 found and clicked the row, then missed the chip. The
+  // miss must name what the composer showed, as the not-exposed path does.
+  it("names the visible composer entries when the chip check misses", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const test = scenario({ clickSticks: false, pickerLabels: ["Deep research", "Pro"] });
+
+      await expect(setDeepResearch(test.page, true)).rejects.toThrow(
+        'selection did not become active; visible entries=["Deep research","Pro"]',
+      );
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it("fails closed when maximum native Deep Research capability cannot be verified", async () => {
     const test = scenario({ effortExposed: false });
 

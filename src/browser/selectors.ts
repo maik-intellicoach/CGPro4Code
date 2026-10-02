@@ -170,8 +170,16 @@ export const SELECTORS: SelectorSet = {
   connectorDiagnosticLabels: [
     '[data-list-navigation-item]:visible',
     ':is([role="menu"]:visible, [role="dialog"]:visible, [role="listbox"]:visible) :is([role="menuitem"], [role="menuitemradio"], [role="option"], button)',
+    // Composer chips and controls, so a chip-verification miss names the chip.
+    'form :is(button, [contenteditable="false"]):visible',
   ],
   deepResearchSelected: [
+    // P-035 2026-10-03: live r3 showed the blue chip in the composer while every
+    // entry below missed, `form button:text-is` included. Either an inline atom
+    // in the ProseMirror editor or a chip button carrying hidden extra text. The
+    // editor atom must be non-editable, so typed prompt text never matches.
+    'form [data-composer-markdown] [contenteditable="false"]:has-text("Deep research")',
+    'form button:not([data-list-navigation-item]):has-text("Deep research")',
     'form [data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"]',
     '#prompt-textarea [data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"]',
     'form [data-testid*="deep-research" i]',

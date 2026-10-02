@@ -81,6 +81,8 @@ describe("selectors", () => {
     expect(SELECTORS.deepResearchToggle[1]).toBe('button[data-list-navigation-item]:has-text("Recherche approfondie")');
     expect(SELECTORS.deepResearchToggle).toContain('div.__menu-item[tabindex="0"]:has(span:text-is("Deep research"))');
     expect(SELECTORS.deepResearchSelected.some((selector) => selector.includes("Deep research"))).toBe(true);
+    expect(SELECTORS.deepResearchSelected[0]).toBe('form [data-composer-markdown] [contenteditable="false"]:has-text("Deep research")');
+    expect(SELECTORS.deepResearchSelected).toContain('form [data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"]');
     expect(SELECTORS.thinkingPowerSlider.some((selector) => selector.includes("aria-valuemax"))).toBe(true);
   });
 });

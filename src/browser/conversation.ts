@@ -1810,7 +1810,9 @@ export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
     ? await requireSelector(page, SELECTORS.deepResearchSelected, "selected native Deep Research", 8_000).catch(() => null)
     : await firstResolved(page, SELECTORS.deepResearchSelected);
   if ((verified !== null) !== on) {
-    throw new Error("ChatGPT native Deep Research selection did not become active");
+    const visible = await recordConnectorDiagnostics(page);
+    const detail = visible.length > 0 ? `; visible entries=${JSON.stringify(visible)}` : "";
+    throw new Error(`ChatGPT native Deep Research selection did not become active${detail}`);
   }
   if (on) {
     await verifyMaximum();
