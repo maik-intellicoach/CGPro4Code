@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "patchright";
+import { SELECTORS, joinSelectors } from "../src/browser/selectors.js";
 
 const firstResolved = vi.fn();
 const requireSelector = vi.fn();
@@ -38,6 +39,8 @@ function scenario(options: {
   chipExposed?: boolean;
   effortLabel?: "High" | "6Pro";
   normalClickThrows?: boolean;
+  flatListOnly?: boolean;
+  pickerLabels?: string[];
 } = {}) {
   let popoverOpen = false;
   let selected = options.initiallySelected ?? false;
@@ -80,6 +83,13 @@ function scenario(options: {
       press: vi.fn(async (key: string) => { if (key === "End") power = "4"; else popoverOpen = false; }),
     },
     waitForTimeout: vi.fn(async () => {}),
+    locator: vi.fn((selector: string) => {
+      if (selector !== joinSelectors(SELECTORS.connectorDiagnosticLabels)) {
+        throw new Error(`Unexpected diagnostic selector: ${selector}`);
+      }
+      return { allInnerTexts: vi.fn(async () => options.pickerLabels ?? []) };
+    }),
+    screenshot: vi.fn(async () => {}),
     // The picker's own checked entry is where the model is read from since
     // 2026-09-22; a selector-string argument is the pointer-blocker count.
     evaluate: vi.fn(async (_fn: unknown, arg: unknown) => {
@@ -90,9 +100,11 @@ function scenario(options: {
     }),
   } as unknown as Page;
   let power = "2";
-  requireSelector.mockImplementation(async (_page: Page, _selectors: string[], name: string) => {
+  requireSelector.mockImplementation(async (_page: Page, selectors: string[], name: string) => {
     if (name === "native Deep Research") {
-      if (popoverOpen && exposed) return toggle;
+      const rowFound = !options.flatListOnly || selectors.some((selector) =>
+        selector === 'button[data-list-navigation-item]:has-text("Deep research")');
+      if (popoverOpen && exposed && rowFound) return toggle;
       throw new Error("native mode unavailable");
     }
     if (name === "selected native Deep Research") {
@@ -134,6 +146,39 @@ beforeEach(() => {
 });
 
 describe("native Deep Research selection", () => {
+  it("finds and selects a flat-list button row and verifies its composer chip", async () => {
+    const test = scenario({ flatListOnly: true });
+
+    await expect(setDeepResearch(test.page, true)).resolves.toBe(true);
+
+    expect(test.toggle.click).toHaveBeenCalledTimes(1);
+    expect(requireSelector).toHaveBeenCalledWith(
+      test.page, SELECTORS.deepResearchSelected, "selected native Deep Research", 8_000,
+    );
+  });
+
+  it("includes bounded visible labels in the not-exposed error with debug unset", async () => {
+    vi.stubEnv("CGPRO_DEBUG", undefined);
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const test = scenario({
+        exposed: false,
+        pickerLabels: ["  Web\n search  ", " ", "x".repeat(140), ...Array(35).fill("Apps")],
+      });
+      const labels = ["Web search", "x".repeat(120), ...Array(28).fill("Apps")];
+
+      await expect(setDeepResearch(test.page, true)).rejects.toThrow(
+        `not exposed in the composer tool picker; visible entries=${JSON.stringify(labels)}`,
+      );
+      expect(test.page.locator).toHaveBeenCalledTimes(1);
+      expect(test.page.screenshot).not.toHaveBeenCalled();
+      expect(log.mock.calls.flat().join(" ")).not.toContain("deep-research-nodes");
+    } finally {
+      log.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("verifies selection from the composer chip after clicking the picker row", async () => {
     const test = scenario();
 

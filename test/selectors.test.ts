@@ -77,7 +77,9 @@ describe("selectors", () => {
 
   it("exposes a native Deep Research composer selector", () => {
     expect(SELECTORS.deepResearchToggle.some((selector) => selector.includes("Deep research"))).toBe(true);
-    expect(SELECTORS.deepResearchToggle[0]).toContain('__menu-item[tabindex="0"]');
+    expect(SELECTORS.deepResearchToggle[0]).toBe('button[data-list-navigation-item]:has-text("Deep research")');
+    expect(SELECTORS.deepResearchToggle[1]).toBe('button[data-list-navigation-item]:has-text("Recherche approfondie")');
+    expect(SELECTORS.deepResearchToggle).toContain('div.__menu-item[tabindex="0"]:has(span:text-is("Deep research"))');
     expect(SELECTORS.deepResearchSelected.some((selector) => selector.includes("Deep research"))).toBe(true);
     expect(SELECTORS.thinkingPowerSlider.some((selector) => selector.includes("aria-valuemax"))).toBe(true);
   });

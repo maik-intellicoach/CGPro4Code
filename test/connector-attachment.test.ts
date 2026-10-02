@@ -124,6 +124,8 @@ function makePage() {
 
   const makeCandidates = (sourceRows = rows) => ({
     count: async () => sourceRows.length,
+    // Failure diagnostics now read picker labels even without CGPRO_DEBUG.
+    allInnerTexts: async () => sourceRows.filter((row) => row.visible).map((row) => row.label),
     nth: (i: number) => rowLoc(sourceRows[i]),
     // One in-page pass over DOM-like stand-ins, mirroring Playwright's evaluateAll.
     evaluateAll: async <R, A>(fn: (elements: unknown[], arg: A) => R, arg: A): Promise<R> => {

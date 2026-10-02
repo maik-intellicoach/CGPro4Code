@@ -1905,10 +1905,8 @@ async function waitForComposerTool(page: Page, name: string, timeoutMs = 8_000):
 }
 
 async function recordConnectorDiagnostics(page: Page): Promise<string[]> {
-  if (process.env.CGPRO_DEBUG !== "1") return [];
-  const surfaces = page.locator('[role="menu"]:visible, [role="dialog"]:visible, [role="listbox"]:visible');
-  const labels = await surfaces
-    .locator('[role="menuitem"], [role="menuitemradio"], [role="option"], button')
+  const labels = await page
+    .locator(joinSelectors(SELECTORS.connectorDiagnosticLabels))
     .allInnerTexts()
     .catch(() => [] as string[]);
   const boundedLabels = labels
@@ -1917,6 +1915,7 @@ async function recordConnectorDiagnostics(page: Page): Promise<string[]> {
     .slice(0, 30)
     .map((label) => label.slice(0, 120));
   console.error(`[cgpro:connector] visible picker entries=${JSON.stringify(boundedLabels)}`);
+  if (process.env.CGPRO_DEBUG !== "1") return boundedLabels;
   const deepResearchNodes = await page
     .locator("button, [role], [data-testid], span, div")
     .filter({ hasText: /^\s*Deep research\s*$/i })

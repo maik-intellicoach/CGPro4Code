@@ -34,6 +34,8 @@ export interface SelectorSet {
   webSearchToggle: string[];
   /** Native ChatGPT Deep Research composer mode. */
   deepResearchToggle: string[];
+  /** Content-free picker labels for bounded failure diagnostics. */
+  connectorDiagnosticLabels: string[];
   /** Selected native Deep Research chip in the composer. */
   deepResearchSelected: string[];
   /** Account / profile button — proxy for "logged in" state. */
@@ -154,6 +156,9 @@ export const SELECTORS: SelectorSet = {
     'button[aria-label*="web search" i]',
   ],
   deepResearchToggle: [
+    // P-035 2026-10-03: the popover is a flat list of plain buttons, no roles.
+    'button[data-list-navigation-item]:has-text("Deep research")',
+    'button[data-list-navigation-item]:has-text("Recherche approfondie")',
     'div.__menu-item[tabindex="0"]:has(span:text-is("Deep research"))',
     'div.__menu-item[tabindex="0"]:has(span:text-is("Recherche approfondie"))',
     '[data-radix-popper-content-wrapper] [role="menuitemradio"]:has-text("Deep research")',
@@ -161,6 +166,10 @@ export const SELECTORS: SelectorSet = {
     '[data-radix-popper-content-wrapper] button[data-testid="composer-tool-deep-research"]',
     '[data-radix-popper-content-wrapper] button[aria-label*="Deep research" i]',
     '[data-radix-popper-content-wrapper] span:text-is("Deep research")',
+  ],
+  connectorDiagnosticLabels: [
+    '[data-list-navigation-item]:visible',
+    ':is([role="menu"]:visible, [role="dialog"]:visible, [role="listbox"]:visible) :is([role="menuitem"], [role="menuitemradio"], [role="option"], button)',
   ],
   deepResearchSelected: [
     'form [data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"]',
