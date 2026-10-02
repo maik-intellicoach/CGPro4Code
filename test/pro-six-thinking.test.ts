@@ -27,6 +27,7 @@ vi.mock("../src/api/models.js", async (importOriginal) => {
   };
 });
 const { ensureProSixMaximum, menuIsThinkingEffort } = await import("../src/browser/conversation.js");
+const { findProModel, findProSlug } = await import("../src/api/models.js");
 
 // P-035 2026-09-27. The Pro-limit path reads the page through `page.evaluate`.
 // The test environment is `node` (no jsdom), so these tests install a tiny
@@ -468,15 +469,35 @@ describe("6 Pro maximum thinking admission", () => {
     await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/has "GPT-5\.6 Sol" selected/);
   });
 
-  // Maik, 2026-09-21 13:41: the label must be deterministic on any subscribed
-  // account. An account whose catalogue carries no Pro model is the one case
-  // where it cannot be, and that must refuse the turn rather than fall through
-  // to whatever the composer happens to show.
-  it("refuses the turn when the account's catalogue carries no Pro model", async () => {
-    fetchModels.mockResolvedValue([{ slug: "gpt-5-5", title: "GPT-5.5" }]);
-    const s = setup();
-    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/none is a Pro model/);
-    expect(s.slider.focus).toHaveBeenCalledOnce();
+  // P-035 2026-10-03: a successful catalogue read can omit Pro; Maik's ruling
+  // admits Latest only when the existing picker and maximum-effort proof pass.
+  it("accepts Latest at maximum effort with no catalogue Pro entry and logs none", async () => {
+    fetchModels.mockResolvedValue([{ slug: "gpt-5-6-sol", title: "GPT-5.6 Sol" }]);
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const s = setup({ effortLabel: "6Pro", pickerCheckedIndex: 0 });
+      await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "Latest", power: 4 });
+      expect(log.mock.calls.flat().join(" ")).toContain('catalogue="none"');
+      expect(s.slider.focus).toHaveBeenCalledOnce();
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it.each([
+    { pickerEntries: ["Latest", "GPT-5.6 Sol"], pickerCheckedIndex: 1 },
+    { pickerEntries: ["GPT-5.6 Sol", "Latest"], pickerCheckedIndex: 0 },
+    { pickerEntries: ["GPT-5.6 Sol", "Latest"], pickerCheckedIndex: 1 },
+  ])("refuses a picker without Latest checked at index zero even with no catalogue Pro: %j", async (options) => {
+    fetchModels.mockResolvedValue([{ slug: "gpt-5-6-sol", title: "GPT-5.6 Sol" }]);
+    const s = setup(options);
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/where the newest model is/);
+  });
+
+  it("still refuses unverified maximum effort with no catalogue Pro entry", async () => {
+    fetchModels.mockResolvedValue([{ slug: "gpt-5-6-sol", title: "GPT-5.6 Sol" }]);
+    const s = setup({ sticks: false });
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/did not reach its maximum/);
   });
 
   // A catalogue that cannot be read is not evidence of anything, so the retry
@@ -488,7 +509,7 @@ describe("6 Pro maximum thinking admission", () => {
     // P-035 2026-09-21. The refusal must say the READ returned nothing, not that
     // the account has no Pro model: those are different facts, and the second was
     // being stated for the first.
-    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/returned nothing/);
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/the catalogue read returned nothing/);
     expect(fetchModels).toHaveBeenCalledTimes(2);
   });
 
@@ -635,6 +656,36 @@ describe("6 Pro maximum thinking admission", () => {
     await rejected;
   });
 
+});
+
+describe("catalogue Pro preference", () => {
+  it.each(["6", "gpt-6", "6-pro", "6pro", "gpt-6.1-pro", "gpt-6-1-pro"])(
+    "prefers the 6-series Pro entry %s over GPT-5.5 Pro", (slug) => {
+      const six = { slug, title: "Pro" };
+      const models = [{ slug: "gpt-5-5-pro", title: "GPT-5.5 Pro" }, six];
+      expect(findProModel(models)).toBe(six);
+      expect(findProSlug(models)).toBe(slug);
+    },
+  );
+
+  it("recognizes a 6-series Pro title when the slug has no version", () => {
+    const six = { slug: "latest", title: "GPT-6.2 Pro" };
+    expect(findProModel([{ slug: "gpt-5-5-pro", title: "GPT-5.5 Pro" }, six])).toBe(six);
+  });
+
+  it("does not treat GPT-5.6 Sol alone as Pro", () => {
+    expect(findProModel([{ slug: "gpt-5-6-sol", title: "GPT-5.6 Sol" }])).toBeNull();
+  });
+
+  it("does not mistake GPT-5.6 Pro for 6-series Pro and keeps the 5.5 preference", () => {
+    const five = { slug: "gpt-5-5-pro", title: "GPT-5.5 Pro" };
+    expect(findProModel([{ slug: "gpt-5-6-pro", title: "GPT-5.6 Pro" }, five])).toBe(five);
+  });
+
+  it("keeps the any-Pro-slug fallback when neither preferred series exists", () => {
+    const fallback = { slug: "gpt-5-pro", title: "Pro" };
+    expect(findProModel([fallback])).toBe(fallback);
+  });
 });
 
 // P-035 2026-09-27. Live: the intelli account's picker listed `Latest` (checked),

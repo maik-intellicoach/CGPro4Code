@@ -52,7 +52,8 @@ export async function fetchModels(page: Page, accessToken?: string): Promise<Cha
 }
 
 /**
- * Picks the Pro model itself from the catalogue, not just its slug.
+ * Picks the Pro model itself, preferring 6-series Pro, then the existing 5.5
+ * match, then any Pro slug. Version boundaries keep 5.6 out of the 6 series.
  *
  * P-035 2026-09-21. Verification needs the model's own TITLE as well as its
  * slug: hardcoding the label the composer should show is what broke the 6 Pro
@@ -60,6 +61,14 @@ export async function fetchModels(page: Page, accessToken?: string): Promise<Cha
  * vocabulary. Callers that only need the slug should use findProSlug.
  */
 export function findProModel(models: ChatgptModel[]): ChatgptModel | null {
+  const sixSeries = models.filter((m) => {
+    const labels = [m.slug ?? "", m.title ?? ""];
+    return labels.some((label) => /pro/i.test(label)) && labels.some((label) =>
+      /(?:^|[^a-z0-9._-])(?:gpt[-_ ]*)?6(?:[._-]\d+)*(?=$|[^a-z0-9]|pro\b)/i.test(label));
+  });
+  if (sixSeries.length > 0) {
+    return sixSeries.find((m) => /pro/i.test(m.slug ?? "")) ?? sixSeries[0];
+  }
   const candidates = models.filter((m) => {
     const blob = `${m.slug ?? ""} ${m.title ?? ""}`.toLowerCase();
     return (
@@ -76,9 +85,8 @@ export function findProModel(models: ChatgptModel[]): ChatgptModel | null {
 }
 
 /**
- * Picks the best slug for "GPT-5.5 Pro" from the catalogue.
- * The exact slug varies (gpt-5-5-pro, gpt-5.5-pro, gpt-5-pro, …) so we
- * match flexibly on the slug + title.
+ * Returns the preferred Pro model's slug using findProModel's 6-series,
+ * 5.5, then any-Pro-slug order, matching flexibly on slug and title.
  */
 export function findProSlug(models: ChatgptModel[]): string | null {
   return findProModel(models)?.slug ?? null;

@@ -1357,13 +1357,8 @@ export async function ensureProSixMaximum(
     mark("model-catalogue-read");
     const catalogue = await readCatalogueForModelCheck(page);
     const proModel = findProModel(catalogue.models);
-    if (!proModel) {
-      // Two different facts, two different sentences. Only the second sends the
-      // reader to the account; the first is the read failing, and saying
-      // "carries no Pro model" for it was wrong on every occasion it fired.
-      const why = catalogue.models.length === 0
-        ? `the catalogue read returned nothing (${catalogue.reason})`
-        : `the catalogue returned ${catalogue.models.length} models and none is a Pro model`;
+    if (catalogue.models.length === 0) {
+      const why = `the catalogue read returned nothing (${catalogue.reason})`;
       const unresolved = new PreSubmitInteractionError(
         "model_control_unresolved",
         "model_verification",
@@ -1373,7 +1368,10 @@ export async function ensureProSixMaximum(
       failure = classifyInteractionFailure(unresolved);
       throw unresolved;
     }
-    const catalogueLabel = proModel.title ?? proModel.slug;
+    // P-035 2026-10-03: Maik ruled to accept the 6-series Latest Pro entry.
+    // With no catalogue Pro entry, entitlement rests on account eligibility
+    // plus the picker proof below, not on a catalogue Pro entry.
+    const catalogueLabel = proModel ? proModel.title ?? proModel.slug : "none";
     // The model comes from the picker's checked entry, and the requirement is the
     // picker's NEWEST model. The effort label this row carries ("Extra High",
     // "6Pro" and "6 Pro" are the same Pro level in three rollout spellings) is no
