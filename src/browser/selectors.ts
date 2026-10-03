@@ -283,6 +283,14 @@ export const PREFLIGHT_CHROME = {
   deepResearchChipAtom: '[contenteditable="false"]',
   deepResearchChipButton: 'button:not([data-list-navigation-item])',
   deepResearchChipLabels: ["Deep research", "Recherche approfondie"],
+  /**
+   * P-035 2026-10-03 G3-B (fourth run). The same persisted Deep Research mode
+   * in its pill form (text `deep-research`, another icon), the same string as
+   * in `SELECTORS.deepResearchSelected` minus its `form ` scope. An atom or
+   * chip button that is or contains a match is the automation's own chip
+   * whatever its text.
+   */
+  deepResearchChipPill: '[data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"]',
 } as const;
 
 /**

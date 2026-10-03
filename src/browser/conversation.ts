@@ -2660,18 +2660,35 @@ export async function assertPreflightDraftSafe(
       // such a chip, and the chip itself as a control, are chrome; its atom is
       // removed from the clone and its label from the text below. Any other
       // media, control or text refuses exactly as before.
+      //
+      // P-035 2026-10-03 G3-B (fourth run). Live intelli passed `home` and then
+      // refused `connector_token_text` after the Project flow's `goHome`: the
+      // composer held only the same persisted mode in its pill form, text
+      // `deep-research`, which the exact labels miss. An atom or button that IS
+      // or CONTAINS a `deepResearchChipPill` match is an own chip too; its text
+      // to strip is then its own whitespace-collapsed `textContent`. A
+      // `[contenteditable="false"]` token without that data-id refuses as before.
       const ownChipLabel = (element: Element): string | null => {
         const label = norm(element.textContent ?? "");
         return (chromeSelectors.deepResearchChipLabels as readonly string[]).includes(label) ? label : null;
       };
+      const ownChipPill = (element: Element): boolean => {
+        try {
+          return !!(element.matches?.(chromeSelectors.deepResearchChipPill)
+            || element.querySelector?.(chromeSelectors.deepResearchChipPill));
+        } catch { return false; }
+      };
+      /** The text an own chip renders (its label, or a pill's own text), else null. */
+      const ownChipText = (element: Element): string | null =>
+        ownChipLabel(element) ?? (ownChipPill(element) ? norm(element.textContent ?? "") : null);
       // A root that cannot be queried (not a DOM element) holds no own chip.
       const ownChipAtoms = (root: Element): HTMLElement[] =>
         Array.from(root.querySelectorAll?.<HTMLElement>(chromeSelectors.deepResearchChipAtom) ?? []).filter(atom =>
-          !atom.parentElement?.closest('[contenteditable="false"]') && ownChipLabel(atom) !== null);
+          !atom.parentElement?.closest('[contenteditable="false"]') && ownChipText(atom) !== null);
       const ownChips: Element[] = [
         ...ownChipAtoms(composer),
         ...Array.from(form.querySelectorAll(chromeSelectors.deepResearchChipButton))
-          .filter(button => ownChipLabel(button) !== null),
+          .filter(button => ownChipText(button) !== null),
       ];
       const inOwnChip = (node: Element): boolean => ownChips.some(chip => chip.contains(node));
       for (const [kind, mediaSelector] of mediaKinds) {
@@ -2892,10 +2909,10 @@ export async function assertPreflightDraftSafe(
       let text = composer instanceof HTMLTextAreaElement ? composer.value : composer.innerText;
       // G3-B: strip each own chip's label once per chip rendered in the
       // composer, so the chip alone reads as an empty composer. Text beside it
-      // still decides admission exactly as before.
+      // still decides admission exactly as before. A pill strips its own text.
       for (const chip of ownChips) {
-        const label = composer.contains(chip) ? ownChipLabel(chip) : null;
-        if (label !== null) text = text.replace(label, "");
+        const label = composer.contains(chip) ? ownChipText(chip) : null;
+        if (label) text = text.replace(label, "");
       }
       // The token branch above already proved exactly one outermost token
       // carrying the owned connector's own trimmed text; what remains decides

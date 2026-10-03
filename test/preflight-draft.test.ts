@@ -105,6 +105,11 @@ function fixture(initial: Partial<State> = {}) {
           closest: () => element,
           contains: node => containsVia(element)(node),
           remove: () => { removedTokens.push(element); removedNow.add(element); },
+          // G3-B (fourth run): `pill` makes this node answer the pill selector,
+          // and `querySelector` finds such a node below it.
+          matches: selector => !!node.pill && selector === PREFLIGHT_CHROME.deepResearchChipPill,
+          querySelector: selector => tokens.find(token => token !== element && element.contains(token)
+            && token.matches(selector)) ?? null,
         };
         tokens.push(element);
         if (node.icon) chipIcons.push({ tagName: "IMG", parentElement: element });
@@ -195,7 +200,8 @@ function fixture(initial: Partial<State> = {}) {
       const chipButtons = (state.drButtons ?? []).map(entry => {
         const button = {
           tagName: "BUTTON", textContent: entry.text, parentElement: null,
-          closest: () => null, matches: () => false, getAttribute: () => null,
+          closest: () => null, getAttribute: () => null,
+          matches: (selector: string) => !!entry.pill && selector === PREFLIGHT_CHROME.deepResearchChipPill,
           contains: (node: unknown) => containsVia(button)(node),
         };
         if (entry.icon) chipIcons.push({ tagName: "IMG", parentElement: button });
@@ -312,6 +318,8 @@ interface TokenNode {
   children?: TokenNode[];
   /** G3-B: the token carries its own media icon (an `img` child). */
   icon?: boolean;
+  /** G3-B (fourth run): the node carries the Deep Research pill data-id. */
+  pill?: boolean;
 }
 /** The token shape the guard reads: tag, text, parentElement and closest/remove. */
 interface FixtureToken {
@@ -321,6 +329,8 @@ interface FixtureToken {
   closest: () => FixtureToken;
   contains: (node: unknown) => boolean;
   remove: () => void;
+  matches: (selector: string) => boolean;
+  querySelector: (selector: string) => FixtureToken | null;
 }
 /** One synthetic ancestor of the foreign text node, nearest first. */
 interface ForeignAncestor {
@@ -345,7 +355,7 @@ interface State {
    */
   banners?: Record<string, { holdsComposer?: boolean; nested?: boolean }>;
   /** G3-B: native Deep Research chip buttons in the form, outside the composer. */
-  drButtons?: Array<{ text: string; icon?: boolean }>;
+  drButtons?: Array<{ text: string; icon?: boolean; pill?: boolean }>;
   /** G3-B: text nodes directly inside a banner card, walked before `foreignText`. */
   bannerTexts?: Array<{ banner: string; text: string }>;
   /** Connector chips by tag and nesting; overrides the flat `mention(s)` shape. */
@@ -2930,5 +2940,68 @@ describe("own native Deep Research chip", () => {
     expect(await reasonOf(
       fixture({ tokenTree: [chip(), { tagName: "SPAN", textContent: "fixture" }] }).page,
     )).toBe("connector_unowned");
+  });
+});
+
+// P-035 2026-10-03 G3-B (fourth run). Live intelli passed `home`, then refused
+// `connector_token_text` at `project-chat-surface`: the composer held only the
+// same Deep Research mode in its pill form, text `deep-research`.
+describe("own native Deep Research chip, pill form", () => {
+  const reasonOf = async (page: Page, owned: Parameters<typeof assertPreflightDraftSafe>[1] = {}) =>
+    (await assertPreflightDraftSafe(page, owned).then(() => undefined).catch(caught => caught))?.reason;
+  const pill = (textContent = "deep-research"): TokenNode => ({ tagName: "SPAN", textContent, icon: true, pill: true });
+  const homeControls = [{ ariaLabel: "Add files and more" }, { ariaLabel: "Send" }];
+
+  it("uses the selector SELECTORS.deepResearchSelected already names", () => {
+    expect(SELECTORS.deepResearchSelected).toContain(`form ${PREFLIGHT_CHROME.deepResearchChipPill}`);
+  });
+
+  it("admits the lone pill with its icon, without and with an owned connector", async () => {
+    const test = fixture({ tokenTree: [pill()], controls: homeControls });
+    await expect(assertPreflightDraftSafe(test.page)).resolves.toBeUndefined();
+    // Removed from the clone before tokens were counted.
+    expect(test.removedTokens.map(token => token.textContent)).toEqual(["deep-research"]);
+    await expect(assertPreflightDraftSafe(fixture({ tokenTree: [pill()], controls: homeControls }).page,
+      { connector: "fixture" })).resolves.toBeUndefined();
+    // The whitespace a removed atom leaves behind follows the same rule.
+    await expect(assertPreflightDraftSafe(fixture({ tokenTree: [pill()], text: " " }).page,
+      { connector: "fixture" })).resolves.toBeUndefined();
+  });
+
+  it("admits an atom that contains the pill, and a form button that is one", async () => {
+    await expect(assertPreflightDraftSafe(fixture({
+      tokenTree: [{ tagName: "SPAN", textContent: "deep-research", children: [{ tagName: "SPAN", pill: true, icon: true }] }],
+    }).page, { connector: "fixture" })).resolves.toBeUndefined();
+    await expect(assertPreflightDraftSafe(fixture({
+      drButtons: [{ text: "deep-research", icon: true, pill: true }], controls: homeControls,
+    }).page)).resolves.toBeUndefined();
+    expect(await reasonOf(fixture({ drButtons: [{ text: "deep-research", icon: true }] }).page))
+      .toBe("form_media:img");
+  });
+
+  it("refuses the pill plus typed text as text_present", async () => {
+    expect(await reasonOf(fixture({ tokenTree: [pill()], text: "private draft" }).page)).toBe("text_present");
+    expect(await reasonOf(fixture({
+      tokenTree: [pill()], composerInnerText: "deep-research private draft",
+    }).page, { connector: "fixture" })).toBe("text_present");
+  });
+
+  it("admits the pill plus the owned connector token exactly as the token alone", async () => {
+    const token = { tagName: "SPAN", textContent: "fixture" };
+    await expect(assertPreflightDraftSafe(fixture({ tokenTree: [token] }).page, { connector: "fixture" }))
+      .resolves.toBeUndefined();
+    await expect(assertPreflightDraftSafe(fixture({ tokenTree: [pill(), token] }).page, { connector: "fixture" }))
+      .resolves.toBeUndefined();
+    expect(await reasonOf(fixture({ tokenTree: [token] }).page)).toBe("connector_unowned");
+    expect(await reasonOf(fixture({ tokenTree: [pill(), token] }).page)).toBe("connector_unowned");
+  });
+
+  it("still refuses a foreign token reading deep-research without the pill data-id", async () => {
+    const foreign = { tagName: "SPAN", textContent: "deep-research" };
+    expect(await reasonOf(fixture({ tokenTree: [foreign] }).page, { connector: "fixture" }))
+      .toBe("connector_token_text");
+    expect(await reasonOf(fixture({ tokenTree: [foreign] }).page)).toBe("connector_unowned");
+    expect(await reasonOf(fixture({ tokenTree: [{ ...foreign, icon: true }] }).page, { connector: "fixture" }))
+      .toBe("form_media:img");
   });
 });
