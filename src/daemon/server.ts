@@ -37,10 +37,12 @@ import {
   clearComposer,
   currentConversationId,
   openConversation,
+  readDeepResearchQuota,
   readLatestAssistantText,
   turnIsWorking,
   waitForComposerHydrated,
 } from "../browser/conversation.js";
+import { deepResearchQuota } from "../browser/deep-research-quota.js";
 import { detectPlan, fetchMe, type MeResponse } from "../api/me.js";
 import { archiveSavedConversation } from "../api/conversation-filing.js";
 import { fetchModels, findProSlug, type ChatgptModel } from "../api/models.js";
@@ -1017,6 +1019,65 @@ export async function handleRequest(
     return;
   }
 
+  // P-035 2026-10-03 G4-A. Read ChatGPT's own Deep Research counter on an idle
+  // slot: home composer, tools popover, the Deep research row's text, Escape.
+  // It never clicks the row, never types and never submits. Lane admission is
+  // exactly /dom-shape's: reader budget, a free slot, the queue, a lease
+  // released in `finally`, and 409 `busy` otherwise.
+  if (method === "POST" && url.pathname === "/deep-research-quota") {
+    try {
+      state.readerBudget.acquire();
+    } catch (err) {
+      if (err instanceof ReaderBudgetExceededError) {
+        res.writeHead(429, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "reader_budget_exceeded", active: err.active }));
+        return;
+      }
+      throw err;
+    }
+    try {
+      // No field is read; the body is drained under the same bounds.
+      await readJsonBody<Record<string, unknown>>(req);
+    } catch (err) {
+      const status = err instanceof BodyTimeoutError ? 408 : err instanceof BodyTooLargeError ? 413 : 400;
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: status === 408 ? "body_timeout" : status === 413 ? "body_too_large" : "invalid_request" }));
+      return;
+    } finally {
+      state.readerBudget.release();
+    }
+    const slots = slotsOf(state);
+    const slot = slots.find((candidate) => !candidate.busy);
+    if (!slot || !state.queue.tryAcquire()) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "busy" }));
+      return;
+    }
+    slot.busy = true;
+    slot.leasedBy = "deep-research-quota";
+    applyWorkPosture(state, slot, true);
+    log.info(`slot leased slot=${slot.id} by=deep-research-quota`);
+    try {
+      const page = await slotPage(state, slot);
+      const quota = await readDeepResearchQuota(page);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(quota));
+    } catch (error) {
+      const message = String((error as Error)?.message ?? "unknown error")
+        .replace(/\s+/g, " ")
+        .slice(0, 200);
+      log.error(`deep-research quota read failed: ${message}`);
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "deep_research_quota_failed", detail: message }));
+      }
+    } finally {
+      releaseSlot(state, slot, "deep-research-quota");
+      state.queue.release();
+    }
+    return;
+  }
+
   if (method === "GET" && url.pathname === "/status") {
     const slots = slotsOf(state);
     const busySlots = slots.filter((s) => s.busy).length;
@@ -1071,6 +1132,7 @@ export async function handleRequest(
       currentConversation: slots.find((s) => s.currentConversation !== null)?.currentConversation ?? null,
       lastConversation: slots[state.lastFinishedSlot ?? 0].lastConversation,
       interaction: worstInteraction(slots),
+      deepResearch: deepResearchQuota(),
       slots: {
         total: slots.length,
         busy: busySlots,

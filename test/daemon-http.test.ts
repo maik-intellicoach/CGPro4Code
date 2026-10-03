@@ -1699,3 +1699,150 @@ describe("daemon-side DOM shape probe", () => {
     expect(line).toContain("data_attrs=0");
   });
 });
+
+describe("daemon-side Deep Research quota read", () => {
+  // P-035 2026-10-03 G4-A. ChatGPT's own per-account counter, read on an idle
+  // slot exactly like /dom-shape is admitted: home composer, tools popover,
+  // the Deep research row's text, Escape. It never clicks the row.
+  const ROW_TEXT = "Deep research\n5 left";
+
+  function fakeQuotaPage() {
+    let popoverOpen = false;
+    const plus = {
+      count: vi.fn(async () => 1),
+      isVisible: vi.fn(async () => true),
+      getAttribute: vi.fn(async (name: string) => (name === "aria-expanded" && popoverOpen ? "true" : null)),
+      click: vi.fn(async () => { popoverOpen = true; }),
+    };
+    const row = {
+      count: vi.fn(async () => (popoverOpen ? 1 : 0)),
+      isVisible: vi.fn(async () => popoverOpen),
+      click: vi.fn(async () => undefined),
+      evaluate: vi.fn(async () => ROW_TEXT),
+    };
+    const absent = {
+      count: vi.fn(async () => 0),
+      isVisible: vi.fn(async () => false),
+      waitFor: vi.fn(async () => undefined),
+    };
+    const page = {
+      isClosed: () => false,
+      url: () => "https://chatgpt.com/",
+      goto: vi.fn(async () => null),
+      waitForTimeout: vi.fn(async () => undefined),
+      keyboard: {
+        press: vi.fn(async (key: string) => { if (key === "Escape") popoverOpen = false; }),
+        type: vi.fn(async () => undefined),
+      },
+      locator: vi.fn((selector: string) => {
+        const target = selector === 'button[data-testid="composer-plus-btn"]'
+          ? plus
+          : selector === 'button[data-list-navigation-item]:has-text("Deep research")'
+            ? row
+            : absent;
+        return { first: () => target };
+      }),
+    };
+    return { page, plus, row };
+  }
+
+  async function readQuota(state: ServerState): Promise<FakeRes> {
+    const req = new FakeReq() as unknown as IncomingMessage;
+    const res = new FakeRes() as unknown as ServerResponse;
+    Object.assign(req, {
+      method: "POST",
+      url: "/deep-research-quota",
+      headers: { authorization: "Bearer test-token" },
+    });
+    const pending = handleRequest(req, res, state);
+    sendBody(req, {});
+    await pending;
+    return res as unknown as FakeRes;
+  }
+
+  beforeEach(async () => {
+    const { resetDeepResearchQuota } = await import("../src/browser/deep-research-quota.js");
+    resetDeepResearchQuota();
+  });
+
+  it("serves a deepResearch object of nulls on /status by default", async () => {
+    const state = fakeState();
+    const req = new FakeReq() as unknown as IncomingMessage;
+    const res = new FakeRes() as unknown as ServerResponse;
+    Object.assign(req, { method: "GET", url: "/status", headers: { authorization: "Bearer test-token" } });
+
+    await handleRequest(req, res, state);
+
+    expect((parseJsonBody(res as unknown as FakeRes) as { deepResearch: unknown }).deepResearch).toEqual({
+      remaining: null,
+      label: null,
+      observedAt: null,
+      exhaustedUntil: null,
+      exhaustedObservedAt: null,
+    });
+  });
+
+  it("refuses with 409 busy when every slot is busy", async () => {
+    const { page } = fakeQuotaPage();
+    const state = fakeState({ session: { page } as unknown as Session });
+    const slot = slotsOf(state)[0];
+    slot.busy = true;
+    slot.leasedBy = "ask";
+    const res = await readQuota(state);
+
+    expect(res.statusCode).toBe(409);
+    expect(parseJsonBody(res)).toEqual({ error: "busy" });
+    expect(page.goto).not.toHaveBeenCalled();
+    expect(slot.leasedBy).toBe("ask");
+  });
+
+  it("reads the row on the home composer, closes the popover and never clicks the row", async () => {
+    const { page, plus, row } = fakeQuotaPage();
+    const state = fakeState({ session: { page } as unknown as Session });
+    const res = await readQuota(state);
+
+    expect(res.statusCode).toBe(200);
+    expect(parseJsonBody(res)).toMatchObject({
+      remaining: 5,
+      label: "Deep research 5 left",
+      exhaustedUntil: null,
+      exhaustedObservedAt: null,
+    });
+    expect(page.goto).toHaveBeenCalledWith("https://chatgpt.com/", expect.objectContaining({ waitUntil: "domcontentloaded" }));
+    expect(plus.click).toHaveBeenCalledTimes(1);
+    expect(row.click).not.toHaveBeenCalled();
+    expect(page.keyboard.type).not.toHaveBeenCalled();
+    expect(page.keyboard.press.mock.calls).toEqual([["Escape"]]);
+    expect(slotsOf(state)[0].busy).toBe(false);
+    expect(slotsOf(state)[0].leasedBy).toBeNull();
+    expect(state.queue.busy).toBe(false);
+
+    // The reading now rides /status for this daemon process.
+    const statusReq = new FakeReq() as unknown as IncomingMessage;
+    const statusRes = new FakeRes() as unknown as ServerResponse;
+    Object.assign(statusReq, { method: "GET", url: "/status", headers: { authorization: "Bearer test-token" } });
+    await handleRequest(statusReq, statusRes, state);
+    expect((parseJsonBody(statusRes as unknown as FakeRes) as { deepResearch: { remaining: number } }).deepResearch.remaining).toBe(5);
+  });
+
+  it("answers 502 with a bounded detail and releases the lane when the row is missing", async () => {
+    const { page, row } = fakeQuotaPage();
+    row.count.mockImplementation(async () => 0);
+    const state = fakeState({ session: { page } as unknown as Session });
+    // The row lookup polls for 8 s; the fake clock advances by each wait.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    page.waitForTimeout.mockImplementation(async (ms: number) => { vi.setSystemTime(Date.now() + ms); });
+    try {
+      const res = await readQuota(state);
+      expect(res.statusCode).toBe(502);
+      const body = parseJsonBody(res) as { error: string; detail: string };
+      expect(body.error).toBe("deep_research_quota_failed");
+      expect(body.detail.length).toBeLessThanOrEqual(200);
+      expect(row.click).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(slotsOf(state)[0].busy).toBe(false);
+    expect(state.queue.busy).toBe(false);
+  });
+});

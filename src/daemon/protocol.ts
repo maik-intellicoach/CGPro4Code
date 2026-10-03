@@ -1,4 +1,5 @@
 import type { FilingProof } from "../api/conversation-filing.js";
+import type { DeepResearchQuota } from "../browser/deep-research-quota.js";
 /**
  * Daemon wire format. Kept tiny and string-only so the client and server
  * can stay decoupled — the daemon process and the CLI are separate Node
@@ -145,6 +146,11 @@ export interface StatusResponse {
   /** UUID of the last completed turn, if any. */
   lastConversation?: string | null;
   interaction?: InteractionStatus;
+  /**
+   * P-035 2026-10-03 G4-A. This daemon process's last Deep Research quota
+   * reading, from ChatGPT's own tools row; every field null when unknown.
+   */
+  deepResearch?: DeepResearchQuota;
   /** Per-tab occupancy (CGPRO_DAEMON_SLOTS; total stays 1 unless configured). */
   slots?: {
     total: number;

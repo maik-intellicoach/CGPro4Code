@@ -174,6 +174,19 @@ export async function getDaemonStatus(info: DaemonInfo): Promise<StatusResponse 
 }
 
 /**
+ * Read ChatGPT's own Deep Research counter on an idle slot (P-035 2026-10-03
+ * G4-A). Raw so the caller can tell 409 `busy` from 502
+ * `deep_research_quota_failed`; a 200 body is the `/status` `deepResearch`
+ * object. `status: 0` means the request never completed.
+ */
+export async function readDaemonDeepResearchQuota(
+  info: DaemonInfo,
+): Promise<{ status: number; text: string }> {
+  // Home navigation, composer hydration and the row lookup can take ~40 s.
+  return await rawRequest(info, "POST", "/deep-research-quota", {}, 120_000);
+}
+
+/**
  * Read-only, content-free DOM shape probe of one conversation
  * (P-035 2026-09-28, vendor r39).
  *

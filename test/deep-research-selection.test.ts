@@ -31,6 +31,7 @@ vi.mock("../src/api/models.js", async (importOriginal) => {
 });
 
 const { setDeepResearch } = await import("../src/browser/conversation.js");
+const { deepResearchQuota, resetDeepResearchQuota } = await import("../src/browser/deep-research-quota.js");
 
 function scenario(options: {
   exposed?: boolean;
@@ -211,6 +212,40 @@ describe("native Deep Research selection", () => {
     expect(test.page.keyboard.press).toHaveBeenCalledWith("Escape");
   });
 
+  it("G4-A: reads the row's remaining counter before the row is clicked", async () => {
+    resetDeepResearchQuota();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const test = scenario();
+      let clickedBeforeRead = false;
+      test.toggle.evaluate.mockImplementationOnce(async () => {
+        clickedBeforeRead = test.toggle.click.mock.calls.length > 0;
+        return "Deep research\n 5 left" as unknown as boolean;
+      });
+
+      await expect(setDeepResearch(test.page, true)).resolves.toBe(true);
+
+      expect(clickedBeforeRead).toBe(false);
+      expect(deepResearchQuota()).toMatchObject({ remaining: 5, label: "Deep research 5 left" });
+      expect(log.mock.calls.flat()).toContain(
+        '[cgpro:deep-research] tools row: remaining=5 label="Deep research 5 left"',
+      );
+    } finally {
+      log.mockRestore();
+      resetDeepResearchQuota();
+    }
+  });
+
+  it("G4-A: an already-selected chip takes no reading and keeps the previous one", async () => {
+    resetDeepResearchQuota();
+    const test = scenario({ initiallySelected: true, effortLabel: "6Pro" });
+
+    await expect(setDeepResearch(test.page, true)).resolves.toBe(true);
+
+    expect(test.toggle.evaluate).not.toHaveBeenCalled();
+    expect(deepResearchQuota().observedAt).toBeNull();
+  });
+
   it("recognizes an already-selected native mode without reopening the picker", async () => {
     const test = scenario({ initiallySelected: true, effortLabel: "6Pro" });
 
@@ -226,7 +261,8 @@ describe("native Deep Research selection", () => {
     await expect(setDeepResearch(test.page, true)).resolves.toBe(true);
 
     expect(test.toggle.click).toHaveBeenCalledTimes(1);
-    expect(test.toggle.evaluate).toHaveBeenCalledTimes(1);
+    // G4-A: the first evaluate is the read-only row read, the second the fallback.
+    expect(test.toggle.evaluate).toHaveBeenCalledTimes(2);
   });
 
   it("fails closed when the native Deep Research row is missing", async () => {

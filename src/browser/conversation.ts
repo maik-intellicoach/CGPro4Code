@@ -1,6 +1,7 @@
 import type { Page, Locator } from "patchright";
 import { PREFLIGHT_CHROME, SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
+import { deepResearchQuota, recordDeepResearchRow, type DeepResearchQuota } from "./deep-research-quota.js";
 import { listProjects } from "../api/projects.js";
 import { fetchModelsWithReason, findProModel, type ChatgptModel } from "../api/models.js";
 import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, type ReplyStalledDetails, ReplyStalledError, SelectorBrokenError, type SubmittedTurnNotRenderedDetails, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../errors.js";
@@ -1798,6 +1799,9 @@ export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
     const detail = visible.length > 0 ? `; visible entries=${JSON.stringify(visible)}` : "";
     throw new Error(`ChatGPT native Deep Research is not exposed in the composer tool picker${detail}`);
   }
+  // P-035 2026-10-03 G4-A. Read the row's remaining counter before it is
+  // touched. Text only: the read never clicks and never changes the selection.
+  if (on) await readDeepResearchRow(toggle);
 
   const selected = async (candidate: Locator): Promise<boolean> => {
     const checked = (await candidate.getAttribute("aria-checked").catch(() => null)) === "true";
@@ -1898,6 +1902,54 @@ async function deepResearchMention(page: Page, placeCaret: boolean): Promise<boo
     placeCaret,
   });
   return found === true;
+}
+
+/** Interactive ancestors a Deep research label may sit inside; the row is the nearest one. */
+const DEEP_RESEARCH_ROW_ANCESTORS =
+  'button, [role="menuitem"], [role="menuitemradio"], [role="option"], [data-radix-collection-item], div.__menu-item';
+
+/**
+ * P-035 2026-10-03 G4-A. One bounded read of the Deep research row's text,
+ * recorded as this process's quota reading. The row is the nearest interactive
+ * ancestor of the resolved label (the count may be a sibling of the label).
+ * Returns false, recording nothing, when the row cannot be read.
+ */
+async function readDeepResearchRow(toggle: Locator): Promise<boolean> {
+  const text = await toggle.evaluate((element, ancestors) => {
+    const row = (element.closest(ancestors) as HTMLElement | null) ?? element as HTMLElement;
+    return typeof row.innerText === "string" ? row.innerText : "";
+  }, DEEP_RESEARCH_ROW_ANCESTORS, { timeout: PICKER_READ_TIMEOUT_MS }).catch(() => null);
+  if (typeof text !== "string") return false;
+  recordDeepResearchRow(text);
+  return true;
+}
+
+/**
+ * P-035 2026-10-03 G4-A. Read the Deep Research quota on an idle page: the
+ * preflight's home step (`goHome` + `waitForComposerHydrated`), then the tools
+ * popover, then the row's text, then Escape and a check that the popover
+ * closed. It never clicks the row, never types and never submits.
+ */
+export async function readDeepResearchQuota(page: Page): Promise<DeepResearchQuota> {
+  await goHome(page);
+  await waitForComposerHydrated(page);
+  if (!(await openComposerToolsPopover(page))) {
+    throw new Error("ChatGPT composer tools popover is unavailable");
+  }
+  const toggle = await requireSelector(page, SELECTORS.deepResearchToggle, "native Deep Research", 8_000)
+    .catch(() => null);
+  if (!toggle) {
+    await page.keyboard.press("Escape").catch(() => undefined);
+    throw new Error("ChatGPT native Deep Research is not exposed in the composer tool picker");
+  }
+  const read = await readDeepResearchRow(toggle);
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+  if (await toggle.isVisible().catch(() => false)) {
+    throw new Error("ChatGPT composer tools popover did not close after Escape");
+  }
+  if (!read) throw new Error("ChatGPT native Deep Research row could not be read");
+  return deepResearchQuota();
 }
 
 async function openComposerToolsPopover(page: Page): Promise<boolean> {
