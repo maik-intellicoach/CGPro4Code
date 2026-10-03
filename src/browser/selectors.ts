@@ -291,6 +291,20 @@ export const PREFLIGHT_CHROME = {
    * whatever its text.
    */
   deepResearchChipPill: '[data-inline-selection-pill][data-id="plugin:connector_openai_deep_research"]',
+  /**
+   * P-035 2026-10-03 G3-B (sixth run). The same persisted mode as an app
+   * mention (`@deep-research`): a `[contenteditable="false"]` element inside
+   * the composer carrying `app-mention-name`. It is the Deep Research mention
+   * only when its whitespace-collapsed text is exactly
+   * `deepResearchMentionText` (case-insensitive) AND at least one of
+   * `deepResearchMentionAttributes` matches `deepResearchMentionPattern`
+   * (flag `i`). The draft guard and `setDeepResearch(page, false)` both apply
+   * exactly these four parts.
+   */
+  deepResearchMention: '[contenteditable="false"][app-mention-name]',
+  deepResearchMentionText: "deep-research",
+  deepResearchMentionAttributes: ["app-mention-name", "app-mention-path", "data-prompt-link-label"],
+  deepResearchMentionPattern: "deep[\\s_-]*research",
 } as const;
 
 /**

@@ -99,9 +99,15 @@ function fixture(initial: Partial<State> = {}) {
       const removedNow = new Set<FixtureToken>();
       // G3-B (fifth run): `pill` answers the Deep Research pill selector, and
       // `selectionPill` (or `pill`) the bare `[data-inline-selection-pill]` one.
-      const answers = (entry: { pill?: boolean; selectionPill?: boolean }, selector: string): boolean =>
+      // G3-B (sixth run): a node carrying `app-mention-name` answers the Deep
+      // Research mention selector (`[contenteditable="false"][app-mention-name]`).
+      const answers = (
+        entry: { pill?: boolean; selectionPill?: boolean; attributes?: Array<{ name: string }> }, selector: string,
+      ): boolean =>
         (!!entry.pill && selector === PREFLIGHT_CHROME.deepResearchChipPill)
-        || ((!!entry.pill || !!entry.selectionPill) && selector === "[data-inline-selection-pill]");
+        || ((!!entry.pill || !!entry.selectionPill) && selector === "[data-inline-selection-pill]")
+        || (selector === PREFLIGHT_CHROME.deepResearchMention
+          && (entry.attributes ?? []).some(attribute => attribute.name === "app-mention-name"));
       const attributesOf = (entry: { attributes?: Array<{ name: string; value?: string }> }) => ({
         attributes: (entry.attributes ?? []).map(attribute => ({ name: attribute.name, value: attribute.value ?? "" })),
         getAttribute: (name: string) => (entry.attributes ?? []).find(attribute => attribute.name === name)?.value ?? null,
@@ -3126,11 +3132,11 @@ describe("own Deep Research pill on an ancestor, and the token shape line", () =
     const shape = lines.filter(line => line.startsWith("[cgpro:preflight] token shape: "));
     expect(shape).toEqual([
       "[cgpro:preflight] token shape: tag=SPAN attrs=contenteditable,class,data-id,data-private,aria-label "
-      + `data-id="plugin:other" data-type=- role=- aria-label="${"a".repeat(80)}" class="chip x" `
+      + `data-id="plugin:other" data-type=- role=- aria-label="${"a".repeat(80)}" class="chip x" app-mention-name=- app-mention-path=- data-prompt-link-label=- `
       + "text_len=20 slug=no "
       + "parent=[tag=SPAN attrs=data-inline-selection-pill,data-type,role data-id=- data-type=\"mention\" "
-      + "role=\"button\" aria-label=- class=-] "
-      + "grandparent=[tag=P attrs=data-empty data-id=- data-type=- role=- aria-label=- class=-] pill_ancestor=yes",
+      + "role=\"button\" aria-label=- class=- app-mention-name=- app-mention-path=- data-prompt-link-label=-] "
+      + "grandparent=[tag=P attrs=data-empty data-id=- data-type=- role=- aria-label=- class=- app-mention-name=- app-mention-path=- data-prompt-link-label=-] pill_ancestor=yes",
     ]);
     for (const line of lines) {
       expect(line).not.toContain("zorble");
@@ -3145,7 +3151,7 @@ describe("own Deep Research pill on an ancestor, and the token shape line", () =
       { connector: "fixture" });
     expect(error.reason).toBe("connector_token_text");
     expect(lines.filter(line => line.includes("token shape"))).toEqual([
-      "[cgpro:preflight] token shape: tag=SPAN attrs=- data-id=- data-type=- role=- aria-label=- class=- "
+      "[cgpro:preflight] token shape: tag=SPAN attrs=- data-id=- data-type=- role=- aria-label=- class=- app-mention-name=- app-mention-path=- data-prompt-link-label=- "
       + "text_len=15 slug=yes parent=[-] grandparent=[-] pill_ancestor=no",
     ]);
   });
@@ -3154,7 +3160,7 @@ describe("own Deep Research pill on an ancestor, and the token shape line", () =
     const unowned = await linesOf(fixture({ tokenTree: [{ tagName: "A", textContent: "lane-x" }] }).page);
     expect(unowned.error.reason).toBe("connector_unowned");
     expect(unowned.lines.filter(line => line.includes("token shape"))).toEqual([
-      "[cgpro:preflight] token shape: tag=A attrs=- data-id=- data-type=- role=- aria-label=- class=- "
+      "[cgpro:preflight] token shape: tag=A attrs=- data-id=- data-type=- role=- aria-label=- class=- app-mention-name=- app-mention-path=- data-prompt-link-label=- "
       + "text_len=6 slug=yes parent=[-] grandparent=[-] pill_ancestor=no",
     ]);
     const count = await linesOf(fixture({
@@ -3162,7 +3168,7 @@ describe("own Deep Research pill on an ancestor, and the token shape line", () =
     }).page, { connector: "lane-x" });
     expect(count.error.reason).toBe("connector_token_count:2");
     expect(count.lines.filter(line => line.includes("token shape"))).toEqual([
-      "[cgpro:preflight] token shape: tag=B attrs=- data-id=- data-type=- role=- aria-label=- class=- "
+      "[cgpro:preflight] token shape: tag=B attrs=- data-id=- data-type=- role=- aria-label=- class=- app-mention-name=- app-mention-path=- data-prompt-link-label=- "
       + "text_len=12 slug=no parent=[-] grandparent=[-] pill_ancestor=no",
     ]);
     expect(count.lines.join("\n")).not.toContain("Private");
@@ -3175,5 +3181,86 @@ describe("own Deep Research pill on an ancestor, and the token shape line", () =
     const text = await linesOf(fixture({ text: "private draft" }).page);
     expect(text.error.reason).toBe("text_present");
     expect(text.lines.some(line => line.includes("token shape"))).toBe(false);
+  });
+});
+
+// P-035 2026-10-03 G3-B (sixth run). Live intelli (built 2134f76) refused
+// `connector_token_text` at `home` on a composer holding one SPAN carrying
+// `app-mention-name`, `app-mention-path`, `data-prompt-link-label`, ...: the
+// persisted Deep Research mode as an app mention, text `deep-research`.
+describe("own native Deep Research chip, app mention form", () => {
+  const reasonOf = async (page: Page, owned: Parameters<typeof assertPreflightDraftSafe>[1] = {}) =>
+    (await assertPreflightDraftSafe(page, owned).then(() => undefined).catch(caught => caught))?.reason;
+  const homeControls = [{ ariaLabel: "Add files and more" }, { ariaLabel: "Send" }];
+  // The evidence-2 attribute names; the values are illustrative.
+  const mentionAttributes = (values: { name?: string; path?: string; label?: string } = {}) => [
+    { name: "app-mention-name", value: values.name ?? "Deep research" },
+    { name: "app-mention-display-name", value: "Deep research" },
+    { name: "app-mention-path", value: values.path ?? "deep-research" },
+    { name: "app-mention-icon", value: "" },
+    { name: "app-mention-brand-color", value: "" },
+    { name: "data-prompt-link-href", value: "" },
+    { name: "data-prompt-link-label", value: values.label ?? "Deep research" },
+    { name: "class", value: "Mention-hIgCkC" },
+    { name: "data-appearance", value: "" }, { name: "data-layout", value: "" },
+    { name: "data-font-weight", value: "" }, { name: "data-tone", value: "" },
+    { name: "data-interactive", value: "" }, { name: "data-underline-on-hover", value: "" },
+    { name: "contenteditable", value: "false" },
+  ];
+  const mention = (textContent = "deep-research", values: Parameters<typeof mentionAttributes>[0] = {}): TokenNode =>
+    ({ tagName: "SPAN", textContent, icon: true, attributes: mentionAttributes(values), wrappers: [{ tagName: "P" }] });
+
+  it("admits the evidence-2 mention alone, without and with an owned connector", async () => {
+    const test = fixture({ tokenTree: [mention()], controls: homeControls });
+    await expect(assertPreflightDraftSafe(test.page)).resolves.toBeUndefined();
+    // Removed from the clone before tokens were counted.
+    expect(test.removedTokens.map(token => token.textContent)).toEqual(["deep-research"]);
+    await expect(assertPreflightDraftSafe(fixture({ tokenTree: [mention()], controls: homeControls }).page,
+      { connector: "fixture" })).resolves.toBeUndefined();
+    // Case-insensitive text, and the whitespace a removed atom leaves behind.
+    await expect(assertPreflightDraftSafe(fixture({
+      tokenTree: [mention(" Deep-Research ")], composerInnerText: "Deep-Research", text: " ",
+    }).page)).resolves.toBeUndefined();
+    // One matching attribute is enough.
+    await expect(assertPreflightDraftSafe(fixture({
+      tokenTree: [mention("deep-research", { name: "x", path: "y", label: "Deep_Research" })],
+    }).page)).resolves.toBeUndefined();
+  });
+
+  it("refuses the mention plus typed text", async () => {
+    expect(await reasonOf(fixture({ tokenTree: [mention()], text: "private draft" }).page)).toBe("text_present");
+    expect(await reasonOf(fixture({
+      tokenTree: [mention()], composerInnerText: "deep-research private draft",
+    }).page, { connector: "fixture" })).toBe("text_present");
+  });
+
+  it("refuses a deep-research mention whose attribute values do not match", async () => {
+    const values = { name: "canva", path: "canva", label: "Canva" };
+    expect(await reasonOf(fixture({ tokenTree: [{ ...mention("deep-research", values), icon: false }] }).page,
+      { connector: "fixture" })).toBe("connector_token_text");
+    expect(await reasonOf(fixture({ tokenTree: [mention("deep-research", values)] }).page)).toBe("form_media:img");
+  });
+
+  it("refuses another app mention", async () => {
+    const canva = { ...mention("canva", { name: "Canva", path: "canva", label: "Canva" }), icon: false };
+    expect(await reasonOf(fixture({ tokenTree: [canva] }).page, { connector: "fixture" })).toBe("connector_token_text");
+    expect(await reasonOf(fixture({ tokenTree: [canva] }).page)).toBe("connector_unowned");
+    // A Deep Research attribute does not make other text ours.
+    expect(await reasonOf(fixture({ tokenTree: [{ ...mention("canva"), icon: false }] }).page,
+      { connector: "fixture" })).toBe("connector_token_text");
+  });
+
+  it("shows the three app-mention values in the token shape of a refused mention", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await assertPreflightDraftSafe(fixture({
+        tokenTree: [{ ...mention("canva", { name: "Canva", path: `canva/${"p".repeat(100)}`, label: "Canva" }), icon: false }],
+      }).page, { connector: "fixture" }).catch(() => undefined);
+      const shape = spy.mock.calls.map(call => String(call[0])).find(line => line.includes("token shape"));
+      expect(shape).toContain(`class="Mention-hIgCkC" app-mention-name="Canva" app-mention-path="canva/${"p".repeat(74)}" `
+        + 'data-prompt-link-label="Canva" text_len=5');
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "patchright";
-import { SELECTORS, joinSelectors } from "../src/browser/selectors.js";
+import { runInNewContext } from "node:vm";
+import { PREFLIGHT_CHROME, SELECTORS, joinSelectors } from "../src/browser/selectors.js";
 
 const firstResolved = vi.fn();
 const requireSelector = vi.fn();
@@ -41,7 +42,15 @@ function scenario(options: {
   normalClickThrows?: boolean;
   flatListOnly?: boolean;
   pickerLabels?: string[];
+  /**
+   * G3-B (sixth run): the composer holds the Deep Research app mention, and
+   * this many caret-placed Backspaces remove it (`Infinity`: never).
+   */
+  mentionRemovedAfter?: number;
 } = {}) {
+  let mentionPresent = options.mentionRemovedAfter !== undefined;
+  let caretPlaced = false;
+  let backspaces = 0;
   let popoverOpen = false;
   let selected = options.initiallySelected ?? false;
   const exposed = options.exposed ?? true;
@@ -81,7 +90,14 @@ function scenario(options: {
     keyboard: {
       // "End" now drives the thinking-power slider (it is focused first);
       // Escape is what closes the popover.
-      press: vi.fn(async (key: string) => { if (key === "End") power = "4"; else popoverOpen = false; }),
+      press: vi.fn(async (key: string) => {
+        if (key === "End") power = "4";
+        else if (key === "Backspace") {
+          if (caretPlaced) backspaces += 1;
+          caretPlaced = false;
+          if (backspaces >= (options.mentionRemovedAfter ?? Infinity)) mentionPresent = false;
+        } else popoverOpen = false;
+      }),
     },
     waitForTimeout: vi.fn(async () => {}),
     locator: vi.fn((selector: string) => {
@@ -96,6 +112,11 @@ function scenario(options: {
     evaluate: vi.fn(async (_fn: unknown, arg: unknown) => {
       if (typeof arg === "string") return 0;
       const keys = arg && typeof arg === "object" ? Object.keys(arg) : [];
+      // G3-B (sixth run): the mention check, which may also place the caret.
+      if (keys.includes("mentionSelector")) {
+        if (mentionPresent && (arg as { placeCaret: boolean }).placeCaret) caretPlaced = true;
+        return mentionPresent;
+      }
       if (keys.includes("selectedSelector")) return "row=\"6Pro\" menus=1 menuItems=[] sliders=[4/4]";
       return { entries: options.pickerEntries ?? ["Latest", "GPT-5.6 Sol"], checkedIndex: 0 };
     }),
@@ -136,7 +157,7 @@ function scenario(options: {
     return null;
   });
 
-  return { page, plus, toggle, effort };
+  return { page, plus, toggle, effort, mentionPresent: () => mentionPresent };
 }
 
 beforeEach(() => {
@@ -276,7 +297,7 @@ describe("native Deep Research selection", () => {
     it("clicks the same row to deselect an inherited chip and verifies it is gone", async () => {
       const test = scenario({ initiallySelected: true });
 
-      await expect(setDeepResearch(test.page, false)).resolves.toBe(false);
+      await expect(setDeepResearch(test.page, false)).resolves.toBe(true);
 
       expect(test.plus.click).toHaveBeenCalledTimes(1);
       expect(test.toggle.click).toHaveBeenCalledTimes(1);
@@ -288,14 +309,14 @@ describe("native Deep Research selection", () => {
     it("ignores the row's ARIA state and still clicks while the chip shows", async () => {
       // The picker row reports checked; the chip is the only authority.
       const test = scenario({ initiallySelected: true });
-      await expect(setDeepResearch(test.page, false)).resolves.toBe(false);
+      await expect(setDeepResearch(test.page, false)).resolves.toBe(true);
       expect(test.toggle.click).toHaveBeenCalledTimes(1);
     });
 
     it("deselects through the interactive-row fallback when the click is intercepted", async () => {
       const test = scenario({ initiallySelected: true, normalClickThrows: true });
 
-      await expect(setDeepResearch(test.page, false)).resolves.toBe(false);
+      await expect(setDeepResearch(test.page, false)).resolves.toBe(true);
 
       expect(test.toggle.evaluate).toHaveBeenCalledTimes(1);
     });
@@ -311,6 +332,100 @@ describe("native Deep Research selection", () => {
       } finally {
         log.mockRestore();
       }
+    });
+
+    // P-035 2026-10-03 G3-B (sixth run). Live intelli: the persisted mode can
+    // render as an app mention (`@deep-research`) that the chip selectors miss.
+    it("removes the app mention with one caret-placed Backspace and returns true", async () => {
+      const test = scenario({ mentionRemovedAfter: 1 });
+
+      await expect(setDeepResearch(test.page, false)).resolves.toBe(true);
+
+      expect(test.mentionPresent()).toBe(false);
+      expect(test.page.keyboard.press).toHaveBeenCalledTimes(1);
+      expect(test.page.keyboard.press).toHaveBeenCalledWith("Backspace");
+      // The caret is placed in-page before the key, with the guard's own parts.
+      const placements = vi.mocked(test.page.evaluate).mock.calls
+        .map(call => call[1] as { placeCaret?: boolean; mentionSelector?: string; pattern?: string })
+        .filter(arg => arg?.mentionSelector !== undefined);
+      expect(placements.map(arg => arg.placeCaret)).toEqual([false, true, false]);
+      expect(placements[0]).toMatchObject({
+        mentionSelector: PREFLIGHT_CHROME.deepResearchMention,
+        text: PREFLIGHT_CHROME.deepResearchMentionText,
+        attributes: [...PREFLIGHT_CHROME.deepResearchMentionAttributes],
+        pattern: PREFLIGHT_CHROME.deepResearchMentionPattern,
+        composerSelector: joinSelectors(SELECTORS.composer),
+      });
+      // No chip: the picker was never opened.
+      expect(test.plus.click).not.toHaveBeenCalled();
+      expect(test.toggle.click).not.toHaveBeenCalled();
+    });
+
+    it("tries a second Backspace when the first leaves the mention", async () => {
+      const test = scenario({ mentionRemovedAfter: 2 });
+      await expect(setDeepResearch(test.page, false)).resolves.toBe(true);
+      expect(test.page.keyboard.press).toHaveBeenCalledTimes(2);
+    });
+
+    it("throws when the mention is still there after two attempts", async () => {
+      const test = scenario({ mentionRemovedAfter: Infinity });
+
+      await expect(setDeepResearch(test.page, false)).rejects.toThrow(
+        "ChatGPT native Deep Research mention could not be removed",
+      );
+
+      expect(test.page.keyboard.press).toHaveBeenCalledTimes(2);
+      expect(test.plus.click).not.toHaveBeenCalled();
+    });
+
+    it("removes the mention first and then the chip, still returning true", async () => {
+      const test = scenario({ mentionRemovedAfter: 1, initiallySelected: true });
+      await expect(setDeepResearch(test.page, false)).resolves.toBe(true);
+      expect(test.mentionPresent()).toBe(false);
+      expect(test.toggle.click).toHaveBeenCalledTimes(1);
+    });
+
+    it("never checks for the mention on the Deep Research on path", async () => {
+      const test = scenario({ mentionRemovedAfter: 1 });
+      await expect(setDeepResearch(test.page, true)).resolves.toBe(true);
+      expect(test.page.keyboard.press).not.toHaveBeenCalledWith("Backspace");
+      expect(vi.mocked(test.page.evaluate).mock.calls
+        .some(call => (call[1] as { mentionSelector?: string } | undefined)?.mentionSelector !== undefined)).toBe(false);
+    });
+
+    it("places the caret directly after the mention inside the focused composer", async () => {
+      const test = scenario({ mentionRemovedAfter: 1 });
+      await setDeepResearch(test.page, false);
+      const call = vi.mocked(test.page.evaluate).mock.calls
+        .find(entry => (entry[1] as { placeCaret?: boolean } | undefined)?.placeCaret === true);
+      expect(call).toBeDefined();
+      const [fn, arg] = call as unknown as [Function, Record<string, unknown>];
+      const attributes: Record<string, string> = { "app-mention-path": "deep-research" };
+      const mention = { textContent: " Deep-Research ", getAttribute: (name: string) => attributes[name] ?? null };
+      const other = { textContent: "canva", getAttribute: () => "canva" };
+      const focus = vi.fn();
+      const composer = { focus, querySelectorAll: (selector: string) =>
+        selector === PREFLIGHT_CHROME.deepResearchMention ? [other, mention] : [] };
+      const range = { setStartAfter: vi.fn(), collapse: vi.fn() };
+      const selection = { removeAllRanges: vi.fn(), addRange: vi.fn() };
+      const run = (place: boolean) => runInNewContext(`(${fn.toString()})(arg)`, {
+        arg: { ...arg, placeCaret: place },
+        document: { querySelectorAll: () => [composer], createRange: () => range },
+        window: { getSelection: () => selection },
+      });
+
+      expect(run(true)).toBe(true);
+      expect(focus).toHaveBeenCalledTimes(1);
+      expect(range.setStartAfter).toHaveBeenCalledWith(mention);
+      expect(range.collapse).toHaveBeenCalledWith(true);
+      expect(selection.addRange).toHaveBeenCalledWith(range);
+      // Checking only never moves the caret.
+      focus.mockClear();
+      expect(run(false)).toBe(true);
+      expect(focus).not.toHaveBeenCalled();
+      // A deep-research text without a matching attribute is not the mention.
+      attributes["app-mention-path"] = "canva";
+      expect(run(false)).toBe(false);
     });
   });
 });

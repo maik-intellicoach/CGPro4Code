@@ -369,6 +369,58 @@ describe("runAskOnSession native Deep Research chip hygiene", () => {
     expect(sendPrompt).not.toHaveBeenCalled();
   });
 
+  // P-035 2026-10-03 G3-B (sixth run). The persisted mode can also render as
+  // the app mention `@deep-research`; `setDeepResearch(page, false)` now
+  // removes it, so both of its callers clear it too. The composer is modelled
+  // by one flag the mock clears exactly as the real off path does.
+  const mentionComposer = (initially: boolean) => {
+    const composer = { mention: initially };
+    setDeepResearch.mockImplementation(async (_page: unknown, on: boolean) => {
+      if (on) { composer.mention = true; return true; }
+      const removed = composer.mention;
+      composer.mention = false;
+      return removed;
+    });
+    return composer;
+  };
+
+  it("clears an inherited Deep Research mention on an ordinary turn before submit", async () => {
+    waitTurnComplete.mockResolvedValueOnce(undefined);
+    const composer = mentionComposer(true);
+    let mentionAtSubmit: boolean | undefined;
+    sendPrompt.mockImplementationOnce(async () => { mentionAtSubmit = composer.mention; });
+    const activeSession = session();
+    const runner = runAskOnSession({ prompt: "plain", web: true, timeoutSec: 1_200, headless: false }, activeSession);
+    await collect(runner.events);
+    await runner.result.catch(() => undefined);
+    expect(setDeepResearch).toHaveBeenCalledWith(activeSession.page, false);
+    expect(sendPrompt).toHaveBeenCalledTimes(1);
+    expect(mentionAtSubmit).toBe(false);
+  });
+
+  it("fails an ordinary turn before submit when the Deep Research mention cannot be removed", async () => {
+    setDeepResearch.mockRejectedValueOnce(new Error("ChatGPT native Deep Research mention could not be removed"));
+    const runner = runAskOnSession({ prompt: "plain", web: true, timeoutSec: 1_200, headless: false }, session());
+    await collect(runner.events);
+    await expect(runner.result).rejects.toThrow("ChatGPT native Deep Research mention could not be removed");
+    expect(setWebSearch).not.toHaveBeenCalled();
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
+  it("clears its own Deep Research mention when a Deep Research turn fails before submit", async () => {
+    const original = new Error("native user nodes unavailable");
+    currentConversationId.mockReturnValue("native-conversation");
+    fetchNativeResearchUserNodes.mockRejectedValueOnce(original);
+    const composer = mentionComposer(false);
+    const activeSession = session();
+    const runner = runAskOnSession({ prompt: "research", deepResearch: true, timeoutSec: 1_200, headless: false }, activeSession);
+    await collect(runner.events);
+    await expect(runner.result).rejects.toBe(original);
+    expect(setDeepResearch.mock.calls.map(call => call[1])).toEqual([true, false]);
+    expect(composer.mention).toBe(false);
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
   it("clears its own chip when a Deep Research turn fails between selection and submit", async () => {
     const original = new Error("native user nodes unavailable");
     currentConversationId.mockReturnValue("native-conversation");

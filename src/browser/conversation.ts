@@ -1750,6 +1750,24 @@ export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
     await ensureProSixMaximum(page);
   };
 
+  // P-035 2026-10-03 G3-B (sixth run). Live intelli: the persisted mode can
+  // also render as an app mention (`@deep-research`) that
+  // `SELECTORS.deepResearchSelected` does not know, and the draft guard admits
+  // it as an own chip. Turning the mode off therefore removes the mention
+  // first: place the caret directly after it, press Backspace once, check
+  // again, try once more, and fail before submit if it is still there.
+  let mentionRemoved = false;
+  if (!on && await deepResearchMention(page, false)) {
+    for (let attempt = 0; attempt < 2 && !mentionRemoved; attempt += 1) {
+      if (await deepResearchMention(page, true)) {
+        await page.keyboard.press("Backspace");
+        await page.waitForTimeout(300);
+      }
+      mentionRemoved = !(await deepResearchMention(page, false));
+    }
+    if (!mentionRemoved) throw new Error("ChatGPT native Deep Research mention could not be removed");
+  }
+
   // The selected mode is rendered as a blue composer chip. This is the
   // strongest current-state signal and avoids reopening the picker merely to
   // inspect an ARIA attribute that the current UI no longer supplies.
@@ -1762,7 +1780,7 @@ export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
   // chip in the home composer and ChatGPT kept it across restarts. Turning the
   // mode off is judged by the chip alone: no chip means nothing to undo, so
   // neither the picker nor any row is touched.
-  if (!on && !alreadySelected) return false;
+  if (!on && !alreadySelected) return mentionRemoved;
 
   await page.waitForTimeout(5_000);
   if (!(await openComposerToolsPopover(page))) {
@@ -1838,7 +1856,48 @@ export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
   if (on) {
     await verifyMaximum();
   }
-  return on;
+  // G3-B (sixth run): on the off path the chip was removed, so report it.
+  return true;
+}
+
+/**
+ * P-035 2026-10-03 G3-B (sixth run). Whether a composer holds the Deep Research
+ * app mention, judged by the same `PREFLIGHT_CHROME.deepResearchMention*` parts
+ * the draft guard uses. With `placeCaret`, the matching composer is focused and
+ * a collapsed selection is put directly after the mention (`Range.setStartAfter`)
+ * so one Backspace removes exactly that mention. In-tab JavaScript only.
+ */
+async function deepResearchMention(page: Page, placeCaret: boolean): Promise<boolean> {
+  const found = await page.evaluate(({ composerSelector, mentionSelector, text, attributes, pattern, placeCaret }) => {
+    const matcher = new RegExp(pattern, "i");
+    for (const composer of Array.from(document.querySelectorAll<HTMLElement>(composerSelector))) {
+      const mention = Array.from(composer.querySelectorAll<HTMLElement>(mentionSelector)).find(element =>
+        element !== composer
+        && (element.textContent ?? "").replace(/\s+/g, " ").trim().toLowerCase() === text
+        && attributes.some(name => matcher.test(element.getAttribute(name) ?? "")));
+      if (!mention) continue;
+      if (placeCaret) {
+        composer.focus();
+        const range = document.createRange();
+        range.setStartAfter(mention);
+        range.collapse(true);
+        const selection = window.getSelection();
+        if (!selection) return false;
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+      return true;
+    }
+    return false;
+  }, {
+    composerSelector: joinSelectors(SELECTORS.composer),
+    mentionSelector: PREFLIGHT_CHROME.deepResearchMention,
+    text: PREFLIGHT_CHROME.deepResearchMentionText,
+    attributes: [...PREFLIGHT_CHROME.deepResearchMentionAttributes],
+    pattern: PREFLIGHT_CHROME.deepResearchMentionPattern,
+    placeCaret,
+  });
+  return found === true;
 }
 
 async function openComposerToolsPopover(page: Page): Promise<boolean> {
@@ -2483,8 +2542,15 @@ interface TokenNodeShape {
   values: Record<string, string | null>;
 }
 
-/** The only attributes whose values a token shape may carry. */
-const TOKEN_SHAPE_VALUES = ["data-id", "data-type", "role", "aria-label", "class"] as const;
+/**
+ * The only attributes whose values a token shape may carry. G3-B (sixth run):
+ * the three app-mention attributes the Deep Research mention is recognised by,
+ * so a future miss shows their values.
+ */
+const TOKEN_SHAPE_VALUES = [
+  "data-id", "data-type", "role", "aria-label", "class",
+  "app-mention-name", "app-mention-path", "data-prompt-link-label",
+] as const;
 
 /**
  * P-035 2026-10-03 G3-B (fifth run). Live intelli refused `connector_token_text`
@@ -2843,9 +2909,32 @@ export async function assertPreflightDraftSafe(
           return !!holder && holder !== scope && !!scope.contains?.(holder);
         } catch { return false; }
       };
-      /** The text an own chip renders (its label, or a pill's own text), else null. */
+      //
+      // P-035 2026-10-03 G3-B (sixth run). Live intelli (built 2134f76) refused
+      // `connector_token_text` at `home` on a composer holding one token:
+      //   [cgpro:preflight] token shape: tag=SPAN attrs=app-mention-name,app-mention-display-name,app-mention-path,... text_len=13 slug=yes parent=[tag=P ...] pill_ancestor=no
+      // A third rendering of the persisted mode: the app mention
+      // `@deep-research`. It is an own chip exactly when the
+      // `deepResearchMention*` parts all hold: a `[contenteditable="false"]`
+      // element strictly inside `scope` carrying `app-mention-name`, text
+      // exactly `deep-research` (case-insensitive, whitespace collapsed), and
+      // a matching value in at least one of the named attributes. Any other
+      // app mention, or this text without a matching value, refuses as before.
+      // `setDeepResearch(page, false)` removes it before an ordinary turn.
+      const ownChipMention = (element: Element, scope: Element): boolean => {
+        try {
+          if (!element.matches?.(chromeSelectors.deepResearchMention)) return false;
+          if (element === scope || !scope.contains?.(element)) return false;
+          if (norm(element.textContent ?? "").toLowerCase() !== chromeSelectors.deepResearchMentionText) return false;
+          const pattern = new RegExp(chromeSelectors.deepResearchMentionPattern, "i");
+          return (chromeSelectors.deepResearchMentionAttributes as readonly string[])
+            .some(name => pattern.test(element.getAttribute?.(name) ?? ""));
+        } catch { return false; }
+      };
+      /** The text an own chip renders (its label, or a pill's or mention's own text), else null. */
       const ownChipText = (element: Element, scope: Element = composer): string | null =>
-        ownChipLabel(element) ?? (ownChipPill(element, scope) ? norm(element.textContent ?? "") : null);
+        ownChipLabel(element)
+        ?? (ownChipPill(element, scope) || ownChipMention(element, scope) ? norm(element.textContent ?? "") : null);
       // A root that cannot be queried (not a DOM element) holds no own chip.
       const ownChipAtoms = (root: Element): HTMLElement[] =>
         Array.from(root.querySelectorAll?.<HTMLElement>(chromeSelectors.deepResearchChipAtom) ?? []).filter(atom =>
@@ -2965,7 +3054,7 @@ export async function assertPreflightDraftSafe(
       // outermost token for the three token refusals. Read on the ORIGINAL
       // composer (own chip atoms excluded, as in the clone) so the ancestor
       // walk can reach the form; the clone's token is the fallback. Tags,
-      // attribute names, five capped attribute values, one length and one
+      // attribute names, the capped `TOKEN_SHAPE_VALUES`, one length and one
       // slug bit: never the token's text.
       const tokenNode = (element: Element): TokenNodeShape => {
         const values: Record<string, string | null> = {};
