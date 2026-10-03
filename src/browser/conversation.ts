@@ -2645,15 +2645,26 @@ export async function assertPreflightDraftSafe(
       // ChatGPT shows "Take this further in ChatGPT Work" above the composer,
       // with a "Try Work" button and an X, and the watchdog preflight refused
       // `unknown_control:BUTTON|Dismiss ChatGPT beacon banner` and restarted the
-      // lane. The banner is the nearest ancestor of that X which does NOT
-      // contain the composer; a `button` inside it is chrome, not a draft. An
-      // unnamed `BUTTON` anywhere else, a `[role="button"]` on another tag, and
-      // every control when that ancestor also holds the composer still refuse
-      // exactly as before.
+      // lane. The banner is an ancestor of that X which does NOT contain the
+      // composer (G3-B below: the outermost one); a `button` inside it is
+      // chrome, not a draft. An unnamed `BUTTON` anywhere else, a
+      // `[role="button"]` on another tag, and every control when no such
+      // ancestor exists still refuse exactly as before.
+      //
+      // P-035 2026-10-03 G3-B. In the live capture the heading, the line and
+      // "Try Work" are siblings of the X inside one card, so the X's direct
+      // parent need not be the whole card. The banner is now the OUTERMOST
+      // ancestor of the X that is inside the form and does not contain the
+      // composer: walk up from the X and stop before the first ancestor that
+      // holds the composer or is the form. Inside it, every `button` is chrome
+      // and the foreign-text walk below skips its text; text or controls
+      // outside it refuse exactly as before.
       const beaconBanners: Element[] = [];
       for (const dismiss of Array.from(form.querySelectorAll(chromeSelectors.beaconBannerDismiss))) {
-        const banner = dismiss.parentElement;
-        if (banner && banner !== form && !banner.contains(composer)) beaconBanners.push(banner);
+        let banner: Element | null = null;
+        for (let element = dismiss.parentElement; element && element !== form && !element.contains(composer);
+          element = element.parentElement) banner = element;
+        if (banner) beaconBanners.push(banner);
       }
       for (const control of Array.from(form.querySelectorAll('button, [role="button"]'))) {
         if (composer.contains(control) || control.closest('[role="menu"], [role="listbox"]')) continue;
@@ -3150,6 +3161,8 @@ export async function assertPreflightDraftSafe(
         if (!nodeText || composer.contains(node)) continue;
         const parent = node.parentElement;
         if (parent?.closest('button, [role="button"], [role="menu"], [role="listbox"]')) continue;
+        // G3-B: the beacon banner's heading and line are chrome (see above).
+        if (beaconBanners.some(banner => banner.contains(node))) continue;
         if (ownedToken && owned.connector && hiddenByAria(node)
           && !/\s/.test(nodeText) && nodeText.includes(owned.connector)) continue;
         // P-035 2026-09-28 r27. Live ms1980 (vendor bad524b) passed chip

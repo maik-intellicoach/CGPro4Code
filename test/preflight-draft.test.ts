@@ -121,18 +121,37 @@ function fixture(initial: Partial<State> = {}) {
       const controls = state.controls.length > 0
         ? state.controls
         : state.unknownButton ? [{ testid: state.unknownTestId }] : [];
-      // P-035 2026-10-03 G3. A control may sit in a synthetic banner: its
-      // `parentElement`, which contains exactly its own controls and, only when
-      // `holdsComposer` is set, the composer as well.
-      const banners = new Map<string, { contains: (node: unknown) => boolean }>();
-      const bannerFor = (id: string): { contains: (node: unknown) => boolean } => {
+      // P-035 2026-10-03 G3. A control may sit in a synthetic banner card whose
+      // parent is the form. G3-B: `nested` puts the X one wrapper deeper inside
+      // the card, and `contains` follows real `parentElement` links, so the
+      // guard's outermost-ancestor walk is exercised. `holdsComposer` makes the
+      // card contain the composer as well.
+      interface SyntheticElement {
+        tagName: string; parentElement: unknown; contains: (node: unknown) => boolean;
+        closest: () => null; getAttribute: () => null; hasAttribute: () => boolean; getClientRects: () => object[];
+      }
+      // The parent is resolved lazily: the form is built after the controls.
+      const syntheticElement = (tagName: string, parent: () => unknown, holdsComposer: boolean): SyntheticElement => {
+        const element: SyntheticElement = {
+          tagName, get parentElement() { return parent(); }, closest: () => null, getAttribute: () => null,
+          hasAttribute: () => false, getClientRects: () => [{}],
+          contains: (node: unknown) => {
+            if (node === composer) return holdsComposer;
+            for (let current = node as { parentElement?: unknown } | null; current;
+              current = (current.parentElement ?? null) as { parentElement?: unknown } | null) {
+              if (current === element) return true;
+            }
+            return false;
+          },
+        };
+        return element;
+      };
+      const banners = new Map<string, { card: SyntheticElement; inner: SyntheticElement }>();
+      const bannerFor = (id: string): { card: SyntheticElement; inner: SyntheticElement } => {
         let banner = banners.get(id);
         if (!banner) {
-          const own = banner = {
-            contains: (node: unknown) => node === composer
-              ? !!state.banners?.[id]?.holdsComposer
-              : controlElements.some(element => element === node && element.parentElement === own),
-          };
+          const card = syntheticElement("DIV", () => form, !!state.banners?.[id]?.holdsComposer);
+          banner = { card, inner: syntheticElement("DIV", () => card, false) };
           banners.set(id, banner);
         }
         return banner;
@@ -145,9 +164,14 @@ function fixture(initial: Partial<State> = {}) {
         getAttribute: (name: string) => name === "data-testid" ? (control.testid ?? "")
           : name === "aria-label" ? (control.ariaLabel ?? null) : null,
         tagName: control.tagName ?? "BUTTON",
-        parentElement: control.banner === undefined ? null : bannerFor(control.banner),
+        parentElement: control.banner === undefined ? null
+          : control.ariaLabel === "Dismiss ChatGPT beacon banner" && state.banners?.[control.banner]?.nested
+            ? bannerFor(control.banner).inner : bannerFor(control.banner).card,
       }));
       const form = {
+        tagName: "FORM",
+        getAttribute: () => null,
+        hasAttribute: () => false,
         querySelector: () => state.attachment ? {} : null,
         // The shape line bounds its ancestor scan to the form, so the walk must
         // see every synthetic foreign ancestor as inside it.
@@ -211,13 +235,18 @@ function fixture(initial: Partial<State> = {}) {
         // P-035 2026-09-28 r16. Models ONE text node outside the composer so a
         // test can prove the foreign-text walk still runs after admission. r17
         // gives it a real parent chain, so the refusal's shape line is proved.
+        //
+        // P-035 2026-10-03 G3-B. Banner text nodes (`state.bannerTexts`), each
+        // inside its synthetic card, come first; the one foreign node after them.
         createTreeWalker: () => {
-          let served = false;
+          const nodes: Array<{ textContent: string; parentElement: unknown }> = [
+            ...(state.bannerTexts ?? []).map(entry => ({ textContent: entry.text, parentElement: bannerFor(entry.banner).card })),
+            ...(state.foreignText ? [{ textContent: state.foreignText, parentElement: foreignParent }] : []),
+          ];
+          let index = -1;
           return {
-            nextNode: () => { if (served || !state.foreignText) return false; served = true; return true; },
-            get currentNode() {
-              return { textContent: state.foreignText ?? "", parentElement: foreignParent };
-            },
+            nextNode: () => { index += 1; return index < nodes.length; },
+            get currentNode() { return nodes[index]; },
           };
         },
       };
@@ -265,8 +294,13 @@ interface State {
   readable: boolean; count: number; form: boolean; unknownButton: boolean; unknownTestId: string;
   controls: Array<{ testid?: string; ariaLabel?: string; tagName?: string; banner?: string }>; url: string;
   rich?: RichNode[];
-  /** G3: synthetic banners by id; a control names its banner with `banner`. */
-  banners?: Record<string, { holdsComposer?: boolean }>;
+  /**
+   * G3: synthetic banner cards by id; a control names its banner with `banner`.
+   * G3-B: `nested` puts the dismiss X in a wrapper one level inside the card.
+   */
+  banners?: Record<string, { holdsComposer?: boolean; nested?: boolean }>;
+  /** G3-B: text nodes directly inside a banner card, walked before `foreignText`. */
+  bannerTexts?: Array<{ banner: string; text: string }>;
   /** Connector chips by tag and nesting; overrides the flat `mention(s)` shape. */
   tokenTree?: TokenNode[];
   /** Delays the composer's appearance until this many ms into the hydration wait. */
@@ -2660,6 +2694,56 @@ describe("ChatGPT Work beacon banner", () => {
       banners: { work: { holdsComposer: true } },
       controls: [{ banner: "work" }, { ariaLabel: dismiss, banner: "work" }],
     }).page)).toBe(`unknown_control:BUTTON|${dismiss}`);
+  });
+
+  // P-035 2026-10-03 G3-B. The live card: the X sits in a nested wrapper, and
+  // "Try Work", the heading and the line are elsewhere in the same card.
+  const heading = "Take this further in ChatGPT Work";
+  const line = "Turn your work into a polished document, deck, spreadsheet, report, or website.";
+  const liveCard = {
+    banners: { work: { nested: true } },
+    bannerTexts: [{ banner: "work", text: heading }, { banner: "work", text: line }],
+    controls: [
+      { banner: "work" },
+      { ariaLabel: dismiss, banner: "work" },
+      { ariaLabel: "Add files and more" },
+      { ariaLabel: "Send" },
+    ],
+  };
+
+  it("admits the whole card when the X sits in a nested child of it", async () => {
+    await expect(assertPreflightDraftSafe(fixture(liveCard).page)).resolves.toBeUndefined();
+  });
+
+  it("still refuses the banner text when no dismiss button is present", async () => {
+    expect(await reasonOf(fixture({
+      ...liveCard,
+      controls: [{ ariaLabel: "Add files and more" }],
+    }).page)).toBe("foreign_text");
+  });
+
+  it("does not admit a card that contains the composer", async () => {
+    // X directly in a card that holds the composer: no banner at all.
+    expect(await reasonOf(fixture({
+      ...liveCard,
+      banners: { work: { holdsComposer: true } },
+    }).page)).toBe(`unknown_control:BUTTON|${dismiss}`);
+    // X nested: the walk stops below the card, so "Try Work" and the text
+    // beside the X's own wrapper are not admitted.
+    expect(await reasonOf(fixture({
+      ...liveCard,
+      banners: { work: { holdsComposer: true, nested: true } },
+    }).page)).toBe("unknown_control:BUTTON");
+    expect(await reasonOf(fixture({
+      ...liveCard,
+      banners: { work: { holdsComposer: true, nested: true } },
+      controls: [{ ariaLabel: dismiss, banner: "work" }],
+    }).page)).toBe("foreign_text");
+  });
+
+  it("still refuses foreign text outside the admitted card", async () => {
+    expect(await reasonOf(fixture({ ...liveCard, foreignText: "private draft chip" }).page))
+      .toBe("foreign_text");
   });
 
   it("does not admit a role=button control inside the banner", async () => {
