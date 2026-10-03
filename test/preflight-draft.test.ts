@@ -2888,6 +2888,31 @@ describe("own native Deep Research chip", () => {
     }).page)).toBe("text_present");
   });
 
+  // P-035 2026-10-03 G3-B. Live intelli (built ca3fb0f) refused the lone chip:
+  //   [cgpro:preflight] no-token text shape: len=1 ws=1 cf=0 at=0 other=0
+  // The clone keeps the one whitespace the editor leaves beside the removed atom.
+  it("admits the whitespace or format character a removed chip atom leaves behind", async () => {
+    await expect(assertPreflightDraftSafe(fixture({ tokenTree: [chip()], text: " " }).page)).resolves.toBeUndefined();
+    await expect(assertPreflightDraftSafe(fixture({ tokenTree: [chip()], text: "\u00a0" }).page)).resolves.toBeUndefined();
+    // U+200B survives `trim()`, so the rendered text here is the label alone and
+    // only the clone carries it; a U+200B in the rendered text still refuses.
+    await expect(assertPreflightDraftSafe(fixture({
+      tokenTree: [chip()], text: "\u200b", composerInnerText: "Deep research",
+    }).page)).resolves.toBeUndefined();
+    expect(await reasonOf(fixture({ tokenTree: [chip()], text: "\u200b" }).page)).toBe("text_present");
+  });
+
+  it("still refuses the chip plus any non-whitespace remainder, and whitespace with no chip", async () => {
+    expect(await reasonOf(fixture({ tokenTree: [chip()], text: "x" }).page)).toBe("text_present");
+    expect(await reasonOf(fixture({ tokenTree: [chip()], text: "@" }).page)).toBe("text_present");
+    expect(await reasonOf(fixture({ text: " " }).page)).toBe("text_present");
+    expect(await reasonOf(fixture({ text: " ", composerInnerText: "" }).page)).toBe("text_present");
+    // A chip button outside the composer removes no atom from the clone.
+    expect(await reasonOf(fixture({
+      drButtons: [{ text: "Deep research", icon: true }], text: " ", composerInnerText: "",
+    }).page)).toBe("text_present");
+  });
+
   it("still refuses the chip plus a foreign img", async () => {
     expect(await reasonOf(fixture({ tokenTree: [chip()], attachment: true }).page)).toBe("form_media:img");
     expect(await reasonOf(fixture({ drButtons: [{ text: "Deep research", icon: true }], attachment: true }).page))

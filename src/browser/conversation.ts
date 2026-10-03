@@ -2760,7 +2760,13 @@ export async function assertPreflightDraftSafe(
       const copy = composer.cloneNode(true) as HTMLElement;
       // G3-B: the automation's own Deep Research atom is not a connector token
       // and not draft content; drop it from the clone before tokens are counted.
-      for (const atom of ownChipAtoms(copy)) atom.remove();
+      // G3-B (third run): how many were removed decides the whitespace rule in
+      // the no-token text check below.
+      let removedOwnChipAtoms = 0;
+      for (const atom of ownChipAtoms(copy)) {
+        atom.remove();
+        removedOwnChipAtoms += 1;
+      }
       // P-035 2026-09-28 r14. Ownership is proven by the chip's TEXT, never its
       // tag: ms1980's owned chip is not an `A` while intelli's is, so the old
       // `tagName !== "A"` clause refused the very chip this call attached. The
@@ -3048,7 +3054,21 @@ export async function assertPreflightDraftSafe(
               }
               return { len: ws + cf + at + other, ws, cf, at, other };
             };
-            if (text.trim() || remainder.length > 0) {
+            // P-035 2026-10-03 G3-B. Live intelli (built ca3fb0f): the home
+            // composer held only the native "Deep research" chip, its atom was
+            // removed from the clone above, and this branch still refused:
+            //   [cgpro:preflight] no-token text shape: len=1 ws=1 cf=0 at=0 other=0
+            // The one whitespace is what the editor keeps beside an inline atom.
+            // Treat the remainder as empty ONLY when at least one own chip atom
+            // was removed, the remainder is nothing but whitespace or `\p{Cf}`
+            // (no `@`, nothing else), the rendered text is empty after the label
+            // strip, and the composer is not a textarea. Any other remainder, and
+            // every composer without an own chip, refuses exactly as before.
+            const chipWhitespaceOnly = removedOwnChipAtoms > 0
+              && !(composer instanceof HTMLTextAreaElement)
+              && stripped.length === 0
+              && text.trim() === "";
+            if (text.trim() || (remainder.length > 0 && !chipWhitespaceOnly)) {
               return { reason: "text_present", noTokenShape: noTokenShape(remainder) };
             }
             if (composer instanceof HTMLTextAreaElement && text.length > 0) {
