@@ -4878,6 +4878,11 @@ const TURN_NOT_RENDERED_CONSECUTIVE_OBSERVATIONS = 3;
  * that exists, is not working, and whose trimmed text never changes, and any
  * observation with a working turn, a changed length or a failed read restarts
  * the streak.
+ *
+ * P-035 G3 r46 (2026-10-03). Never on a native Deep Research turn: it renders a
+ * short static bubble and researches for 10 to 30 minutes in the research panel
+ * with no Stop button, so every genuine run read as frozen and died at minute
+ * ten (invocations d8198ffb, b998458d). The turn timeout still bounds it.
  */
 const REPLY_STALL_CONSECUTIVE_OBSERVATIONS = 10;
 /**
@@ -5070,7 +5075,8 @@ async function readTurnHeartbeat(
           alertShapes,
         }
       : null,
-    stall: count > priorAssistantCount && !working
+    // r46: a Deep Research turn is never observed as a frozen reply.
+    stall: !deepResearch && count > priorAssistantCount && !working
       ? {
           elapsedSeconds: Math.floor(elapsedMs / 1_000),
           bubbleLength: bubbleText.trim().length,
@@ -5214,6 +5220,10 @@ function turnHeartbeat(
  * from an earlier iteration as soon as its own stability window and backend
  * confirmation hold, so it always wins: ten unchanged observations cannot
  * accumulate while the completion path is returning.
+ *
+ * P-035 G3 r46 (2026-10-03). The fifth way out is off on a Deep Research turn
+ * (`control.deepResearch`); r37 and r38 keep their exits there, and the
+ * configured timeout bounds the research run.
  */
 export async function waitTurnComplete(
   page: Page,

@@ -778,4 +778,31 @@ describe("waitTurnComplete stalled reply", () => {
     expect(result.error).toBeInstanceOf(ReplyStalledError);
     expect((result.error as ReplyStalledError).streamBreaks).toBe(1);
   });
+
+  it("never stops a Deep Research turn on a frozen bubble, while a normal turn still does (r46)", async () => {
+    // P-035 G3 r46 (2026-10-03). Native Deep Research shows one short static
+    // bubble while it researches for 10 to 30 minutes without a Stop button.
+    const deepResearch = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 1,
+      bubbleText: () => "Frozen reply",
+      control: frozenControl({ deepResearch: true, cancelled: () => Date.now() >= 900_000 }),
+      captureFailure: true,
+    });
+    const normal = await runTurn({
+      timeoutMs: 1_200_000,
+      assistantCount: () => 1,
+      bubbleText: () => "Frozen reply",
+      control: frozenControl({ cancelled: () => Date.now() >= 900_000 }),
+      captureFailure: true,
+    });
+
+    expect(deepResearch.outcome).toBe("resolved");
+    expect(deepResearch.error).toBeUndefined();
+    // Fourteen unchanged observations, none counted toward rule 3.
+    expect(deepResearch.lines).toHaveLength(14);
+    for (const line of deepResearch.lines) expect(line).toContain("stall=0/10");
+    expect(normal.error).toBeInstanceOf(ReplyStalledError);
+    expect(normal.lines).toHaveLength(10);
+  });
 });
