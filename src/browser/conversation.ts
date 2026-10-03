@@ -47,6 +47,9 @@ function escapeRegExp(text: string): string {
  */
 export const COMPOSER_HYDRATION_TIMEOUT_MS = 28_000;
 
+/** The light-version notice leads a Deep Research reply; read no deeper. */
+const LIGHT_NOTICE_HEAD = 300;
+
 /**
  * Bounded wait for the composer to become visible.
  *
@@ -5023,9 +5026,14 @@ async function readTurnHeartbeat(
   const haystack = `${alertText}\n${bubbleText}`;
   const working = stop || streaming === "true";
   const limitMatch = matchTurnLimitAlert(alerts.texts);
-  // P-035 2026-10-03 G4-A. On a Deep Research turn the same alert and bubble
-  // text may carry the light-version notice: a quota fact, never a failure.
-  const lightNotice = deepResearch ? parseDeepResearchExhausted(haystack, new Date()) : null;
+  // P-035 2026-10-03 G4-A. On a Deep Research turn the alerts, or the opening
+  // of the reply, may carry the light-version notice: a quota fact, never a
+  // failure. Only the opening: a report that quotes the notice further down
+  // must not mark its own account exhausted.
+  // ponytail: a report whose first 300 chars quote the notice still misreads; anchor to the notice's own node if one shows live.
+  const lightNotice = deepResearch
+    ? parseDeepResearchExhausted(`${alertText}\n${bubbleText.slice(0, LIGHT_NOTICE_HEAD)}`, new Date())
+    : null;
   const noAssistantTurn = count <= priorAssistantCount && bubbleText.trim().length === 0 && !working;
   // Content-free: the visible alert count plus one shape per visible alert.
   const alertShapes = alerts.texts.map(alertShape).join(",");

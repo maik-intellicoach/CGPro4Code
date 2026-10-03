@@ -41,8 +41,8 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function turnPage(): Page {
-  const bubble = { getAttribute: async () => null, innerText: async () => REPLY };
+function turnPage(reply: string = REPLY): Page {
+  const bubble = { getAttribute: async () => null, innerText: async () => reply };
   const assistant = {
     count: async () => (Date.now() >= 30_000 ? 1 : 0),
     nth: () => bubble,
@@ -121,6 +121,23 @@ describe("the light-version notice on a Deep Research turn", () => {
       exhaustedUntil: expect.stringMatching(/^2027-04-17T00:00:00[+-]\d{2}:\d{2}$/),
       exhaustedObservedAt: expect.any(String),
     });
+  });
+
+  it("ignores the notice when a report quotes it further down", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 9, 3, 10, 20));
+    const lines: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((line: unknown) => { lines.push(String(line)); });
+
+    const startedAt = Date.now();
+    const report = `# Deep Research limits\n\n${"Background on quotas. ".repeat(20)}\nChatGPT then says: "${NOTICE}"`;
+    await expect(waitTurnComplete(turnPage(report), 1_200_000, 0, 100, {
+      deepResearch: true,
+      externalComplete: () => Date.now() - startedAt >= 130_000,
+      confirmComplete: async () => true,
+    })).resolves.toBeUndefined();
+
+    expect(lines.some((line) => line.includes("light-version notice"))).toBe(false);
   });
 
   it("is not read on an ordinary turn", async () => {
