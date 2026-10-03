@@ -505,17 +505,20 @@ describe("Projects directory draft admission", () => {
             src: "https://challenges.example.com/cdn-cgi/frame/abc?token=private#hash", "aria-hidden": "true",
             tabindex: "-1", id: `frame-${"i".repeat(60)}`, name: "n".repeat(50),
           },
-          rect: { width: 0.4, height: 64.6 }, style: { display: "none", visibility: "hidden" },
+          // G3-B (sixth run): 0.4 px wide but 65 px high and visible, so it is
+          // rendered and still refuses.
+          rect: { width: 0.4, height: 64.6 }, style: { display: "block", visibility: "visible" },
         },
         { tagName: "IFRAME", attributes: { src: "/relative/path?x=1" }, rect: { width: 300, height: 150 },
           style: { display: "block", visibility: "visible" } },
         { tagName: "EMBED", attributes: {}, rect: { width: 10, height: 10 }, style: { display: "inline", visibility: "visible" } },
-        { tagName: "OBJECT", attributes: { src: "https://fourth.example/x" } },
+        { tagName: "OBJECT", attributes: { src: "https://fourth.example/x" }, rect: { width: 20, height: 20 },
+          style: { display: "block", visibility: "visible" } },
       ]);
       expect(error).toMatchObject({ code: "preflight_draft_protected", reason: "directory_forbidden_node:embed" });
       expect(lines.filter(line => line.includes("directory embed shape"))).toEqual([
         "[cgpro:preflight] directory embed shape: index=1 count=4 tag=IFRAME "
-        + "src=https://challenges.example.com/cdn-cgi/frame/abc width=0 height=65 display=none visibility=hidden "
+        + "src=https://challenges.example.com/cdn-cgi/frame/abc width=0 height=65 display=block visibility=visible "
         + `aria_hidden="true" tabindex="-1" id="frame-${"i".repeat(34)}" name="${"n".repeat(40)}"`,
         "[cgpro:preflight] directory embed shape: index=2 count=4 tag=IFRAME "
         + "src=https://chatgpt.com/relative/path width=300 height=150 display=block visibility=visible "
@@ -534,6 +537,63 @@ describe("Projects directory draft admission", () => {
       expect(lines.filter(line => line.includes("directory embed shape"))).toEqual([
         "[cgpro:preflight] directory embed shape: index=1 count=1 tag=IFRAME src=none width=-1 height=-1 "
         + "display=unknown visibility=unknown aria_hidden=- tabindex=- id=- name=-",
+      ]);
+    });
+
+    // P-035 2026-10-03 G3-B (sixth run). Live ms1980 (built 2134f76): a clean
+    // /projects page refused on one 1x1, visibility-hidden IFRAME without a
+    // src. A frame that is not rendered is skipped; any other still refuses.
+    it("admits the evidence-1 frame: 1x1, visibility hidden, no src", async () => {
+      const { error, lines } = await embedLines([
+        { tagName: "IFRAME", attributes: {}, rect: { width: 1, height: 1 }, style: { display: "block", visibility: "hidden" } },
+      ]);
+      expect(error).toBeUndefined();
+      expect(lines.some(line => line.includes("directory embed shape"))).toBe(false);
+    });
+
+    it("admits a frame with display none", async () => {
+      const { error } = await embedLines([
+        { tagName: "IFRAME", attributes: { src: "https://frame.example/x" }, rect: { width: 300, height: 200 },
+          style: { display: "none", visibility: "visible" } },
+      ]);
+      expect(error).toBeUndefined();
+    });
+
+    it("admits a frame with visibility collapse", async () => {
+      const { error } = await embedLines([
+        { tagName: "OBJECT", attributes: {}, rect: { width: 300, height: 200 },
+          style: { display: "block", visibility: "collapse" } },
+      ]);
+      expect(error).toBeUndefined();
+    });
+
+    it("admits a 1x1 frame whose visibility is visible", async () => {
+      const { error } = await embedLines([
+        { tagName: "IFRAME", attributes: {}, rect: { width: 1, height: 1 }, style: { display: "block", visibility: "visible" } },
+      ]);
+      expect(error).toBeUndefined();
+    });
+
+    it("still refuses a visible 300x200 frame", async () => {
+      const { error, lines } = await embedLines([
+        { tagName: "IFRAME", attributes: {}, rect: { width: 300, height: 200 }, style: { display: "block", visibility: "visible" } },
+      ]);
+      expect(error).toMatchObject({ code: "preflight_draft_protected", reason: "directory_forbidden_node:embed" });
+      expect(lines.filter(line => line.includes("directory embed shape"))).toEqual([
+        "[cgpro:preflight] directory embed shape: index=1 count=1 tag=IFRAME src=none width=300 height=200 "
+        + "display=block visibility=visible aria_hidden=- tabindex=- id=- name=-",
+      ]);
+    });
+
+    it("refuses a visible frame beside a hidden one and lists only the visible one", async () => {
+      const { error, lines } = await embedLines([
+        { tagName: "IFRAME", attributes: {}, rect: { width: 1, height: 1 }, style: { display: "block", visibility: "hidden" } },
+        { tagName: "EMBED", attributes: {}, rect: { width: 300, height: 200 }, style: { display: "inline", visibility: "visible" } },
+      ]);
+      expect(error).toMatchObject({ reason: "directory_forbidden_node:embed" });
+      expect(lines.filter(line => line.includes("directory embed shape"))).toEqual([
+        "[cgpro:preflight] directory embed shape: index=1 count=1 tag=EMBED src=none width=300 height=200 "
+        + "display=inline visibility=visible aria_hidden=- tabindex=- id=- name=-",
       ]);
     });
 

@@ -2511,6 +2511,8 @@ interface TokenShape {
  * origin and pathname only (`none` without a `src`), the rounded client rect,
  * computed `display`/`visibility`, `aria-hidden`, `tabindex`, and `id`/`name`
  * capped at 40. `count` is how many elements matched in total.
+ * G3-B (sixth run): only frames that refused, so unrendered frames are neither
+ * listed nor counted.
  */
 interface EmbedShape {
   count: number;
@@ -2758,15 +2760,37 @@ export async function assertPreflightDraftSafe(
             id: capped(attribute("id")), name: capped(attribute("name")),
           };
         };
+        // P-035 2026-10-03 G3-B (sixth run). Live ms1980 (built 2134f76)
+        // refused at `project-label-click` on a clean /projects page:
+        //   [cgpro:preflight] draft guard refused: reason=directory_forbidden_node:embed
+        //   [cgpro:preflight] directory embed shape: index=1 count=1 tag=IFRAME src=none width=1 height=1 display=block visibility=hidden aria_hidden=- tabindex=- id=- name=-
+        // A frame that is not rendered cannot hold a draft. The `embed` group
+        // skips a frame whose computed `display` is `none`, or whose computed
+        // `visibility` is `hidden` or `collapse`, or whose client rect is at most
+        // 1 px wide AND at most 1 px high. A frame that cannot be read is not
+        // proven hidden and still refuses. Every other frame refuses exactly as
+        // before, and the shape lists only the frames that refused.
+        const unrenderedFrame = (element: Element): boolean => {
+          try {
+            const style = getComputedStyle(element);
+            if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") return true;
+          } catch { /* no computed style */ }
+          try {
+            const rect = element.getBoundingClientRect();
+            if (rect.width <= 1 && rect.height <= 1) return true;
+          } catch { /* not laid out or not a DOM element */ }
+          return false;
+        };
         for (const [code, forbidden] of directoryForbidden) {
-          const matches = document.querySelectorAll(forbidden);
+          const all = Array.from(document.querySelectorAll(forbidden));
+          const matches = code === "embed" ? all.filter(element => !unrenderedFrame(element)) : all;
           if (matches.length > 0) {
             const reason = `directory_forbidden_node:${code}`;
             if (code !== "embed") return reason;
             try {
               return {
                 reason,
-                embedShape: { count: matches.length, frames: Array.from(matches).slice(0, 3).map(embedFrame) },
+                embedShape: { count: matches.length, frames: matches.slice(0, 3).map(embedFrame) },
               };
             } catch { return reason; }
           }
