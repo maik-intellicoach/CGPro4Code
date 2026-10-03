@@ -1748,6 +1748,11 @@ export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
     await verifyMaximum();
     return true;
   }
+  // P-035 2026-10-03 G3-B. Live intelli: a failed Deep Research turn left the
+  // chip in the home composer and ChatGPT kept it across restarts. Turning the
+  // mode off is judged by the chip alone: no chip means nothing to undo, so
+  // neither the picker nor any row is touched.
+  if (!on && !alreadySelected) return false;
 
   await page.waitForTimeout(5_000);
   if (!(await openComposerToolsPopover(page))) {
@@ -1773,7 +1778,9 @@ export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
     return checked || pressed || state;
   };
 
-  if ((await selected(toggle)) === on) {
+  // Off is only reached with the chip present, and the chip is the truth: the
+  // picker row's ARIA state is not consulted, the same row is clicked again.
+  if (on && (await selected(toggle))) {
     await page.keyboard.press("Escape").catch(() => undefined);
     if (on) await verifyMaximum();
     return on;
@@ -1798,7 +1805,9 @@ export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
     if (!dispatched) {
       await recordConnectorDiagnostics(page);
       await page.keyboard.press("Escape").catch(() => undefined);
-      throw new Error("ChatGPT native Deep Research was visible but could not be selected");
+      throw new Error(on
+        ? "ChatGPT native Deep Research was visible but could not be selected"
+        : "ChatGPT native Deep Research could not be turned off");
     }
   }
 
@@ -1812,7 +1821,9 @@ export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
   if ((verified !== null) !== on) {
     const visible = await recordConnectorDiagnostics(page);
     const detail = visible.length > 0 ? `; visible entries=${JSON.stringify(visible)}` : "";
-    throw new Error(`ChatGPT native Deep Research selection did not become active${detail}`);
+    throw new Error(on
+      ? `ChatGPT native Deep Research selection did not become active${detail}`
+      : `ChatGPT native Deep Research could not be turned off${detail}`);
   }
   if (on) {
     await verifyMaximum();
@@ -2630,8 +2641,34 @@ export async function assertPreflightDraftSafe(
       const composer = composers[0];
       const form = composer.closest("form");
       if (!form || !composer.isConnected || composer.getClientRects().length === 0) return "composer_not_rendered";
+      // P-035 2026-10-03 G3-B. Live intelli: a failed Deep Research turn left the
+      // native "Deep research" chip in the home composer, ChatGPT kept it across
+      // restarts, and every preflight refused `form_media:img` on the chip's own
+      // icon. The automation's own chip is a non-editable atom inside the
+      // composer (outermost only) or a non-picker `button` in the form whose
+      // whitespace-collapsed text is EXACTLY one of the chip labels. Media inside
+      // such a chip, and the chip itself as a control, are chrome; its atom is
+      // removed from the clone and its label from the text below. Any other
+      // media, control or text refuses exactly as before.
+      const ownChipLabel = (element: Element): string | null => {
+        const label = norm(element.textContent ?? "");
+        return (chromeSelectors.deepResearchChipLabels as readonly string[]).includes(label) ? label : null;
+      };
+      // A root that cannot be queried (not a DOM element) holds no own chip.
+      const ownChipAtoms = (root: Element): HTMLElement[] =>
+        Array.from(root.querySelectorAll?.<HTMLElement>(chromeSelectors.deepResearchChipAtom) ?? []).filter(atom =>
+          !atom.parentElement?.closest('[contenteditable="false"]') && ownChipLabel(atom) !== null);
+      const ownChips: Element[] = [
+        ...ownChipAtoms(composer),
+        ...Array.from(form.querySelectorAll(chromeSelectors.deepResearchChipButton))
+          .filter(button => ownChipLabel(button) !== null),
+      ];
+      const inOwnChip = (node: Element): boolean => ownChips.some(chip => chip.contains(node));
       for (const [kind, mediaSelector] of mediaKinds) {
-        if (form.querySelector(mediaSelector)) return `form_media:${kind}`;
+        if (form.querySelector(mediaSelector)
+          && Array.from(form.querySelectorAll(mediaSelector)).some(media => !inOwnChip(media))) {
+          return `form_media:${kind}`;
+        }
       }
       // P-035 2026-09-27. On this account's UI variant the composer `+` carries
       // aria-label="Add files and more" and no composer-plus-btn testid, so an
@@ -2668,6 +2705,7 @@ export async function assertPreflightDraftSafe(
       }
       for (const control of Array.from(form.querySelectorAll('button, [role="button"]'))) {
         if (composer.contains(control) || control.closest('[role="menu"], [role="listbox"]')) continue;
+        if (inOwnChip(control)) continue;
         if (control.tagName === "BUTTON" && beaconBanners.some(banner => banner.contains(control))) continue;
         if (control.matches('button[data-testid="composer-plus-btn"], button[aria-label="Add files and more"], button[data-testid="send-button"], button[data-testid="composer-send-button"], button[aria-label="Select ChatGPT model"], button.__composer-pill[aria-haspopup="menu"], button[data-testid="model-switcher-dropdown-button"]')) continue;
         const id = identify(control);
@@ -2710,6 +2748,9 @@ export async function assertPreflightDraftSafe(
       }
       if (unknownControls.length > 0) return `unknown_control:${unknownControls.join("|")}`.slice(0, 200);
       const copy = composer.cloneNode(true) as HTMLElement;
+      // G3-B: the automation's own Deep Research atom is not a connector token
+      // and not draft content; drop it from the clone before tokens are counted.
+      for (const atom of ownChipAtoms(copy)) atom.remove();
       // P-035 2026-09-28 r14. Ownership is proven by the chip's TEXT, never its
       // tag: ms1980's owned chip is not an `A` while intelli's is, so the old
       // `tagName !== "A"` clause refused the very chip this call attached. The
@@ -2833,6 +2874,13 @@ export async function assertPreflightDraftSafe(
         }
       }
       let text = composer instanceof HTMLTextAreaElement ? composer.value : composer.innerText;
+      // G3-B: strip each own chip's label once per chip rendered in the
+      // composer, so the chip alone reads as an empty composer. Text beside it
+      // still decides admission exactly as before.
+      for (const chip of ownChips) {
+        const label = composer.contains(chip) ? ownChipLabel(chip) : null;
+        if (label !== null) text = text.replace(label, "");
+      }
       // The token branch above already proved exactly one outermost token
       // carrying the owned connector's own trimmed text; what remains decides
       // admission.

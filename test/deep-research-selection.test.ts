@@ -58,13 +58,14 @@ function scenario(options: {
       name === "aria-checked" && selected ? "true" : null),
     click: vi.fn(async () => {
       if (options.normalClickThrows) throw new Error("intercepted");
-      if (clickSticks) selected = true;
+      // G3-B: the row toggles, so clicking it again turns the mode off.
+      if (clickSticks) selected = !selected;
       popoverOpen = false;
     }),
     evaluate: vi.fn(async (callback: (element: HTMLElement) => boolean) => {
       const element = {
         closest: () => null,
-        click: () => { if (clickSticks) selected = true; popoverOpen = false; },
+        click: () => { if (clickSticks) selected = !selected; popoverOpen = false; },
       } as unknown as HTMLElement;
       return callback(element);
     }),
@@ -256,5 +257,60 @@ describe("native Deep Research selection", () => {
     const test = scenario({ initiallySelected: true, chipExposed: false, effortLabel: "High" });
     await expect(setDeepResearch(test.page, true)).rejects.toThrow(/composer shows "High"/);
     expect(test.toggle.click).not.toHaveBeenCalled();
+  });
+
+  // P-035 2026-10-03 G3-B. Live intelli: a failed Deep Research turn left the
+  // native chip in the home composer and every preflight refused on it.
+  describe("turning native Deep Research off", () => {
+    it("makes no click and opens no picker when no chip is present", async () => {
+      const test = scenario();
+
+      await expect(setDeepResearch(test.page, false)).resolves.toBe(false);
+
+      expect(test.plus.click).not.toHaveBeenCalled();
+      expect(test.toggle.click).not.toHaveBeenCalled();
+      expect(test.toggle.evaluate).not.toHaveBeenCalled();
+      expect(test.page.keyboard.press).not.toHaveBeenCalled();
+    });
+
+    it("clicks the same row to deselect an inherited chip and verifies it is gone", async () => {
+      const test = scenario({ initiallySelected: true });
+
+      await expect(setDeepResearch(test.page, false)).resolves.toBe(false);
+
+      expect(test.plus.click).toHaveBeenCalledTimes(1);
+      expect(test.toggle.click).toHaveBeenCalledTimes(1);
+      expect(test.page.keyboard.press).toHaveBeenCalledWith("Escape");
+      // The chip check ran again after the click and found nothing.
+      expect(firstResolved).toHaveBeenLastCalledWith(test.page, SELECTORS.deepResearchSelected);
+    });
+
+    it("ignores the row's ARIA state and still clicks while the chip shows", async () => {
+      // The picker row reports checked; the chip is the only authority.
+      const test = scenario({ initiallySelected: true });
+      await expect(setDeepResearch(test.page, false)).resolves.toBe(false);
+      expect(test.toggle.click).toHaveBeenCalledTimes(1);
+    });
+
+    it("deselects through the interactive-row fallback when the click is intercepted", async () => {
+      const test = scenario({ initiallySelected: true, normalClickThrows: true });
+
+      await expect(setDeepResearch(test.page, false)).resolves.toBe(false);
+
+      expect(test.toggle.evaluate).toHaveBeenCalledTimes(1);
+    });
+
+    it("throws when the chip is still there after the click", async () => {
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const test = scenario({ initiallySelected: true, clickSticks: false, pickerLabels: ["Deep research"] });
+
+        await expect(setDeepResearch(test.page, false)).rejects.toThrow(
+          'ChatGPT native Deep Research could not be turned off; visible entries=["Deep research"]',
+        );
+      } finally {
+        log.mockRestore();
+      }
+    });
   });
 });

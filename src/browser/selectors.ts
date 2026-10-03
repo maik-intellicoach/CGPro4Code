@@ -273,6 +273,16 @@ export const PREFLIGHT_CHROME = {
    * Work" banner ChatGPT shows above the composer after a Deep Research turn.
    */
   beaconBannerDismiss: 'button[aria-label="Dismiss ChatGPT beacon banner"]',
+  /**
+   * P-035 2026-10-03 G3-B. The native Deep Research chip the automation itself
+   * selects: a non-editable inline atom inside the composer, or a chip button in
+   * the form (never a picker row). Either one is the automation's own chip only
+   * when its whitespace-collapsed text is exactly one of
+   * `deepResearchChipLabels`.
+   */
+  deepResearchChipAtom: '[contenteditable="false"]',
+  deepResearchChipButton: 'button:not([data-list-navigation-item])',
+  deepResearchChipLabels: ["Deep research", "Recherche approfondie"],
 } as const;
 
 /**

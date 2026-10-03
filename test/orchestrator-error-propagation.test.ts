@@ -333,6 +333,104 @@ describe("runAskOnSession native Deep Research contract", () => {
   });
 });
 
+// P-035 2026-10-03 G3-B. Live intelli: a failed Deep Research turn left the
+// native chip in the home composer, ChatGPT kept it across restarts, and every
+// preflight refused on it.
+describe("runAskOnSession native Deep Research chip hygiene", () => {
+  const offCalls = () => setDeepResearch.mock.calls.filter(call => call[1] === false);
+
+  it("removes an inherited chip on an ordinary turn before web-search setup and submit", async () => {
+    waitTurnComplete.mockResolvedValueOnce(undefined);
+    const activeSession = session();
+    const runner = runAskOnSession({ prompt: "plain", web: true, timeoutSec: 1_200, headless: false }, activeSession);
+    await collect(runner.events);
+    await runner.result;
+    expect(setDeepResearch).toHaveBeenCalledTimes(1);
+    expect(setDeepResearch).toHaveBeenCalledWith(activeSession.page, false);
+    expect(setDeepResearch.mock.invocationCallOrder[0]).toBeLessThan(setWebSearch.mock.invocationCallOrder[0]);
+    expect(setDeepResearch.mock.invocationCallOrder[0]).toBeLessThan(sendPrompt.mock.invocationCallOrder[0]);
+  });
+
+  it("removes an inherited chip on a connector turn before the connector is selected", async () => {
+    waitTurnComplete.mockResolvedValueOnce(undefined);
+    const runner = runAskOnSession({ prompt: "plain", connector: "IntelliCoach Context", timeoutSec: 1_200, headless: false }, session());
+    await collect(runner.events);
+    await runner.result.catch(() => undefined);
+    expect(offCalls()).toHaveLength(1);
+    expect(setDeepResearch.mock.invocationCallOrder[0]).toBeLessThan(setConnector.mock.invocationCallOrder[0]);
+  });
+
+  it("fails an ordinary turn before submit when the inherited chip cannot be removed", async () => {
+    setDeepResearch.mockRejectedValueOnce(new Error("ChatGPT native Deep Research could not be turned off"));
+    const runner = runAskOnSession({ prompt: "plain", web: true, timeoutSec: 1_200, headless: false }, session());
+    await collect(runner.events);
+    await expect(runner.result).rejects.toThrow("could not be turned off");
+    expect(setWebSearch).not.toHaveBeenCalled();
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
+  it("clears its own chip when a Deep Research turn fails between selection and submit", async () => {
+    const original = new Error("native user nodes unavailable");
+    currentConversationId.mockReturnValue("native-conversation");
+    fetchNativeResearchUserNodes.mockRejectedValueOnce(original);
+    const activeSession = session();
+    const runner = runAskOnSession({ prompt: "research", deepResearch: true, timeoutSec: 1_200, headless: false }, activeSession);
+    await collect(runner.events);
+    await expect(runner.result).rejects.toBe(original);
+    expect(setDeepResearch.mock.calls.map(call => call[1])).toEqual([true, false]);
+    expect(setDeepResearch).toHaveBeenLastCalledWith(activeSession.page, false);
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
+  it("clears its own chip when selection itself fails after the chip appeared", async () => {
+    setDeepResearch.mockRejectedValueOnce(new Error("6 Pro thinking power did not reach its maximum"));
+    const runner = runAskOnSession({ prompt: "research", deepResearch: true, timeoutSec: 1_200, headless: false }, session());
+    await collect(runner.events);
+    await expect(runner.result).rejects.toThrow("did not reach its maximum");
+    expect(offCalls()).toHaveLength(1);
+  });
+
+  it("clears its own chip on a verify-callback failure and on a pre-submit refusal", async () => {
+    ensureProSixMaximum.mockRejectedValueOnce(new Error("6 Pro thinking power did not reach its maximum"));
+    const verify = runAskOnSession({ prompt: "research", deepResearch: true, timeoutSec: 1_200, headless: false }, session());
+    await collect(verify.events);
+    await expect(verify.result).rejects.toThrow("did not reach its maximum");
+    expect(offCalls()).toHaveLength(1);
+
+    setDeepResearch.mockClear();
+    const refusal = new PreSubmitInteractionError("pro_usage_limit_reached", "model_verification", "Pro limit");
+    sendPrompt.mockRejectedValueOnce(refusal);
+    const refused = runAskOnSession({ prompt: "research", deepResearch: true, timeoutSec: 1_200, headless: false }, session());
+    await collect(refused.events);
+    await expect(refused.result).rejects.toBe(refusal);
+    expect(offCalls()).toHaveLength(1);
+  });
+
+  it("keeps the original error when clearing the chip also fails", async () => {
+    const original = new Error("native user nodes unavailable");
+    currentConversationId.mockReturnValue("native-conversation");
+    fetchNativeResearchUserNodes.mockRejectedValueOnce(original);
+    setDeepResearch.mockResolvedValueOnce(true).mockRejectedValueOnce(new Error("could not be turned off"));
+    const runner = runAskOnSession({ prompt: "research", deepResearch: true, timeoutSec: 1_200, headless: false }, session());
+    await collect(runner.events);
+    await expect(runner.result).rejects.toBe(original);
+  });
+
+  it("leaves the chip alone once the prompt may have been submitted", async () => {
+    sendPrompt.mockRejectedValueOnce(new Error("send button vanished"));
+    const sendFailed = runAskOnSession({ prompt: "research", deepResearch: true, timeoutSec: 1_200, headless: false }, session());
+    await collect(sendFailed.events);
+    await expect(sendFailed.result).rejects.toThrow("send button vanished");
+    expect(offCalls()).toHaveLength(0);
+
+    waitTurnComplete.mockRejectedValueOnce(new Error("response failed"));
+    const afterSubmit = runAskOnSession({ prompt: "research", deepResearch: true, timeoutSec: 1_200, headless: false }, session());
+    await collect(afterSubmit.events);
+    await expect(afterSubmit.result).rejects.toThrow("response failed");
+    expect(offCalls()).toHaveLength(0);
+  });
+});
+
 describe("runAskOnSession connector contract", () => {
   it("records a connector-free submission before a later response failure", async () => {
     waitTurnComplete.mockRejectedValueOnce(new Error("response failed"));

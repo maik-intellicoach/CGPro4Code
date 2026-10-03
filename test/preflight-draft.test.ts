@@ -77,15 +77,32 @@ function fixture(initial: Partial<State> = {}) {
       const tokenRoots: TokenNode[] = state.tokenTree
         ?? tokenTexts.map(textContent => ({ tagName: "A", textContent }));
       const tokens: FixtureToken[] = [];
+      // P-035 2026-10-03 G3-B. Media the guard can find in the form: a chip's
+      // own icon (`icon` on a token or a chip button) and, with `attachment`,
+      // one foreign media node outside every chip.
+      const chipIcons: object[] = [];
+      // `contains` follows real `parentElement` links, the node itself included.
+      const containsVia = (self: unknown) => (node: unknown): boolean => {
+        for (let current = node as { parentElement?: unknown } | null; current;
+          current = (current.parentElement ?? null) as { parentElement?: unknown } | null) {
+          if (current === self) return true;
+        }
+        return false;
+      };
+      // Tokens the guard removed from its clone during THIS evaluation; the
+      // clone stops returning them (and their descendants) afterwards.
+      const removedNow = new Set<FixtureToken>();
       const buildToken = (node: TokenNode, parent: unknown): FixtureToken => {
         const element: FixtureToken = {
           tagName: node.tagName,
           textContent: node.textContent ?? "",
           parentElement: parent,
           closest: () => element,
-          remove: () => { removedTokens.push(element); },
+          contains: node => containsVia(element)(node),
+          remove: () => { removedTokens.push(element); removedNow.add(element); },
         };
         tokens.push(element);
+        if (node.icon) chipIcons.push({ tagName: "IMG", parentElement: element });
         for (const child of node.children ?? []) buildToken(child, element);
         return element;
       };
@@ -115,7 +132,8 @@ function fixture(initial: Partial<State> = {}) {
       };
       const richNodes = state.rich ?? (state.unknown ? [{ tagName: "CUSTOM-TOKEN", attributes: [] }] : []);
       const copy = { textContent: state.text, querySelectorAll: (selector: string) => selector === "*"
-        ? richNodes.map(node => materialize(node, copy)) : tokens };
+        ? richNodes.map(node => materialize(node, copy))
+        : tokens.filter(token => ![...removedNow].some(removed => removed.contains(token))) };
       // Form controls answer `matches` the way CSS attribute selectors would, so
       // the guard's real allowlist string decides admission, not the fixture.
       const controls = state.controls.length > 0
@@ -168,20 +186,37 @@ function fixture(initial: Partial<State> = {}) {
           : control.ariaLabel === "Dismiss ChatGPT beacon banner" && state.banners?.[control.banner]?.nested
             ? bannerFor(control.banner).inner : bannerFor(control.banner).card,
       }));
+      // G3-B: native Deep Research chip buttons in the form, outside the composer.
+      const chipButtons = (state.drButtons ?? []).map(entry => {
+        const button = {
+          tagName: "BUTTON", textContent: entry.text, parentElement: null,
+          closest: () => null, matches: () => false, getAttribute: () => null,
+          contains: (node: unknown) => containsVia(button)(node),
+        };
+        if (entry.icon) chipIcons.push({ tagName: "IMG", parentElement: button });
+        return button;
+      });
+      const foreignMedia = { tagName: "IMG", parentElement: null };
+      const mediaFor = (selector: string): object[] =>
+        [...(state.attachment ? [foreignMedia] : []), ...(selector === "img" ? chipIcons : [])];
       const form = {
         tagName: "FORM",
         getAttribute: () => null,
         hasAttribute: () => false,
-        querySelector: () => state.attachment ? {} : null,
+        querySelector: (selector: string) => mediaFor(selector)[0] ?? null,
         // The shape line bounds its ancestor scan to the form, so the walk must
         // see every synthetic foreign ancestor as inside it.
         contains: () => true,
         // The banner's X answers its own selector the way CSS would; every other
         // query still sees every control, exactly as before.
+        // G3-B: the chip-button selector sees the chip buttons, the control scan
+        // sees every control and chip button, and any other query is a media one.
         querySelectorAll: (selector: string) => selector === PREFLIGHT_CHROME.beaconBannerDismiss
           ? controlElements.filter(element => element.tagName === "BUTTON"
             && element.getAttribute("aria-label") === "Dismiss ChatGPT beacon banner")
-          : controlElements,
+          : selector === PREFLIGHT_CHROME.deepResearchChipButton ? [...controlElements, ...chipButtons]
+            : selector === 'button, [role="button"]' ? [...controlElements, ...chipButtons]
+              : mediaFor(selector),
       };
       // P-035 2026-09-28 r17. The foreign text node's parent chain, so the
       // content-free shape line can be proved: tag, role, nearest testid,
@@ -209,7 +244,9 @@ function fixture(initial: Partial<State> = {}) {
       }
       const composer = { isConnected: true, getClientRects: () => [{}],
         innerText: state.composerInnerText ?? (tokenTopTexts.join("") + state.text), cloneNode: () => copy,
-        closest: () => state.form ? form : null, contains: () => false,
+        closest: () => state.form ? form : null,
+        // G3-B: the composer contains its own tokens, as a real DOM would.
+        contains: (node: unknown) => tokens.includes(node as FixtureToken),
         // r18: the placeholder scan reads attributes on the composer itself and
         // on its descendants, and only ever compares their trimmed values.
         getAttribute: (name: string) => (state.composerAttributes ?? [])
@@ -268,6 +305,8 @@ interface TokenNode {
   tagName: string;
   textContent?: string;
   children?: TokenNode[];
+  /** G3-B: the token carries its own media icon (an `img` child). */
+  icon?: boolean;
 }
 /** The token shape the guard reads: tag, text, parentElement and closest/remove. */
 interface FixtureToken {
@@ -275,6 +314,7 @@ interface FixtureToken {
   textContent: string;
   parentElement: unknown;
   closest: () => FixtureToken;
+  contains: (node: unknown) => boolean;
   remove: () => void;
 }
 /** One synthetic ancestor of the foreign text node, nearest first. */
@@ -299,6 +339,8 @@ interface State {
    * G3-B: `nested` puts the dismiss X in a wrapper one level inside the card.
    */
   banners?: Record<string, { holdsComposer?: boolean; nested?: boolean }>;
+  /** G3-B: native Deep Research chip buttons in the form, outside the composer. */
+  drButtons?: Array<{ text: string; icon?: boolean }>;
   /** G3-B: text nodes directly inside a banner card, walked before `foreignText`. */
   bannerTexts?: Array<{ banner: string; text: string }>;
   /** Connector chips by tag and nesting; overrides the flat `mention(s)` shape. */
@@ -2751,5 +2793,70 @@ describe("ChatGPT Work beacon banner", () => {
       banners: { work: {} },
       controls: [{ ariaLabel: dismiss, banner: "work" }, { ariaLabel: "Try Work", tagName: "DIV", banner: "work" }],
     }).page)).toBe("unknown_control:Try Work");
+  });
+});
+
+// P-035 2026-10-03 G3-B. Live intelli: a failed Deep Research turn left the
+// native chip in the home composer and every preflight refused
+// `form_media:img` on the chip's own icon.
+describe("own native Deep Research chip", () => {
+  const reasonOf = async (page: Page, owned: Parameters<typeof assertPreflightDraftSafe>[1] = {}) =>
+    (await assertPreflightDraftSafe(page, owned).then(() => undefined).catch(caught => caught))?.reason;
+  const chip = (textContent = "Deep research") => ({ tagName: "SPAN", textContent, icon: true });
+  const homeControls = [{ ariaLabel: "Add files and more" }, { ariaLabel: "Send" }];
+
+  it("admits the lone chip with its icon as an atom in the composer", async () => {
+    const test = fixture({ tokenTree: [chip()], controls: homeControls });
+    await expect(assertPreflightDraftSafe(test.page)).resolves.toBeUndefined();
+    // The atom was dropped from the clone before tokens were counted.
+    expect(test.removedTokens.map(token => token.textContent)).toEqual(["Deep research"]);
+  });
+
+  it("admits the French label and whitespace-collapsed text, nothing looser", async () => {
+    await expect(assertPreflightDraftSafe(fixture({
+      tokenTree: [chip("Recherche approfondie")], composerInnerText: "Recherche approfondie",
+    }).page)).resolves.toBeUndefined();
+    await expect(assertPreflightDraftSafe(fixture({
+      tokenTree: [chip("  Deep \n research ")], composerInnerText: "Deep research",
+    }).page)).resolves.toBeUndefined();
+    expect(await reasonOf(fixture({ tokenTree: [chip("Deep research x")] }).page)).toBe("form_media:img");
+    expect(await reasonOf(fixture({ tokenTree: [chip("deep research")] }).page)).toBe("form_media:img");
+  });
+
+  it("admits the lone chip as a form button with its icon", async () => {
+    await expect(assertPreflightDraftSafe(fixture({
+      drButtons: [{ text: "Deep research", icon: true }], controls: homeControls,
+    }).page)).resolves.toBeUndefined();
+    // Any other button with an icon still refuses on its media.
+    expect(await reasonOf(fixture({ drButtons: [{ text: "Try Work", icon: true }] }).page))
+      .toBe("form_media:img");
+  });
+
+  it("still refuses the chip plus typed text", async () => {
+    expect(await reasonOf(fixture({ tokenTree: [chip()], text: "private draft" }).page))
+      .toBe("text_present");
+    // Typed text that the clone does not carry still shows in the rendered text.
+    expect(await reasonOf(fixture({
+      tokenTree: [chip()], composerInnerText: "Deep research private draft",
+    }).page)).toBe("text_present");
+  });
+
+  it("still refuses the chip plus a foreign img", async () => {
+    expect(await reasonOf(fixture({ tokenTree: [chip()], attachment: true }).page)).toBe("form_media:img");
+    expect(await reasonOf(fixture({ drButtons: [{ text: "Deep research", icon: true }], attachment: true }).page))
+      .toBe("form_media:img");
+  });
+
+  it("still refuses an unknown control beside the chip", async () => {
+    expect(await reasonOf(fixture({ tokenTree: [chip()], controls: [{ testid: "voice-mode-btn" }] }).page))
+      .toBe("unknown_control:voice-mode-btn");
+  });
+
+  it("keeps the owned connector token rule beside the chip", async () => {
+    const both = fixture({ tokenTree: [chip(), { tagName: "SPAN", textContent: "fixture" }] });
+    await expect(assertPreflightDraftSafe(both.page, { connector: "fixture" })).resolves.toBeUndefined();
+    expect(await reasonOf(
+      fixture({ tokenTree: [chip(), { tagName: "SPAN", textContent: "fixture" }] }).page,
+    )).toBe("connector_unowned");
   });
 });

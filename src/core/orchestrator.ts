@@ -301,6 +301,11 @@ function runAskInner(
   // refusal can prove the connector turn's own draft (token plus prompt) before
   // clearing it. Undefined on every turn without a connector.
   let ownedConnector: string | undefined;
+  // P-035 2026-10-03 G3-B. Set just before this turn selects native Deep
+  // Research and cleared once the prompt may have been submitted, so a turn
+  // that fails in between removes the chip it left instead of leaving it for
+  // every later preflight to refuse.
+  let nativeChipPreSubmit = false;
 
   const result: Promise<AskResult> = (async () => {
     if (!session) {
@@ -362,11 +367,20 @@ function runAskInner(
       if (opts.deepResearch) {
         await clearComposer(page);
         log("setDeepResearch true…");
+        nativeChipPreSubmit = true;
         await setDeepResearch(page, true);
         emitter.push({ type: "tool", name: "deep-research-selected" });
-      } else if (opts.web !== undefined) {
-        log(`setWebSearch ${opts.web}…`);
-        await setWebSearch(page, opts.web);
+      } else {
+        // P-035 2026-10-03 G3-B. Live intelli: ChatGPT keeps a native Deep
+        // Research chip in the home composer across restarts. An ordinary turn
+        // removes an inherited chip before any tool setup, and fails before
+        // submit if it cannot: it is never sent with the chip on.
+        log("setDeepResearch false…");
+        await setDeepResearch(page, false);
+        if (opts.web !== undefined) {
+          log(`setWebSearch ${opts.web}…`);
+          await setWebSearch(page, opts.web);
+        }
       }
 
       if (opts.connector !== undefined) {
@@ -391,21 +405,37 @@ function runAskInner(
       // rendered. Absent when the send was cancelled before the capture, which
       // leaves the not-rendered rule off for this turn.
       const submitCounts: { priorAnyMessages?: number } = {};
-      const priorBubbles = await sendPrompt(
-        page, opts.prompt, opts.connector !== undefined || opts.deepResearch === true, () => cancelled,
-        async () => {
-          if (opts.deepResearch) {
-            await requireSelector(page, SELECTORS_DUMP.deepResearchSelected, "native Deep Research before submission", 8_000);
-          }
-          if (modelSlug === "gpt-6-pro" || opts.deepResearch) {
-            const selection = await ensureProSixMaximum(page);
-            if (opts.deepResearch) nativeMaximumVerified = true;
-            emitter.push({ type: "tool", name: "model-thinking-verified", meta: selection });
-          }
-        },
-        ownedConnector,
-        submitCounts,
-      );
+      // G3-B: a failure inside the verify callback is still before submit.
+      let verifyFailed = false;
+      let priorBubbles: number;
+      try {
+        priorBubbles = await sendPrompt(
+          page, opts.prompt, opts.connector !== undefined || opts.deepResearch === true, () => cancelled,
+          async () => {
+            try {
+              if (opts.deepResearch) {
+                await requireSelector(page, SELECTORS_DUMP.deepResearchSelected, "native Deep Research before submission", 8_000);
+              }
+              if (modelSlug === "gpt-6-pro" || opts.deepResearch) {
+                const selection = await ensureProSixMaximum(page);
+                if (opts.deepResearch) nativeMaximumVerified = true;
+                emitter.push({ type: "tool", name: "model-thinking-verified", meta: selection });
+              }
+            } catch (error) {
+              verifyFailed = true;
+              throw error;
+            }
+          },
+          ownedConnector,
+          submitCounts,
+        );
+        nativeChipPreSubmit = false;
+      } catch (error) {
+        // Only a pre-submit refusal or a verify failure proves the prompt was
+        // not sent; any other error may follow the submit and keeps the chip.
+        if (!(error instanceof PreSubmitInteractionError) && !verifyFailed) nativeChipPreSubmit = false;
+        throw error;
+      }
       if (opts.deepResearch && !cancelled && !nativeMaximumVerified) {
         throw new Error("Native research maximum UI setting was not verified before submission");
       }
@@ -732,6 +762,12 @@ function runAskInner(
       if (filing) filing.preSubmitVerified = true;
       return { conversationId, finalText, events: collected, filing };
     } catch (err) {
+      if (nativeChipPreSubmit && session) {
+        // G3-B: this turn selected the chip but never submitted. Best effort
+        // only: the original error still propagates unchanged.
+        nativeChipPreSubmit = false;
+        await setDeepResearch(session.page, false).catch(() => false);
+      }
       if (err instanceof ConnectorEvidenceRateLimitError && session && !cancelled) {
         // Stop this page's exact turn without turning the failure into a
         // successful cancellation or disturbing another daemon slot.
