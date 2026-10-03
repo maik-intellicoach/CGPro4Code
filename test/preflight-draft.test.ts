@@ -97,17 +97,51 @@ function fixture(initial: Partial<State> = {}) {
       // Tokens the guard removed from its clone during THIS evaluation; the
       // clone stops returning them (and their descendants) afterwards.
       const removedNow = new Set<FixtureToken>();
+      // G3-B (fifth run): `pill` answers the Deep Research pill selector, and
+      // `selectionPill` (or `pill`) the bare `[data-inline-selection-pill]` one.
+      const answers = (entry: { pill?: boolean; selectionPill?: boolean }, selector: string): boolean =>
+        (!!entry.pill && selector === PREFLIGHT_CHROME.deepResearchChipPill)
+        || ((!!entry.pill || !!entry.selectionPill) && selector === "[data-inline-selection-pill]");
+      const attributesOf = (entry: { attributes?: Array<{ name: string; value?: string }> }) => ({
+        attributes: (entry.attributes ?? []).map(attribute => ({ name: attribute.name, value: attribute.value ?? "" })),
+        getAttribute: (name: string) => (entry.attributes ?? []).find(attribute => attribute.name === name)?.value ?? null,
+      });
+      // G3-B (fifth run): non-token wrappers around a root token, nearest first.
+      // They are inside the composer unless `outside`, are never
+      // `[contenteditable="false"]`, and walk `closest` up real parent links.
+      const wrapperElements: unknown[] = [];
+      const buildWrappers = (wrappers: TokenWrapper[]): unknown => {
+        let parent: unknown = null;
+        for (const wrapper of [...wrappers].reverse()) {
+          const element: Record<string, unknown> = {
+            tagName: wrapper.tagName,
+            parentElement: parent,
+            ...attributesOf(wrapper),
+            matches: (selector: string) => answers(wrapper, selector),
+            closest: (selector: string): unknown => answers(wrapper, selector) ? element
+              : (element.parentElement as { closest?: (s: string) => unknown } | null)?.closest?.(selector) ?? null,
+            contains: (node: unknown) => containsVia(element)(node),
+          };
+          if (!wrapper.outside) wrapperElements.push(element);
+          parent = element;
+        }
+        return parent;
+      };
       const buildToken = (node: TokenNode, parent: unknown): FixtureToken => {
         const element: FixtureToken = {
           tagName: node.tagName,
           textContent: node.textContent ?? "",
           parentElement: parent,
-          closest: () => element,
+          ...attributesOf(node),
+          // Every token is `[contenteditable="false"]`; any other selector walks
+          // up real parent links, the node itself included.
+          closest: (selector: string) => selector === '[contenteditable="false"]' || element.matches(selector) ? element
+            : (element.parentElement as { closest?: (s: string) => unknown } | null)?.closest?.(selector) ?? null,
           contains: node => containsVia(element)(node),
           remove: () => { removedTokens.push(element); removedNow.add(element); },
           // G3-B (fourth run): `pill` makes this node answer the pill selector,
           // and `querySelector` finds such a node below it.
-          matches: selector => !!node.pill && selector === PREFLIGHT_CHROME.deepResearchChipPill,
+          matches: selector => answers(node, selector),
           querySelector: selector => tokens.find(token => token !== element && element.contains(token)
             && token.matches(selector)) ?? null,
         };
@@ -116,7 +150,9 @@ function fixture(initial: Partial<State> = {}) {
         for (const child of node.children ?? []) buildToken(child, element);
         return element;
       };
-      for (const root of tokenRoots) buildToken(root, null);
+      for (const root of tokenRoots) buildToken(root, root.wrappers ? buildWrappers(root.wrappers) : null);
+      const inComposer = (node: unknown): boolean =>
+        tokens.includes(node as FixtureToken) || wrapperElements.includes(node);
       const tokenTopTexts = tokenRoots.map(node => node.textContent ?? "");
       // Synthetic rich nodes carry the real shape the guard reads: tagName,
       // an attributes list, own textContent, and element children. r31 adds a
@@ -141,7 +177,7 @@ function fixture(initial: Partial<State> = {}) {
         return element;
       };
       const richNodes = state.rich ?? (state.unknown ? [{ tagName: "CUSTOM-TOKEN", attributes: [] }] : []);
-      const copy = { textContent: state.text, querySelectorAll: (selector: string) => selector === "*"
+      const copy = { textContent: state.text, contains: inComposer, querySelectorAll: (selector: string) => selector === "*"
         ? richNodes.map(node => materialize(node, copy))
         : tokens.filter(token => ![...removedNow].some(removed => removed.contains(token))) };
       // Form controls answer `matches` the way CSS attribute selectors would, so
@@ -257,7 +293,7 @@ function fixture(initial: Partial<State> = {}) {
         innerText: state.composerInnerText ?? (tokenTopTexts.join("") + state.text), cloneNode: () => copy,
         closest: () => state.form ? form : null,
         // G3-B: the composer contains its own tokens, as a real DOM would.
-        contains: (node: unknown) => tokens.includes(node as FixtureToken),
+        contains: inComposer,
         // r18: the placeholder scan reads attributes on the composer itself and
         // on its descendants, and only ever compares their trimmed values.
         getAttribute: (name: string) => (state.composerAttributes ?? [])
@@ -320,13 +356,30 @@ interface TokenNode {
   icon?: boolean;
   /** G3-B (fourth run): the node carries the Deep Research pill data-id. */
   pill?: boolean;
+  /** G3-B (fifth run): the node carries a bare `data-inline-selection-pill`. */
+  selectionPill?: boolean;
+  /** G3-B (fifth run): attributes the token shape reads (names, and five values). */
+  attributes?: Array<{ name: string; value?: string }>;
+  /** G3-B (fifth run): non-token wrappers around a ROOT token, nearest first. */
+  wrappers?: TokenWrapper[];
+}
+/** G3-B (fifth run): one non-`[contenteditable="false"]` ancestor of a root token. */
+interface TokenWrapper {
+  tagName: string;
+  attributes?: Array<{ name: string; value?: string }>;
+  pill?: boolean;
+  selectionPill?: boolean;
+  /** Not inside the composer (the composer and its clone do not contain it). */
+  outside?: boolean;
 }
 /** The token shape the guard reads: tag, text, parentElement and closest/remove. */
 interface FixtureToken {
   tagName: string;
   textContent: string;
   parentElement: unknown;
-  closest: () => FixtureToken;
+  attributes: Array<{ name: string; value: string }>;
+  getAttribute: (name: string) => string | null;
+  closest: (selector: string) => unknown;
   contains: (node: unknown) => boolean;
   remove: () => void;
   matches: (selector: string) => boolean;
@@ -3003,5 +3056,124 @@ describe("own native Deep Research chip, pill form", () => {
     expect(await reasonOf(fixture({ tokenTree: [foreign] }).page)).toBe("connector_unowned");
     expect(await reasonOf(fixture({ tokenTree: [{ ...foreign, icon: true }] }).page, { connector: "fixture" }))
       .toBe("form_media:img");
+  });
+});
+
+// P-035 2026-10-03 G3-B (fifth run). Live intelli refused `connector_token_text`
+// at `home` on a composer showing only a `deep-research` token: the pill
+// selector matched neither the outermost atom nor anything inside it.
+describe("own Deep Research pill on an ancestor, and the token shape line", () => {
+  const reasonOf = async (page: Page, owned: Parameters<typeof assertPreflightDraftSafe>[1] = {}) =>
+    (await assertPreflightDraftSafe(page, owned).then(() => undefined).catch(caught => caught))?.reason;
+  const linesOf = async (page: Page, owned: Parameters<typeof assertPreflightDraftSafe>[1] = {}) => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = await assertPreflightDraftSafe(page, owned).catch(caught => caught);
+      return { error, lines: spy.mock.calls.map(call => String(call[0])) };
+    } finally {
+      spy.mockRestore();
+    }
+  };
+  const wrapped = (wrapper: TokenWrapper): TokenNode =>
+    ({ tagName: "SPAN", textContent: "deep-research", icon: true, wrappers: [wrapper] });
+
+  it("admits an atom whose wrapper carries the pill attributes as an own chip", async () => {
+    const test = fixture({ tokenTree: [wrapped({ tagName: "SPAN", pill: true })] });
+    await expect(assertPreflightDraftSafe(test.page)).resolves.toBeUndefined();
+    expect(test.removedTokens.map(token => token.textContent)).toEqual(["deep-research"]);
+    await expect(assertPreflightDraftSafe(fixture({
+      tokenTree: [{ ...wrapped({ tagName: "SPAN", pill: true }), wrappers: [{ tagName: "SPAN", pill: true }, { tagName: "P" }] }],
+    }).page, { connector: "fixture" })).resolves.toBeUndefined();
+    // Two levels up is still the nearest pill ancestor inside the composer.
+    await expect(assertPreflightDraftSafe(fixture({
+      tokenTree: [{ ...wrapped({ tagName: "SPAN" }), wrappers: [{ tagName: "SPAN" }, { tagName: "SPAN", pill: true }] }],
+    }).page, { connector: "fixture" })).resolves.toBeUndefined();
+  });
+
+  it("still refuses when the pill ancestor is outside the composer or absent", async () => {
+    expect(await reasonOf(fixture({ tokenTree: [wrapped({ tagName: "DIV", pill: true, outside: true })] }).page,
+      { connector: "fixture" })).toBe("form_media:img");
+    const plain: TokenNode = { tagName: "SPAN", textContent: "deep-research", wrappers: [{ tagName: "SPAN" }] };
+    expect(await reasonOf(fixture({ tokenTree: [plain] }).page, { connector: "fixture" })).toBe("connector_token_text");
+    expect(await reasonOf(fixture({
+      tokenTree: [{ ...plain, wrappers: [{ tagName: "DIV", pill: true, outside: true }] }],
+    }).page, { connector: "fixture" })).toBe("connector_token_text");
+    // A bare selection pill without the Deep Research data-id is not ours.
+    expect(await reasonOf(fixture({
+      tokenTree: [{ ...plain, wrappers: [{ tagName: "SPAN", selectionPill: true }] }],
+    }).page, { connector: "fixture" })).toBe("connector_token_text");
+  });
+
+  it("logs every token shape field on connector_token_text, without the token text", async () => {
+    const { error, lines } = await linesOf(fixture({
+      tokenTree: [{
+        tagName: "SPAN",
+        textContent: " zorble quux secret ",
+        attributes: [
+          { name: "contenteditable", value: "false" }, { name: "class", value: "chip x" },
+          { name: "data-id", value: "plugin:other" }, { name: "data-private", value: "zorblequux" },
+          { name: "aria-label", value: "a".repeat(100) },
+        ],
+        wrappers: [
+          { tagName: "SPAN", selectionPill: true, attributes: [{ name: "data-inline-selection-pill", value: "" },
+            { name: "data-type", value: "mention" }, { name: "role", value: "button" }] },
+          { tagName: "P", attributes: [{ name: "data-empty", value: "zorblequux" }] },
+          { tagName: "DIV", attributes: [{ name: "data-id", value: "beyond-grandparent" }] },
+        ],
+      }],
+    }).page, { connector: "fixture" });
+    expect(error.reason).toBe("connector_token_text");
+    const shape = lines.filter(line => line.startsWith("[cgpro:preflight] token shape: "));
+    expect(shape).toEqual([
+      "[cgpro:preflight] token shape: tag=SPAN attrs=contenteditable,class,data-id,data-private,aria-label "
+      + `data-id="plugin:other" data-type=- role=- aria-label="${"a".repeat(80)}" class="chip x" `
+      + "text_len=20 slug=no "
+      + "parent=[tag=SPAN attrs=data-inline-selection-pill,data-type,role data-id=- data-type=\"mention\" "
+      + "role=\"button\" aria-label=- class=-] "
+      + "grandparent=[tag=P attrs=data-empty data-id=- data-type=- role=- aria-label=- class=-] pill_ancestor=yes",
+    ]);
+    for (const line of lines) {
+      expect(line).not.toContain("zorble");
+      expect(line).not.toContain("secret");
+      expect(line).not.toContain("beyond-grandparent");
+    }
+    expect(lines).toContain("[cgpro:preflight] draft guard refused: reason=connector_token_text");
+  });
+
+  it("names the slug bit and stops at the composer", async () => {
+    const { error, lines } = await linesOf(fixture({ tokenTree: [{ tagName: "SPAN", textContent: " deep-research " }] }).page,
+      { connector: "fixture" });
+    expect(error.reason).toBe("connector_token_text");
+    expect(lines.filter(line => line.includes("token shape"))).toEqual([
+      "[cgpro:preflight] token shape: tag=SPAN attrs=- data-id=- data-type=- role=- aria-label=- class=- "
+      + "text_len=15 slug=yes parent=[-] grandparent=[-] pill_ancestor=no",
+    ]);
+  });
+
+  it("logs the first outermost token's shape on connector_unowned and connector_token_count", async () => {
+    const unowned = await linesOf(fixture({ tokenTree: [{ tagName: "A", textContent: "lane-x" }] }).page);
+    expect(unowned.error.reason).toBe("connector_unowned");
+    expect(unowned.lines.filter(line => line.includes("token shape"))).toEqual([
+      "[cgpro:preflight] token shape: tag=A attrs=- data-id=- data-type=- role=- aria-label=- class=- "
+      + "text_len=6 slug=yes parent=[-] grandparent=[-] pill_ancestor=no",
+    ]);
+    const count = await linesOf(fixture({
+      tokenTree: [{ tagName: "B", textContent: "Private Name" }, { tagName: "A", textContent: "lane-x" }],
+    }).page, { connector: "lane-x" });
+    expect(count.error.reason).toBe("connector_token_count:2");
+    expect(count.lines.filter(line => line.includes("token shape"))).toEqual([
+      "[cgpro:preflight] token shape: tag=B attrs=- data-id=- data-type=- role=- aria-label=- class=- "
+      + "text_len=12 slug=no parent=[-] grandparent=[-] pill_ancestor=no",
+    ]);
+    expect(count.lines.join("\n")).not.toContain("Private");
+  });
+
+  it("logs no token shape on an admitted or a non-token refusal", async () => {
+    const admitted = await linesOf(fixture({ mention: "lane-x" }).page, { connector: "lane-x" });
+    expect(admitted.error).toBeUndefined();
+    expect(admitted.lines.some(line => line.includes("token shape"))).toBe(false);
+    const text = await linesOf(fixture({ text: "private draft" }).page);
+    expect(text.error.reason).toBe("text_present");
+    expect(text.lines.some(line => line.includes("token shape"))).toBe(false);
   });
 });

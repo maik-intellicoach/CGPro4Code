@@ -456,6 +456,97 @@ describe("Projects directory draft admission", () => {
       .rejects.toMatchObject({ reason: "directory_forbidden_node:aria_remove" });
   });
 
+  // P-035 2026-10-03 G3-B (fifth run). Live ms1980 refused
+  // `directory_forbidden_node:embed` on a clean /projects page. The refusal is
+  // unchanged; it also logs one content-free line per frame, at most 3.
+  describe("directory embed shape", () => {
+    interface Frame {
+      tagName: string; attributes?: Record<string, string>; rect?: { width: number; height: number };
+      style?: { display: string; visibility: string };
+    }
+    const embedLines = async (frames: Frame[], others: string[] = []) => {
+      const { page } = pageFor(undefined, { matches: 1, startUrl: "https://chatgpt.com/projects" });
+      const elements = frames.map(frame => frame.attributes || frame.rect || frame.style ? {
+        tagName: frame.tagName,
+        getAttribute: (name: string) => frame.attributes?.[name] ?? null,
+        getBoundingClientRect: () => frame.rect ?? { width: 0, height: 0 },
+        style: frame.style,
+      } : { tagName: frame.tagName });
+      page.evaluate = vi.fn(async (fn: Function, arg: any) => runInNewContext(`(${fn.toString()})(arg)`, {
+        arg,
+        document: {
+          querySelectorAll: (selector: string) => selector === "iframe, object, embed" ? elements
+            : others.includes(selector) ? [{ tagName: "DIV" }] : [],
+          createTreeWalker: () => ({ nextNode: () => false }),
+        },
+        getComputedStyle: (element: { style?: { display: string; visibility: string } }) => {
+          if (!element.style) throw new Error("no style");
+          return element.style;
+        },
+        // A browser page has `URL`; the bare VM context does not.
+        URL,
+        location: new URL(page.url()), HTMLTextAreaElement: class {}, NodeFilter: { SHOW_TEXT: 4 },
+      })) as typeof page.evaluate;
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const error = await assertPreflightDraftSafe(page, { directory: true, sourceProvenEmpty: true })
+          .catch(caught => caught);
+        return { error, lines: spy.mock.calls.map(call => String(call[0])) };
+      } finally {
+        spy.mockRestore();
+      }
+    };
+
+    it("logs every field of up to 3 frames and keeps the refusal exactly as is", async () => {
+      const { error, lines } = await embedLines([
+        {
+          tagName: "IFRAME",
+          attributes: {
+            src: "https://challenges.example.com/cdn-cgi/frame/abc?token=private#hash", "aria-hidden": "true",
+            tabindex: "-1", id: `frame-${"i".repeat(60)}`, name: "n".repeat(50),
+          },
+          rect: { width: 0.4, height: 64.6 }, style: { display: "none", visibility: "hidden" },
+        },
+        { tagName: "IFRAME", attributes: { src: "/relative/path?x=1" }, rect: { width: 300, height: 150 },
+          style: { display: "block", visibility: "visible" } },
+        { tagName: "EMBED", attributes: {}, rect: { width: 10, height: 10 }, style: { display: "inline", visibility: "visible" } },
+        { tagName: "OBJECT", attributes: { src: "https://fourth.example/x" } },
+      ]);
+      expect(error).toMatchObject({ code: "preflight_draft_protected", reason: "directory_forbidden_node:embed" });
+      expect(lines.filter(line => line.includes("directory embed shape"))).toEqual([
+        "[cgpro:preflight] directory embed shape: index=1 count=4 tag=IFRAME "
+        + "src=https://challenges.example.com/cdn-cgi/frame/abc width=0 height=65 display=none visibility=hidden "
+        + `aria_hidden="true" tabindex="-1" id="frame-${"i".repeat(34)}" name="${"n".repeat(40)}"`,
+        "[cgpro:preflight] directory embed shape: index=2 count=4 tag=IFRAME "
+        + "src=https://chatgpt.com/relative/path width=300 height=150 display=block visibility=visible "
+        + "aria_hidden=- tabindex=- id=- name=-",
+        "[cgpro:preflight] directory embed shape: index=3 count=4 tag=EMBED "
+        + "src=none width=10 height=10 display=inline visibility=visible aria_hidden=- tabindex=- id=- name=-",
+      ]);
+      expect(lines.join("\n")).not.toContain("token=private");
+      expect(lines.join("\n")).not.toContain("fourth.example");
+      expect(lines).toContain("[cgpro:preflight] draft guard refused: reason=directory_forbidden_node:embed");
+    });
+
+    it("reads an unreadable frame as unknown, never a different refusal", async () => {
+      const { error, lines } = await embedLines([{ tagName: "IFRAME" }]);
+      expect(error).toMatchObject({ reason: "directory_forbidden_node:embed" });
+      expect(lines.filter(line => line.includes("directory embed shape"))).toEqual([
+        "[cgpro:preflight] directory embed shape: index=1 count=1 tag=IFRAME src=none width=-1 height=-1 "
+        + "display=unknown visibility=unknown aria_hidden=- tabindex=- id=- name=-",
+      ]);
+    });
+
+    it("logs no embed shape for an earlier group or without a frame", async () => {
+      const earlier = await embedLines([{ tagName: "IFRAME" }], ['[aria-label*="remove" i]']);
+      expect(earlier.error).toMatchObject({ reason: "directory_forbidden_node:aria_remove" });
+      expect(earlier.lines.some(line => line.includes("directory embed shape"))).toBe(false);
+      const clean = await embedLines([]);
+      expect(clean.error).toBeUndefined();
+      expect(clean.lines.some(line => line.includes("directory embed shape"))).toBe(false);
+    });
+  });
+
   it("admits the integrated home -> directory -> project-composer path", async () => {
     const { page, rowClick } = pageFor();
     installAdmissionDom(page);

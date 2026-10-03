@@ -2472,26 +2472,93 @@ interface RichAttrShape {
   depth: number;
 }
 
+/**
+ * P-035 2026-10-03 G3-B (fifth run). One element of a token's shape: its
+ * sanitised tag, its attribute NAMES, and the values of only the attributes in
+ * `TOKEN_SHAPE_VALUES`, each capped at 80 characters (`null` when absent).
+ */
+interface TokenNodeShape {
+  tag: string;
+  attrs: string[];
+  values: Record<string, string | null>;
+}
+
+/** The only attributes whose values a token shape may carry. */
+const TOKEN_SHAPE_VALUES = ["data-id", "data-type", "role", "aria-label", "class"] as const;
+
+/**
+ * P-035 2026-10-03 G3-B (fifth run). Live intelli refused `connector_token_text`
+ * on a composer showing only a `deep-research` token, and the pill selector did
+ * not match the outermost atom. The shape of the FIRST outermost token says
+ * where the pill attributes really are: the token, its parent and grandparent
+ * (stopping at the composer, `null` past it), its text length and whether its
+ * whitespace-collapsed text is a slug, and whether any ancestor inside the form
+ * carries `[data-inline-selection-pill]`. Never the token's text.
+ */
+interface TokenShape {
+  node: TokenNodeShape;
+  textLen: number;
+  slug: boolean;
+  parent: TokenNodeShape | null;
+  grandparent: TokenNodeShape | null;
+  pillAncestor: boolean;
+}
+
+/**
+ * P-035 2026-10-03 G3-B (fifth run). Live ms1980 refused
+ * `directory_forbidden_node:embed` on a clean /projects page. One entry per
+ * matching `iframe`/`object`/`embed`, up to 3: the sanitised tag, the `src`
+ * origin and pathname only (`none` without a `src`), the rounded client rect,
+ * computed `display`/`visibility`, `aria-hidden`, `tabindex`, and `id`/`name`
+ * capped at 40. `count` is how many elements matched in total.
+ */
+interface EmbedShape {
+  count: number;
+  frames: Array<{
+    tag: string; src: string; width: number; height: number; display: string; visibility: string;
+    ariaHidden: string | null; tabindex: string | null; id: string | null; name: string | null;
+  }>;
+}
+
 /** The content-free diagnostics a single refusal may carry beside its reason. */
 type PreflightDiagnostic =
   | {
     reason: string; chipRemainder: { len: number; ws: number; cf: number; other: number };
     foreignShape?: undefined; ownedTextShape?: undefined; provenanceShape?: undefined;
-    richAttrShape?: undefined; noTokenShape?: undefined;
+    richAttrShape?: undefined; noTokenShape?: undefined; tokenShape?: undefined; embedShape?: undefined;
   }
   | { reason: string; foreignShape: ForeignTextShape; chipRemainder?: undefined; ownedTextShape?: undefined;
-    provenanceShape?: undefined; richAttrShape?: undefined; noTokenShape?: undefined }
+    provenanceShape?: undefined; richAttrShape?: undefined; noTokenShape?: undefined; tokenShape?: undefined;
+    embedShape?: undefined }
   | { reason: string; ownedTextShape: OwnedTextShape; chipRemainder?: undefined; foreignShape?: undefined;
-    provenanceShape?: undefined; richAttrShape?: undefined; noTokenShape?: undefined }
+    provenanceShape?: undefined; richAttrShape?: undefined; noTokenShape?: undefined; tokenShape?: undefined;
+    embedShape?: undefined }
   | { reason: string; provenanceShape: ProvenanceShape; chipRemainder?: undefined; foreignShape?: undefined;
-    ownedTextShape?: undefined; richAttrShape?: undefined; noTokenShape?: undefined }
+    ownedTextShape?: undefined; richAttrShape?: undefined; noTokenShape?: undefined; tokenShape?: undefined;
+    embedShape?: undefined }
   | { reason: string; richAttrShape: RichAttrShape; chipRemainder?: undefined; foreignShape?: undefined;
-    ownedTextShape?: undefined; provenanceShape?: undefined; noTokenShape?: undefined }
+    ownedTextShape?: undefined; provenanceShape?: undefined; noTokenShape?: undefined; tokenShape?: undefined;
+    embedShape?: undefined }
   | {
     reason: string; noTokenShape: { len: number; ws: number; cf: number; at: number; other: number };
     chipRemainder?: undefined; foreignShape?: undefined; ownedTextShape?: undefined;
-    provenanceShape?: undefined; richAttrShape?: undefined;
-  };
+    provenanceShape?: undefined; richAttrShape?: undefined; tokenShape?: undefined; embedShape?: undefined;
+  }
+  | { reason: string; tokenShape: TokenShape; chipRemainder?: undefined; foreignShape?: undefined;
+    ownedTextShape?: undefined; provenanceShape?: undefined; richAttrShape?: undefined; noTokenShape?: undefined;
+    embedShape?: undefined }
+  | { reason: string; embedShape: EmbedShape; chipRemainder?: undefined; foreignShape?: undefined;
+    ownedTextShape?: undefined; provenanceShape?: undefined; richAttrShape?: undefined; noTokenShape?: undefined;
+    tokenShape?: undefined };
+
+/** One token-shape element as `tag=<t> attrs=<a,b> data-id="<v>" ...`; `-` for none. */
+function formatTokenNode(shape: TokenNodeShape | null): string {
+  if (!shape) return "-";
+  const values = TOKEN_SHAPE_VALUES
+    .map(name => `${name}=${shape.values[name] === null || shape.values[name] === undefined
+      ? "-" : JSON.stringify(shape.values[name])}`);
+  return [`tag=${shape.tag}`, `attrs=${shape.attrs.join(",") || "-"}`, ...values].join(" ");
+}
 
 /**
  * Read-only, content-free admission for the no-submit preflight. Unknown rich
@@ -2516,7 +2583,9 @@ export async function assertPreflightDraftSafe(
   let safe = false;
   let reason: string | null = null;
   try {
-    const outcome = await page.evaluate(({ selector, chromeSelectors, owned }): true | string | PreflightDiagnostic => {
+    const outcome = await page.evaluate(({
+      selector, chromeSelectors, owned, tokenShapeValues,
+    }): true | string | PreflightDiagnostic => {
       // P-035 2026-09-27. The guard still answers a single bit: `true` admits,
       // a string is the FIRST check that refused, named by a closed, content-free
       // reason code. The branch order and every condition are exactly as before,
@@ -2651,8 +2720,56 @@ export async function assertPreflightDraftSafe(
           ["canvas", "canvas"],
           ["media", "video, audio"],
         ];
+        // P-035 2026-10-03 G3-B (fifth run). The `embed` refusal also carries
+        // the content-free shape of up to 3 matching frames, so one live round
+        // says whether they are visible and where they load from. The reason
+        // is exactly as before. Each read is guarded: an unreadable property
+        // reads `unknown`, never a different refusal.
+        const embedFrame = (element: Element): EmbedShape["frames"][number] => {
+          const attribute = (name: string): string | null => {
+            try { return element.getAttribute?.(name) ?? null; } catch { return null; }
+          };
+          let src = "none";
+          const rawSrc = attribute("src");
+          if (rawSrc !== null) {
+            try {
+              const url = new URL(rawSrc, location.href);
+              src = `${url.origin}${url.pathname}`.slice(0, 200);
+            } catch { src = "invalid"; }
+          }
+          let width = -1;
+          let height = -1;
+          try {
+            const rect = element.getBoundingClientRect();
+            width = Math.round(rect.width);
+            height = Math.round(rect.height);
+          } catch { /* not laid out or not a DOM element */ }
+          let display = "unknown";
+          let visibility = "unknown";
+          try {
+            const style = getComputedStyle(element);
+            display = chrome(style.display) || "-";
+            visibility = chrome(style.visibility) || "-";
+          } catch { /* no computed style */ }
+          const capped = (value: string | null): string | null => value === null ? null : value.slice(0, 40);
+          return {
+            tag: chrome(element.tagName ?? "") || "unknown", src, width, height, display, visibility,
+            ariaHidden: capped(attribute("aria-hidden")), tabindex: capped(attribute("tabindex")),
+            id: capped(attribute("id")), name: capped(attribute("name")),
+          };
+        };
         for (const [code, forbidden] of directoryForbidden) {
-          if (document.querySelectorAll(forbidden).length > 0) return `directory_forbidden_node:${code}`;
+          const matches = document.querySelectorAll(forbidden);
+          if (matches.length > 0) {
+            const reason = `directory_forbidden_node:${code}`;
+            if (code !== "embed") return reason;
+            try {
+              return {
+                reason,
+                embedShape: { count: matches.length, frames: Array.from(matches).slice(0, 3).map(embedFrame) },
+              };
+            } catch { return reason; }
+          }
         }
         for (const field of Array.from(document.querySelectorAll<HTMLInputElement>(
           'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])' +
@@ -2687,19 +2804,28 @@ export async function assertPreflightDraftSafe(
         const label = norm(element.textContent ?? "");
         return (chromeSelectors.deepResearchChipLabels as readonly string[]).includes(label) ? label : null;
       };
-      const ownChipPill = (element: Element): boolean => {
+      //
+      // P-035 2026-10-03 G3-B (fifth run). Live intelli still refused
+      // `connector_token_text` at `home`: the outermost atom neither matched nor
+      // contained the pill selector, so the pill attributes may sit on an
+      // ANCESTOR of the atom. An element whose nearest pill ancestor is strictly
+      // inside `scope` (the composer, or its clone) is an own chip too; a pill
+      // ancestor that is the scope itself or outside it never counts.
+      const ownChipPill = (element: Element, scope: Element): boolean => {
         try {
-          return !!(element.matches?.(chromeSelectors.deepResearchChipPill)
-            || element.querySelector?.(chromeSelectors.deepResearchChipPill));
+          if (element.matches?.(chromeSelectors.deepResearchChipPill)
+            || element.querySelector?.(chromeSelectors.deepResearchChipPill)) return true;
+          const holder = element.parentElement?.closest?.(chromeSelectors.deepResearchChipPill) ?? null;
+          return !!holder && holder !== scope && !!scope.contains?.(holder);
         } catch { return false; }
       };
       /** The text an own chip renders (its label, or a pill's own text), else null. */
-      const ownChipText = (element: Element): string | null =>
-        ownChipLabel(element) ?? (ownChipPill(element) ? norm(element.textContent ?? "") : null);
+      const ownChipText = (element: Element, scope: Element = composer): string | null =>
+        ownChipLabel(element) ?? (ownChipPill(element, scope) ? norm(element.textContent ?? "") : null);
       // A root that cannot be queried (not a DOM element) holds no own chip.
       const ownChipAtoms = (root: Element): HTMLElement[] =>
         Array.from(root.querySelectorAll?.<HTMLElement>(chromeSelectors.deepResearchChipAtom) ?? []).filter(atom =>
-          !atom.parentElement?.closest('[contenteditable="false"]') && ownChipText(atom) !== null);
+          !atom.parentElement?.closest('[contenteditable="false"]') && ownChipText(atom, root) !== null);
       const ownChips: Element[] = [
         ...ownChipAtoms(composer),
         ...Array.from(form.querySelectorAll(chromeSelectors.deepResearchChipButton))
@@ -2811,11 +2937,57 @@ export async function assertPreflightDraftSafe(
       const tokens = allTokens.filter(
         token => !token.parentElement?.closest('[contenteditable="false"]'),
       );
+      // P-035 2026-10-03 G3-B (fifth run). Content-free shape of the FIRST
+      // outermost token for the three token refusals. Read on the ORIGINAL
+      // composer (own chip atoms excluded, as in the clone) so the ancestor
+      // walk can reach the form; the clone's token is the fallback. Tags,
+      // attribute names, five capped attribute values, one length and one
+      // slug bit: never the token's text.
+      const tokenNode = (element: Element): TokenNodeShape => {
+        const values: Record<string, string | null> = {};
+        for (const name of tokenShapeValues) {
+          let value: string | null = null;
+          try { value = element.getAttribute?.(name) ?? null; } catch { value = null; }
+          values[name] = value === null ? null : value.slice(0, 80);
+        }
+        let attrs: string[] = [];
+        try {
+          attrs = Array.from(element.attributes ?? []).map(attribute => chrome(attribute.name) || "unknown").slice(0, 20);
+        } catch { attrs = []; }
+        return { tag: chrome(element.tagName ?? "") || "unknown", attrs, values };
+      };
+      const tokenShape = (fallback: HTMLElement): TokenShape => {
+        const originalFirst = Array.from(composer.querySelectorAll<HTMLElement>('[contenteditable="false"]'))
+          .filter(token => !token.parentElement?.closest('[contenteditable="false"]') && !ownChips.includes(token))[0];
+        const token = originalFirst ?? fallback;
+        const root = originalFirst ? composer : copy;
+        const text = token.textContent ?? "";
+        const parent = token.parentElement && token.parentElement !== root ? token.parentElement : null;
+        const grandparent = parent?.parentElement && parent.parentElement !== root ? parent.parentElement : null;
+        // Ancestors strictly inside the form; the clone's walk ends at its root.
+        let pillAncestor = false;
+        for (let element = token.parentElement; element && element !== form && !pillAncestor;
+          element = element === copy ? null : element.parentElement) {
+          try { pillAncestor = !!element.matches?.("[data-inline-selection-pill]"); } catch { /* unqueryable */ }
+        }
+        return {
+          node: tokenNode(token),
+          textLen: text.length,
+          slug: /^[a-z0-9-]+$/.test(norm(text)),
+          parent: parent ? tokenNode(parent) : null,
+          grandparent: grandparent ? tokenNode(grandparent) : null,
+          pillAncestor,
+        };
+      };
+      // The diagnostic never changes the refusal: an unreadable shape returns the bare reason.
+      const withTokenShape = (reason: string): string | PreflightDiagnostic => {
+        try { return { reason, tokenShape: tokenShape(tokens[0]) }; } catch { return reason; }
+      };
       let ownedToken: HTMLElement | undefined;
       if (tokens.length) {
-        if (!owned.connector) return "connector_unowned";
-        if (tokens.length !== 1) return `connector_token_count:${tokens.length}`;
-        if (tokens[0].textContent?.trim() !== owned.connector) return "connector_token_text";
+        if (!owned.connector) return withTokenShape("connector_unowned");
+        if (tokens.length !== 1) return withTokenShape(`connector_token_count:${tokens.length}`);
+        if (tokens[0].textContent?.trim() !== owned.connector) return withTokenShape("connector_token_text");
         ownedToken = tokens[0];
         // Remove exactly the outermost element, with its nested content, so the
         // rich-node and text checks below judge only what remains.
@@ -3344,7 +3516,10 @@ export async function assertPreflightDraftSafe(
         return { reason: "foreign_text", foreignShape: foreignShape(node) };
       }
       return true;
-    }, { selector: joinSelectors(SELECTORS.composer), chromeSelectors: PREFLIGHT_CHROME, owned });
+    }, {
+      selector: joinSelectors(SELECTORS.composer), chromeSelectors: PREFLIGHT_CHROME, owned,
+      tokenShapeValues: TOKEN_SHAPE_VALUES,
+    });
     if (outcome === true) safe = true;
     else if (typeof outcome === "string") reason = outcome;
     else if (typeof outcome === "object" && "reason" in outcome) {
@@ -3364,6 +3539,32 @@ export async function assertPreflightDraftSafe(
       if (outcome.noTokenShape) {
         const { len, ws, cf, at, other } = outcome.noTokenShape;
         console.error(`[cgpro:preflight] no-token text shape: len=${len} ws=${ws} cf=${cf} at=${at} other=${other}`);
+      }
+      // P-035 2026-10-03 G3-B (fifth run). Exactly one content-free shape line
+      // for the token refusals (`connector_token_text`, `connector_unowned`,
+      // `connector_token_count:*`): where the pill attributes sit on or above
+      // the first outermost token. Never the token's text.
+      if (outcome.tokenShape) {
+        const { node, textLen, slug, parent, grandparent, pillAncestor } = outcome.tokenShape;
+        console.error(
+          `[cgpro:preflight] token shape: ${formatTokenNode(node)} text_len=${textLen} slug=${slug ? "yes" : "no"} `
+          + `parent=[${formatTokenNode(parent)}] grandparent=[${formatTokenNode(grandparent)}] `
+          + `pill_ancestor=${pillAncestor ? "yes" : "no"}`,
+        );
+      }
+      // P-035 2026-10-03 G3-B (fifth run). One content-free line per matching
+      // frame (at most 3) for `directory_forbidden_node:embed`.
+      if (outcome.embedShape) {
+        const { count, frames } = outcome.embedShape;
+        const quoted = (value: string | null): string => value === null ? "-" : JSON.stringify(value);
+        frames.forEach((frame, index) => {
+          console.error(
+            `[cgpro:preflight] directory embed shape: index=${index + 1} count=${count} tag=${frame.tag} `
+            + `src=${frame.src} width=${frame.width} height=${frame.height} display=${frame.display} `
+            + `visibility=${frame.visibility} aria_hidden=${quoted(frame.ariaHidden)} `
+            + `tabindex=${quoted(frame.tabindex)} id=${quoted(frame.id)} name=${quoted(frame.name)}`,
+          );
+        });
       }
       // P-035 2026-09-28 r17. Exactly one content-free shape line for the
       // foreign-text refusal, so the next live round names the node class. It
