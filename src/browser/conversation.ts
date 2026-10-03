@@ -33,8 +33,18 @@ function escapeRegExp(text: string): string {
 /**
  * P-035 2026-09-27 r11. Bound on the composer hydration wait that sits between
  * a home navigation and the protected-draft guard that judges its surface.
+ *
+ * P-035 2026-10-03 G3. Raised from 20 s. Live ms1980 refused
+ * `composer_count:0` 12 times under heavy workstation load (cold lane starts
+ * 95-130 s), once with `timeline=slot-page:0+982,home:982+0`: the home page was
+ * still loading when the guard judged it. The brief asked for 60 s, but one
+ * ordinary preflight can issue five of these waits (first guard, home, the
+ * Project flow's home and chat-surface waits in `openConversation`, and
+ * cleanup-home), and all five must fit inside the daemon's 140 s preflight
+ * deadline (`PREFLIGHT_TIMEOUT_MS`, src/daemon/server.ts), so 5 x 28 s = 140 s
+ * is the largest bound that does.
  */
-export const COMPOSER_HYDRATION_TIMEOUT_MS = 20_000;
+export const COMPOSER_HYDRATION_TIMEOUT_MS = 28_000;
 
 /**
  * Bounded wait for the composer to become visible.

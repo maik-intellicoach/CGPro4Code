@@ -500,7 +500,7 @@ describe("Project-flow composer hydration wait", () => {
     // read the composer the wait had just brought in.
     const home = events.indexOf("goHome");
     expect(events.slice(home, home + 3)).toEqual(["goHome", "composer-wait", "guard:composer"]);
-    expect(waitOptions[0]).toEqual({ state: "visible", timeout: 20_000 });
+    expect(waitOptions[0]).toEqual({ state: "visible", timeout: 28_000 });
     expect(onPhase.mock.calls.map(([phase]) => phase)).toContain("project-chat-surface");
     // Past the surface: the Project flow ran to its destination row.
     expect(rowClick).toHaveBeenCalledTimes(1);
@@ -514,7 +514,7 @@ describe("Project-flow composer hydration wait", () => {
     expect(error).toMatchObject({ code: "preflight_draft_protected", reason: "composer_count:0" });
     const home = events.indexOf("goHome");
     expect(events.slice(home, home + 3)).toEqual(["goHome", "composer-wait", "guard:no-composer"]);
-    expect(waitOptions[0]).toEqual({ state: "visible", timeout: 20_000 });
+    expect(waitOptions[0]).toEqual({ state: "visible", timeout: 28_000 });
     // Refused at the surface guard: no Project row was clicked and no cold
     // Project navigation was attempted.
     expect(rowClick).not.toHaveBeenCalled();

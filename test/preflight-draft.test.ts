@@ -21,7 +21,7 @@ vi.mock("../src/browser/conversation.js", async importOriginal => ({
   ensureProSixMaximum: (...a: unknown[]) => model(...a),
   probePromptDelivery: (...a: unknown[]) => probe(...a),
 }));
-const { assertPreflightDraftSafe } = await import("../src/browser/conversation.js");
+const { assertPreflightDraftSafe, COMPOSER_HYDRATION_TIMEOUT_MS } = await import("../src/browser/conversation.js");
 const { runInteractionPreflight } = await import("../src/core/orchestrator.js");
 
 // Synthetic DOM surfaces execute the actual in-page admission function. Reads
@@ -33,7 +33,11 @@ function fixture(initial: Partial<State> = {}) {
   // Records every bounded composer-hydration wait the preflight issues, with the
   // composer count it saw when the wait began, so a test can prove the home
   // guard ran after hydration and not before it.
-  const composerWaits: Array<{ selector: string; options: { state?: string; timeout?: number }; countAtStart: number }> = [];
+  // G3: `evaluationsAtStart` counts guard evaluations already run, so a test
+  // can prove a wait came BEFORE the first guard.
+  const composerWaits: Array<{
+    selector: string; options: { state?: string; timeout?: number }; countAtStart: number; evaluationsAtStart: number;
+  }> = [];
   // Every outermost token the guard removed from its clone this evaluation.
   const removedTokens: FixtureToken[] = [];
   const page = {
@@ -53,7 +57,8 @@ function fixture(initial: Partial<State> = {}) {
     locator: (selector: string) => ({
       first: () => ({
         waitFor: async (options: { state?: string; timeout?: number }) => {
-          composerWaits.push({ selector, options, countAtStart: state.count });
+          composerWaits.push({ selector, options, countAtStart: state.count,
+            evaluationsAtStart: (page.evaluate as unknown as { mock: { calls: unknown[] } }).mock.calls.length });
           if (state.composerNeverHydrates) {
             await new Promise(resolve => setTimeout(resolve, 5));
             throw Object.assign(
@@ -1102,6 +1107,48 @@ describe("ordinary preflight stops before the connector (r36)", () => {
 // pin the fix: the home guard must judge a hydrated composer, and a composer
 // that never arrives must still refuse exactly as before.
 describe("home composer hydration wait", () => {
+  // P-035 2026-10-03 G3. Raised from 20 s; five waits x 28 s fit the daemon's
+  // 140 s preflight deadline.
+  it("bounds each wait at 28 seconds", () => {
+    expect(COMPOSER_HYDRATION_TIMEOUT_MS).toBe(28_000);
+  });
+
+  // P-035 2026-10-03 G3. Live ms1980 `timeline=slot-page:0+982,home:982+0`:
+  // the FIRST guard judged a still-loading chatgpt.com page with no wait.
+  it("waits for hydration before the first guard on a chatgpt.com page", async () => {
+    const { state, session, composerWaits } = fixture({ count: 0 });
+    state.composerHydrationMs = 30;
+    await expect(runInteractionPreflight(options, session))
+      .resolves.toMatchObject({ connectorVerified: false, power: 4 });
+    // First guard, home and cleanup-home: three waits; the first ran before any
+    // guard evaluation and saw no composer yet.
+    expect(composerWaits).toHaveLength(3);
+    expect(composerWaits[0].evaluationsAtStart).toBe(0);
+    expect(composerWaits[0].countAtStart).toBe(0);
+    expect(composerWaits[0].options).toEqual({ state: "visible", timeout: COMPOSER_HYDRATION_TIMEOUT_MS });
+    expect(goHome).toHaveBeenCalledTimes(2);
+  });
+
+  it("still refuses the first guard after a never-hydrating chatgpt.com wait", async () => {
+    const { state, session, composerWaits } = fixture({ count: 0 });
+    state.composerNeverHydrates = true;
+    const error = await runInteractionPreflight(options, session).catch(caught => caught);
+    expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(error.reason).toBe("composer_count:0");
+    expect(composerWaits).toHaveLength(1);
+    expect(composerWaits[0].evaluationsAtStart).toBe(0);
+    expect(goHome).not.toHaveBeenCalled();
+  });
+
+  it("does not wait before the first guard on about:blank", async () => {
+    const { state, session, composerWaits } = fixture({ url: "about:blank", count: 0 });
+    goHome.mockImplementation(() => { state.url = "https://chatgpt.com/"; state.count = 1; });
+    await expect(runInteractionPreflight(options, session)).resolves.toMatchObject({ power: 4 });
+    // Only the home and cleanup-home waits, both after the first guard ran.
+    expect(composerWaits).toHaveLength(2);
+    expect(composerWaits[0].evaluationsAtStart).toBeGreaterThan(0);
+  });
+
   it("waits for the hydrated composer before the home guard, then proceeds past home", async () => {
     const { state, session, composerWaits } = fixture({ url: "about:blank", count: 0 });
     // goHome lands on chatgpt.com but the composer is NOT there yet, exactly as
@@ -1116,7 +1163,7 @@ describe("home composer hydration wait", () => {
     // the home wait this case exists to pin.)
     expect(composerWaits).toHaveLength(2);
     expect(composerWaits[0].selector).toBe(joinSelectors(SELECTORS.composer));
-    expect(composerWaits[0].options).toEqual({ state: "visible", timeout: 20_000 });
+    expect(composerWaits[0].options).toEqual({ state: "visible", timeout: COMPOSER_HYDRATION_TIMEOUT_MS });
     // The composer was absent when the wait began and appeared only inside it,
     // so the guard that admitted the home phase ran after the wait.
     expect(composerWaits[0].countAtStart).toBe(0);
@@ -1141,7 +1188,7 @@ describe("home composer hydration wait", () => {
     expect(error.code).toBe("preflight_draft_protected");
     expect(error.reason).toBe("composer_count:0");
     expect(composerWaits).toHaveLength(1);
-    expect(composerWaits[0].options).toEqual({ state: "visible", timeout: 20_000 });
+    expect(composerWaits[0].options).toEqual({ state: "visible", timeout: COMPOSER_HYDRATION_TIMEOUT_MS });
     expect(composerWaits[0].countAtStart).toBe(0);
     // Nothing past the home phase ran, and the refusal happened once goHome had run.
     expect(goHome).toHaveBeenCalledTimes(1);
@@ -1270,7 +1317,7 @@ describe("cleanup-home composer hydration wait", () => {
     // A second bounded wait, against the shipped composer selector, at the shipped bound.
     expect(composerWaits).toHaveLength(2);
     expect(composerWaits[1].selector).toBe(joinSelectors(SELECTORS.composer));
-    expect(composerWaits[1].options).toEqual({ state: "visible", timeout: 20_000 });
+    expect(composerWaits[1].options).toEqual({ state: "visible", timeout: COMPOSER_HYDRATION_TIMEOUT_MS });
     // It began on the pre-hydration shell and the composer arrived inside it.
     expect(composerWaits[1].countAtStart).toBe(0);
     expect(state.count).toBe(1);
@@ -1294,7 +1341,7 @@ describe("cleanup-home composer hydration wait", () => {
     expect(phases.at(-1)).toBe("cleanup-home");
     expect(composerWaits).toHaveLength(2);
     expect(composerWaits[1].selector).toBe(joinSelectors(SELECTORS.composer));
-    expect(composerWaits[1].options).toEqual({ state: "visible", timeout: 20_000 });
+    expect(composerWaits[1].options).toEqual({ state: "visible", timeout: COMPOSER_HYDRATION_TIMEOUT_MS });
     expect(composerWaits[1].countAtStart).toBe(0);
     // Both navigations happened (the cleanup one refused), and the phase that
     // follows cleanup-home -- its own clearComposer -- never ran. The one main-flow

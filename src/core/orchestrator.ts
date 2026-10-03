@@ -145,6 +145,15 @@ export async function runInteractionPreflight(
     onPhase?.(phase, failedPhase, failure);
   };
   try {
+    // P-035 2026-10-03 G3. Live ms1980 refused `composer_count:0` 12 times under
+    // heavy load with `timeline=slot-page:0+982,home:982+0`: the FIRST guard,
+    // about 1 s after the slot page opened, judged a home page still loading.
+    // Give it the same bounded hydration wait the later guards have, but only
+    // on a chatgpt.com page; a blank slot keeps its blank-page path. The wait
+    // never admits or refuses: the guard stays the only authority.
+    let onChatgpt = false;
+    try { onChatgpt = new URL(page.url()).origin === "https://chatgpt.com"; } catch { onChatgpt = false; }
+    if (onChatgpt) await waitForComposerHydrated(page);
     await guard();
     admitted = true;
     mark("home");
