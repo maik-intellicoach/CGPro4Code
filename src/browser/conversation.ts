@@ -2634,11 +2634,26 @@ export async function assertPreflightDraftSafe(
         // typed value. A missing composer alone is never a safe condition.
         if (!owned.directory || !owned.sourceProvenEmpty) return `composer_count:${composers.length}`;
         if (location.pathname !== "/projects") return "directory_path_not_projects";
-        if (document.querySelectorAll(
-          'textarea, [contenteditable]:not([contenteditable="false"]), [role="textbox"], ' +
-          '[data-type], [data-testid*="attachment" i], [data-testid*="upload" i]:not(input), ' +
-          '[aria-label*="remove" i], img[src^="blob:"], iframe, object, embed, canvas, video, audio',
-        ).length > 0) return "directory_forbidden_node";
+        // P-035 2026-10-03 G3-B (fourth run). Live ms1980 refused
+        // `directory_forbidden_node` three times on a clean-looking /projects
+        // page, and the one combined query could not say which part matched.
+        // The same selectors, split into named groups: the FIRST matching group
+        // names the refusal `directory_forbidden_node:<code>`. Content-free
+        // codes only; which nodes refuse is unchanged.
+        const directoryForbidden: Array<[string, string]> = [
+          ["editor", 'textarea, [contenteditable]:not([contenteditable="false"]), [role="textbox"]'],
+          ["data_type", "[data-type]"],
+          ["attachment", '[data-testid*="attachment" i]'],
+          ["upload", '[data-testid*="upload" i]:not(input)'],
+          ["aria_remove", '[aria-label*="remove" i]'],
+          ["blob_img", 'img[src^="blob:"]'],
+          ["embed", "iframe, object, embed"],
+          ["canvas", "canvas"],
+          ["media", "video, audio"],
+        ];
+        for (const [code, forbidden] of directoryForbidden) {
+          if (document.querySelectorAll(forbidden).length > 0) return `directory_forbidden_node:${code}`;
+        }
         for (const field of Array.from(document.querySelectorAll<HTMLInputElement>(
           'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])' +
           ':not([type="button"]):not([type="submit"]):not([type="file"])',

@@ -366,14 +366,15 @@ function installAdmissionDom(
       closest: () => form, contains: () => false,
       cloneNode: () => ({ textContent: "", querySelectorAll: () => [] }),
     };
-    const risky = directory.draft || directory.attachment ? [{ tagName: "DIV" }] : [];
+    const risky = [{ tagName: "DIV" }];
     const document = {
       querySelectorAll: (selector: string) => {
         if (selector === 'input[type="file"]') return [];
         if (!onDirectory) return [composer];
-        // The directory's first probe is the combined editor/attachment
-        // selector; every other read is empty on a clean directory.
-        return selector.startsWith("textarea,") ? risky : [];
+        // A draft answers the directory's editor group, an attachment its
+        // attachment group; every other read is empty on a clean directory.
+        if (selector.startsWith("textarea,")) return directory.draft ? risky : [];
+        return selector.includes("attachment") ? (directory.attachment ? risky : []) : [];
       },
       createTreeWalker: () => ({ nextNode: () => false }),
     };
@@ -406,9 +407,53 @@ describe("Projects directory draft admission", () => {
   ])("refuses a directory draft/attachment/unreadable state before the row click: %j", async state => {
     const { page, rowClick } = pageFor();
     installAdmissionDom(page, state);
-    await expect(openConversation(page, { gizmoId: target.id }, undefined, true))
-      .rejects.toMatchObject({ code: "preflight_draft_protected" });
+    const error = await openConversation(page, { gizmoId: target.id }, undefined, true).catch(caught => caught);
+    expect(error).toMatchObject({ code: "preflight_draft_protected" });
+    // G3-B (fourth run): the directory refusal names its selector group.
+    if (state.draft) expect(error.reason).toBe("directory_forbidden_node:editor");
+    if (state.attachment) expect(error.reason).toBe("directory_forbidden_node:attachment");
     expect(rowClick).not.toHaveBeenCalled();
+  });
+
+  // P-035 2026-10-03 G3-B (fourth run). The refusal names the FIRST matching
+  // selector group; a clean directory is still admitted.
+  it.each([
+    ["editor", "textarea"], ["editor", '[contenteditable]:not([contenteditable="false"])'],
+    ["editor", '[role="textbox"]'], ["data_type", "[data-type]"],
+    ["attachment", '[data-testid*="attachment" i]'], ["upload", '[data-testid*="upload" i]:not(input)'],
+    ["aria_remove", '[aria-label*="remove" i]'], ["blob_img", 'img[src^="blob:"]'],
+    ["embed", "iframe"], ["embed", "object"], ["embed", "embed"], ["canvas", "canvas"],
+    ["media", "video"], ["media", "audio"],
+  ])("names the directory group %s for a %s node", async (code, part) => {
+    const { page } = pageFor(undefined, { matches: 1, startUrl: "https://chatgpt.com/projects" });
+    page.evaluate = vi.fn(async (fn: Function, arg: any) => {
+      const document = {
+        // Answers a group query when that group's selector list has `part`.
+        querySelectorAll: (selector: string) =>
+          selector.split(", ").includes(part) ? [{ tagName: "DIV" }] : [],
+        createTreeWalker: () => ({ nextNode: () => false }),
+      };
+      return runInNewContext(`(${fn.toString()})(arg)`, {
+        arg, document, location: new URL(page.url()), HTMLTextAreaElement: class {}, NodeFilter: { SHOW_TEXT: 4 },
+      });
+    }) as typeof page.evaluate;
+    await expect(assertPreflightDraftSafe(page, { directory: true, sourceProvenEmpty: true }))
+      .rejects.toMatchObject({ code: "preflight_draft_protected", reason: `directory_forbidden_node:${code}` });
+  });
+
+  it("names the first matching group when several match", async () => {
+    const { page } = pageFor(undefined, { matches: 1, startUrl: "https://chatgpt.com/projects" });
+    page.evaluate = vi.fn(async (fn: Function, arg: any) => runInNewContext(`(${fn.toString()})(arg)`, {
+      arg,
+      document: {
+        querySelectorAll: (selector: string) =>
+          selector === "canvas" || selector === '[aria-label*="remove" i]' ? [{ tagName: "DIV" }] : [],
+        createTreeWalker: () => ({ nextNode: () => false }),
+      },
+      location: new URL(page.url()), HTMLTextAreaElement: class {}, NodeFilter: { SHOW_TEXT: 4 },
+    })) as typeof page.evaluate;
+    await expect(assertPreflightDraftSafe(page, { directory: true, sourceProvenEmpty: true }))
+      .rejects.toMatchObject({ reason: "directory_forbidden_node:aria_remove" });
   });
 
   it("admits the integrated home -> directory -> project-composer path", async () => {
