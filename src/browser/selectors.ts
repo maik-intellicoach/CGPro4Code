@@ -262,6 +262,20 @@ export const SELECTORS: SelectorSet = {
 };
 
 /**
+ * Plain-CSS selectors the no-submit draft guard (`assertPreflightDraftSafe`)
+ * runs with `querySelectorAll` inside the page. Kept apart from `SELECTORS`
+ * because they name UI chrome the guard admits, not elements a turn needs, so
+ * they must not join the selector audit.
+ */
+export const PREFLIGHT_CHROME = {
+  /**
+   * P-035 2026-10-03 G3. The close (X) of the "Take this further in ChatGPT
+   * Work" banner ChatGPT shows above the composer after a Deep Research turn.
+   */
+  beaconBannerDismiss: 'button[aria-label="Dismiss ChatGPT beacon banner"]',
+} as const;
+
+/**
  * Selectors a turn cannot start without, and which therefore must resolve on
  * any authenticated page (P-035 2026-09-16).
  *

@@ -3,7 +3,7 @@ import { runInNewContext } from "node:vm";
 import type { Page } from "patchright";
 import type { Session } from "../src/browser/session.js";
 import { PreflightDraftProtectedError } from "../src/errors.js";
-import { joinSelectors, SELECTORS } from "../src/browser/selectors.js";
+import { joinSelectors, PREFLIGHT_CHROME, SELECTORS } from "../src/browser/selectors.js";
 
 const goHome = vi.fn();
 const openConversation = vi.fn();
@@ -121,20 +121,43 @@ function fixture(initial: Partial<State> = {}) {
       const controls = state.controls.length > 0
         ? state.controls
         : state.unknownButton ? [{ testid: state.unknownTestId }] : [];
+      // P-035 2026-10-03 G3. A control may sit in a synthetic banner: its
+      // `parentElement`, which contains exactly its own controls and, only when
+      // `holdsComposer` is set, the composer as well.
+      const banners = new Map<string, { contains: (node: unknown) => boolean }>();
+      const bannerFor = (id: string): { contains: (node: unknown) => boolean } => {
+        let banner = banners.get(id);
+        if (!banner) {
+          const own = banner = {
+            contains: (node: unknown) => node === composer
+              ? !!state.banners?.[id]?.holdsComposer
+              : controlElements.some(element => element === node && element.parentElement === own),
+          };
+          banners.set(id, banner);
+        }
+        return banner;
+      };
+      const controlElements = controls.map(control => ({
+        closest: () => null,
+        matches: (selector: string) => (control.tagName ?? "BUTTON") !== "BUTTON" ? false
+          : (!!control.testid && selector.includes(`data-testid="${control.testid}"`))
+            || (!!control.ariaLabel && selector.includes(`aria-label="${control.ariaLabel}"`)),
+        getAttribute: (name: string) => name === "data-testid" ? (control.testid ?? "")
+          : name === "aria-label" ? (control.ariaLabel ?? null) : null,
+        tagName: control.tagName ?? "BUTTON",
+        parentElement: control.banner === undefined ? null : bannerFor(control.banner),
+      }));
       const form = {
         querySelector: () => state.attachment ? {} : null,
         // The shape line bounds its ancestor scan to the form, so the walk must
         // see every synthetic foreign ancestor as inside it.
         contains: () => true,
-        querySelectorAll: () => controls.map(control => ({
-          closest: () => null,
-          matches: (selector: string) => (control.tagName ?? "BUTTON") !== "BUTTON" ? false
-            : (!!control.testid && selector.includes(`data-testid="${control.testid}"`))
-              || (!!control.ariaLabel && selector.includes(`aria-label="${control.ariaLabel}"`)),
-          getAttribute: (name: string) => name === "data-testid" ? (control.testid ?? "")
-            : name === "aria-label" ? (control.ariaLabel ?? null) : null,
-          tagName: control.tagName ?? "BUTTON",
-        })),
+        // The banner's X answers its own selector the way CSS would; every other
+        // query still sees every control, exactly as before.
+        querySelectorAll: (selector: string) => selector === PREFLIGHT_CHROME.beaconBannerDismiss
+          ? controlElements.filter(element => element.tagName === "BUTTON"
+            && element.getAttribute("aria-label") === "Dismiss ChatGPT beacon banner")
+          : controlElements,
       };
       // P-035 2026-09-28 r17. The foreign text node's parent chain, so the
       // content-free shape line can be proved: tag, role, nearest testid,
@@ -240,7 +263,10 @@ interface ForeignAncestor {
 interface State {
   text: string; attachment: boolean; file: boolean; mention: string; mentions?: string[]; unknown: boolean;
   readable: boolean; count: number; form: boolean; unknownButton: boolean; unknownTestId: string;
-  controls: Array<{ testid?: string; ariaLabel?: string; tagName?: string }>; url: string; rich?: RichNode[];
+  controls: Array<{ testid?: string; ariaLabel?: string; tagName?: string; banner?: string }>; url: string;
+  rich?: RichNode[];
+  /** G3: synthetic banners by id; a control names its banner with `banner`. */
+  banners?: Record<string, { holdsComposer?: boolean }>;
   /** Connector chips by tag and nesting; overrides the flat `mention(s)` shape. */
   tokenTree?: TokenNode[];
   /** Delays the composer's appearance until this many ms into the hydration wait. */
@@ -2591,5 +2617,55 @@ describe("hidden mirror of the admitted lone @ (r34)", () => {
       fixture({ text: "real user draft", ...hiddenMirror("@") }).page,
       { connector: "lane-x", text: "real user draft" },
     )).toBe("foreign_text");
+  });
+});
+
+// P-035 2026-10-03 G3. Live ms1980: after a successful Deep Research turn the
+// "Take this further in ChatGPT Work" banner sat above the composer with an
+// unnamed "Try Work" button and its X, and the watchdog preflight refused
+// `unknown_control:BUTTON|Dismiss ChatGPT beacon banner`.
+describe("ChatGPT Work beacon banner", () => {
+  const reasonOf = async (page: Page) =>
+    (await assertPreflightDraftSafe(page).then(() => undefined).catch(caught => caught))?.reason;
+  const dismiss = "Dismiss ChatGPT beacon banner";
+
+  it("admits the banner's Try Work button and X on an otherwise empty home composer", async () => {
+    const { page } = fixture({
+      banners: { work: {} },
+      controls: [
+        { banner: "work" },
+        { ariaLabel: dismiss, banner: "work" },
+        { ariaLabel: "Add files and more" },
+        { ariaLabel: "Dictate" },
+        { ariaLabel: "Send" },
+        { ariaLabel: "Select ChatGPT model" },
+      ],
+    });
+    await expect(assertPreflightDraftSafe(page)).resolves.toBeUndefined();
+  });
+
+  it("still refuses an unnamed button outside any banner", async () => {
+    expect(await reasonOf(fixture({ controls: [{ ariaLabel: "Add files and more" }, {}] }).page))
+      .toBe("unknown_control:BUTTON");
+
+    // The banner is present, but the unnamed button is not inside it.
+    expect(await reasonOf(fixture({
+      banners: { work: {} },
+      controls: [{ ariaLabel: dismiss, banner: "work" }, {}],
+    }).page)).toBe("unknown_control:BUTTON");
+  });
+
+  it("does not admit a dismiss button whose banner container also holds the composer", async () => {
+    expect(await reasonOf(fixture({
+      banners: { work: { holdsComposer: true } },
+      controls: [{ banner: "work" }, { ariaLabel: dismiss, banner: "work" }],
+    }).page)).toBe(`unknown_control:BUTTON|${dismiss}`);
+  });
+
+  it("does not admit a role=button control inside the banner", async () => {
+    expect(await reasonOf(fixture({
+      banners: { work: {} },
+      controls: [{ ariaLabel: dismiss, banner: "work" }, { ariaLabel: "Try Work", tagName: "DIV", banner: "work" }],
+    }).page)).toBe("unknown_control:Try Work");
   });
 });

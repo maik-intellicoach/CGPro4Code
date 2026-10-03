@@ -1,5 +1,5 @@
 import type { Page, Locator } from "patchright";
-import { SELECTORS, joinSelectors } from "./selectors.js";
+import { PREFLIGHT_CHROME, SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
 import { listProjects } from "../api/projects.js";
 import { fetchModelsWithReason, findProModel, type ChatgptModel } from "../api/models.js";
@@ -2495,7 +2495,7 @@ export async function assertPreflightDraftSafe(
   let safe = false;
   let reason: string | null = null;
   try {
-    const outcome = await page.evaluate(({ selector, owned }): true | string | PreflightDiagnostic => {
+    const outcome = await page.evaluate(({ selector, chromeSelectors, owned }): true | string | PreflightDiagnostic => {
       // P-035 2026-09-27. The guard still answers a single bit: `true` admits,
       // a string is the FIRST check that refused, named by a closed, content-free
       // reason code. The branch order and every condition are exactly as before,
@@ -2641,8 +2641,23 @@ export async function assertPreflightDraftSafe(
       // identifier, de-duplicated, DOM order, at most 5, whole code capped at
       // 200 chars) so any further variant control shows up in one round.
       const unknownControls: string[] = [];
+      // P-035 2026-10-03 G3. Live ms1980: after a successful Deep Research turn
+      // ChatGPT shows "Take this further in ChatGPT Work" above the composer,
+      // with a "Try Work" button and an X, and the watchdog preflight refused
+      // `unknown_control:BUTTON|Dismiss ChatGPT beacon banner` and restarted the
+      // lane. The banner is the nearest ancestor of that X which does NOT
+      // contain the composer; a `button` inside it is chrome, not a draft. An
+      // unnamed `BUTTON` anywhere else, a `[role="button"]` on another tag, and
+      // every control when that ancestor also holds the composer still refuse
+      // exactly as before.
+      const beaconBanners: Element[] = [];
+      for (const dismiss of Array.from(form.querySelectorAll(chromeSelectors.beaconBannerDismiss))) {
+        const banner = dismiss.parentElement;
+        if (banner && banner !== form && !banner.contains(composer)) beaconBanners.push(banner);
+      }
       for (const control of Array.from(form.querySelectorAll('button, [role="button"]'))) {
         if (composer.contains(control) || control.closest('[role="menu"], [role="listbox"]')) continue;
+        if (control.tagName === "BUTTON" && beaconBanners.some(banner => banner.contains(control))) continue;
         if (control.matches('button[data-testid="composer-plus-btn"], button[aria-label="Add files and more"], button[data-testid="send-button"], button[data-testid="composer-send-button"], button[aria-label="Select ChatGPT model"], button.__composer-pill[aria-haspopup="menu"], button[data-testid="model-switcher-dropdown-button"]')) continue;
         const id = identify(control);
         // P-035 2026-09-27. The empty home composer also carries its dictation
@@ -3206,7 +3221,7 @@ export async function assertPreflightDraftSafe(
         return { reason: "foreign_text", foreignShape: foreignShape(node) };
       }
       return true;
-    }, { selector: joinSelectors(SELECTORS.composer), owned });
+    }, { selector: joinSelectors(SELECTORS.composer), chromeSelectors: PREFLIGHT_CHROME, owned });
     if (outcome === true) safe = true;
     else if (typeof outcome === "string") reason = outcome;
     else if (typeof outcome === "object" && "reason" in outcome) {
