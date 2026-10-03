@@ -305,6 +305,14 @@ export const PREFLIGHT_CHROME = {
   deepResearchMentionText: "deep-research",
   deepResearchMentionAttributes: ["app-mention-name", "app-mention-path", "data-prompt-link-label"],
   deepResearchMentionPattern: "deep[\\s_-]*research",
+  /**
+   * P-035 2026-10-03 G4-C. The hover tooltip beside the Deep research row that
+   * carries the remaining count (`25 left`). The element named by the row's
+   * `aria-describedby` is tried first, then these in order. The tools popover
+   * is itself a Radix popper, so a candidate that holds the row (or sits
+   * inside it) is never the tooltip.
+   */
+  deepResearchTooltip: ['[role="tooltip"]', "[data-radix-popper-content-wrapper]"],
 } as const;
 
 /**

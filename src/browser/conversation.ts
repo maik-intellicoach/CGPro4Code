@@ -1,7 +1,7 @@
 import type { Page, Locator } from "patchright";
 import { PREFLIGHT_CHROME, SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
-import { deepResearchQuota, parseDeepResearchExhausted, recordDeepResearchExhausted, recordDeepResearchRow, type DeepResearchQuota } from "./deep-research-quota.js";
+import { deepResearchQuota, parseDeepResearchExhausted, parseDeepResearchRemaining, recordDeepResearchExhausted, recordDeepResearchRow, recordDeepResearchTooltip, type DeepResearchQuota } from "./deep-research-quota.js";
 import { listProjects } from "../api/projects.js";
 import { fetchModelsWithReason, findProModel, type ChatgptModel } from "../api/models.js";
 import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, type ReplyStalledDetails, ReplyStalledError, SelectorBrokenError, type SubmittedTurnNotRenderedDetails, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../errors.js";
@@ -1801,7 +1801,8 @@ export async function setDeepResearch(page: Page, on = true): Promise<boolean> {
   }
   // P-035 2026-10-03 G4-A. Read the row's remaining counter before it is
   // touched. Text only: the read never clicks and never changes the selection.
-  if (on) await readDeepResearchRow(toggle);
+  // G4-C: without a count in the row text it hovers the row for its tooltip.
+  if (on) await readDeepResearchRow(page, toggle);
 
   const selected = async (candidate: Locator): Promise<boolean> => {
     const checked = (await candidate.getAttribute("aria-checked").catch(() => null)) === "true";
@@ -1914,20 +1915,74 @@ const DEEP_RESEARCH_ROW_ANCESTORS =
  * ancestor of the resolved label (the count may be a sibling of the label).
  * Returns false, recording nothing, when the row cannot be read.
  */
-async function readDeepResearchRow(toggle: Locator): Promise<boolean> {
+async function readDeepResearchRow(page: Page, toggle: Locator): Promise<boolean> {
   const text = await toggle.evaluate((element, ancestors) => {
     const row = (element.closest(ancestors) as HTMLElement | null) ?? element as HTMLElement;
     return typeof row.innerText === "string" ? row.innerText : "";
   }, DEEP_RESEARCH_ROW_ANCESTORS, { timeout: PICKER_READ_TIMEOUT_MS }).catch(() => null);
   if (typeof text !== "string") return false;
   recordDeepResearchRow(text);
+  if (parseDeepResearchRemaining(text) === null) await readDeepResearchTooltip(page, toggle);
   return true;
+}
+
+/** How long the row's hover tooltip may take to appear, and how often it is looked for. */
+const DEEP_RESEARCH_TOOLTIP_WAIT_MS = 1_500;
+const DEEP_RESEARCH_TOOLTIP_POLL_MS = 150;
+
+/**
+ * P-035 2026-10-03 G4-C. Live: the tools row's own text carries no count
+ * ("Deep research Get a detailed report"). OpenAI's help page says: "Your
+ * in-product usage counter shows your remaining tasks." The counter is a
+ * tooltip beside the row (`25 left`), shown on hover. So, when the row names
+ * no count, hover it (Playwright/CDP mouse movement inside the page, never OS
+ * input) and read the first visible tooltip within 1500 ms: the element named
+ * by `aria-describedby`, then `PREFLIGHT_CHROME.deepResearchTooltip` in order.
+ * Bounded and never throws; it never clicks and never types.
+ */
+async function readDeepResearchTooltip(page: Page, toggle: Locator): Promise<void> {
+  let tooltip: string | null = null;
+  try {
+    const deadline = Date.now() + DEEP_RESEARCH_TOOLTIP_WAIT_MS;
+    await toggle.hover({ timeout: DEEP_RESEARCH_TOOLTIP_WAIT_MS });
+    const polls = Math.ceil(DEEP_RESEARCH_TOOLTIP_WAIT_MS / DEEP_RESEARCH_TOOLTIP_POLL_MS);
+    for (let poll = 0; poll < polls && tooltip === null && Date.now() < deadline; poll += 1) {
+      const found = await toggle.evaluate((element, { ancestors, tooltipSelectors }) => {
+        const row = (element.closest(ancestors) as HTMLElement | null) ?? element as HTMLElement;
+        const ids = [element.getAttribute("aria-describedby"), row.getAttribute("aria-describedby")]
+          .join(" ").split(/\s+/).filter(id => id !== "");
+        const candidates: Element[] = [];
+        for (const id of ids) {
+          const node = document.getElementById(id);
+          if (node) candidates.push(node);
+        }
+        for (const selector of tooltipSelectors) candidates.push(...Array.from(document.querySelectorAll(selector)));
+        for (const node of candidates) {
+          if (node.contains(row) || row.contains(node)) continue;
+          const style = window.getComputedStyle(node);
+          if (node.getClientRects().length === 0 || style.visibility === "hidden" || style.display === "none") continue;
+          const text = (node as HTMLElement).innerText;
+          if (typeof text === "string" && text.trim() !== "") return text;
+        }
+        return null;
+      }, {
+        ancestors: DEEP_RESEARCH_ROW_ANCESTORS,
+        tooltipSelectors: [...PREFLIGHT_CHROME.deepResearchTooltip],
+      }, { timeout: Math.max(1, Math.min(PICKER_READ_TIMEOUT_MS, deadline - Date.now())) }).catch(() => null);
+      if (typeof found === "string") tooltip = found;
+      else await page.waitForTimeout(DEEP_RESEARCH_TOOLTIP_POLL_MS);
+    }
+  } catch {
+    // A failed hover or poll leaves the row's reading as it was.
+  }
+  recordDeepResearchTooltip(tooltip);
 }
 
 /**
  * P-035 2026-10-03 G4-A. Read the Deep Research quota on an idle page: the
  * preflight's home step (`goHome` + `waitForComposerHydrated`), then the tools
- * popover, then the row's text, then Escape and a check that the popover
+ * popover, then the row's text (and, G4-C, its hover tooltip when the text
+ * names no count), then Escape and a check that the popover
  * closed. It never clicks the row, never types and never submits.
  */
 export async function readDeepResearchQuota(page: Page): Promise<DeepResearchQuota> {
@@ -1942,7 +1997,7 @@ export async function readDeepResearchQuota(page: Page): Promise<DeepResearchQuo
     await page.keyboard.press("Escape").catch(() => undefined);
     throw new Error("ChatGPT native Deep Research is not exposed in the composer tool picker");
   }
-  const read = await readDeepResearchRow(toggle);
+  const read = await readDeepResearchRow(page, toggle);
   await page.keyboard.press("Escape");
   await page.waitForTimeout(300);
   if (await toggle.isVisible().catch(() => false)) {

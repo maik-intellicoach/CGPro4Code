@@ -89,6 +89,29 @@ export function recordDeepResearchRow(rowText: string, now: Date = new Date()): 
 }
 
 /**
+ * P-035 2026-10-03 G4-C. Record one read of the Deep research row's hover
+ * tooltip; null means no tooltip appeared. A count in the tooltip becomes the
+ * reading, with the tooltip text as its label; without one the row's reading
+ * stands. The tooltip may also carry the light-version notice.
+ */
+export function recordDeepResearchTooltip(tooltipText: string | null, now: Date = new Date()): DeepResearchQuota {
+  if (typeof tooltipText !== "string") {
+    console.error("[cgpro:deep-research] tooltip: none");
+    return deepResearchQuota();
+  }
+  const text = collapse(tooltipText);
+  const label = text.slice(0, LABEL_MAX);
+  const remaining = parseDeepResearchRemaining(text);
+  if (remaining !== null) reading = { ...reading, remaining, label, observedAt: now.toISOString() };
+  console.error(
+    `[cgpro:deep-research] tooltip: remaining=${remaining === null ? "none" : remaining} label="${label}"`,
+  );
+  const exhausted = parseDeepResearchExhausted(text, now);
+  if (exhausted) recordDeepResearchExhausted(exhausted.resetsAt, now);
+  return deepResearchQuota();
+}
+
+/**
  * P-035 2026-10-03 G4-A. When the full quota is spent ChatGPT says "Your
  * remaining queries are powered by a lighter version of deep research. Your
  * full access resets on April 17." and still runs the turn, on the lighter

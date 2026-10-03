@@ -48,6 +48,8 @@ function scenario(options: {
    * this many caret-placed Backspaces remove it (`Infinity`: never).
    */
   mentionRemovedAfter?: number;
+  /** G4-C: the hover tooltip's text; absent or null: no tooltip appears. */
+  tooltip?: string | null;
 } = {}) {
   let mentionPresent = options.mentionRemovedAfter !== undefined;
   let caretPlaced = false;
@@ -66,13 +68,18 @@ function scenario(options: {
   const toggle = {
     getAttribute: vi.fn(async (name: string) =>
       name === "aria-checked" && selected ? "true" : null),
+    hover: vi.fn(async () => {}),
     click: vi.fn(async () => {
       if (options.normalClickThrows) throw new Error("intercepted");
       // G3-B: the row toggles, so clicking it again turns the mode off.
       if (clickSticks) selected = !selected;
       popoverOpen = false;
     }),
-    evaluate: vi.fn(async (callback: (element: HTMLElement) => boolean) => {
+    evaluate: vi.fn(async (callback: (element: HTMLElement) => boolean, arg?: unknown) => {
+      // G4-C: the tooltip poll is told by its argument.
+      if (arg && typeof arg === "object" && "tooltipSelectors" in arg) {
+        return (options.tooltip ?? null) as unknown as boolean;
+      }
       const element = {
         closest: () => null,
         click: () => { if (clickSticks) selected = !selected; popoverOpen = false; },
@@ -236,6 +243,171 @@ describe("native Deep Research selection", () => {
     }
   });
 
+  // P-035 2026-10-03 G4-C. Live: the row's text carries no count; the count
+  // is a hover tooltip beside the row (`25 left`).
+  describe("G4-C: the row's hover tooltip", () => {
+    const tooltipPolls = (toggle: { evaluate: { mock: { calls: unknown[][] } } }) =>
+      toggle.evaluate.mock.calls.filter(([, arg]) =>
+        !!arg && typeof arg === "object" && "tooltipSelectors" in (arg as object));
+
+    function capture() {
+      const lines: string[] = [];
+      const log = vi.spyOn(console, "error").mockImplementation((line: unknown) => { lines.push(String(line)); });
+      return { lines, log };
+    }
+
+    it("records the tooltip's count when the row names none, and logs the tooltip line", async () => {
+      resetDeepResearchQuota();
+      const { lines, log } = capture();
+      try {
+        const test = scenario({ tooltip: "25 left" });
+        test.toggle.evaluate.mockImplementationOnce(async () =>
+          "Deep research\nGet a detailed report" as unknown as boolean);
+
+        await expect(setDeepResearch(test.page, true)).resolves.toBe(true);
+
+        expect(test.toggle.hover).toHaveBeenCalledTimes(1);
+        expect(deepResearchQuota()).toMatchObject({ remaining: 25, label: "25 left" });
+        expect(lines).toContain('[cgpro:deep-research] tools row: remaining=none label="Deep research Get a detailed report"');
+        expect(lines).toContain('[cgpro:deep-research] tooltip: remaining=25 label="25 left"');
+        expect(tooltipPolls(test.toggle)[0][1]).toMatchObject({
+          tooltipSelectors: [...PREFLIGHT_CHROME.deepResearchTooltip],
+        });
+      } finally {
+        log.mockRestore();
+        resetDeepResearchQuota();
+      }
+    });
+
+    it("does not hover when the row already names a count", async () => {
+      resetDeepResearchQuota();
+      const { lines, log } = capture();
+      try {
+        const test = scenario({ tooltip: "25 left" });
+        test.toggle.evaluate.mockImplementationOnce(async () => "Deep research 5 left" as unknown as boolean);
+
+        await expect(setDeepResearch(test.page, true)).resolves.toBe(true);
+
+        expect(test.toggle.hover).not.toHaveBeenCalled();
+        expect(tooltipPolls(test.toggle)).toHaveLength(0);
+        expect(deepResearchQuota().remaining).toBe(5);
+        expect(lines.some(line => line.includes("tooltip:"))).toBe(false);
+      } finally {
+        log.mockRestore();
+        resetDeepResearchQuota();
+      }
+    });
+
+    it("keeps remaining null, does not throw and logs tooltip: none when no tooltip appears", async () => {
+      resetDeepResearchQuota();
+      const { lines, log } = capture();
+      try {
+        const test = scenario({ tooltip: null });
+        test.toggle.evaluate.mockImplementationOnce(async () => "Deep research" as unknown as boolean);
+
+        await expect(setDeepResearch(test.page, true)).resolves.toBe(true);
+
+        expect(test.toggle.hover).toHaveBeenCalledTimes(1);
+        // Bounded: 1500 ms in 150 ms polls.
+        expect(tooltipPolls(test.toggle).length).toBeGreaterThan(0);
+        expect(tooltipPolls(test.toggle).length).toBeLessThanOrEqual(10);
+        expect(deepResearchQuota()).toMatchObject({ remaining: null, label: "Deep research" });
+        expect(lines).toContain("[cgpro:deep-research] tooltip: none");
+      } finally {
+        log.mockRestore();
+        resetDeepResearchQuota();
+      }
+    });
+
+    it("logs tooltip: none and still selects when the hover itself fails", async () => {
+      resetDeepResearchQuota();
+      const { lines, log } = capture();
+      try {
+        const test = scenario({ tooltip: "25 left" });
+        test.toggle.hover.mockRejectedValueOnce(new Error("hover timeout"));
+        test.toggle.evaluate.mockImplementationOnce(async () => "Deep research" as unknown as boolean);
+
+        await expect(setDeepResearch(test.page, true)).resolves.toBe(true);
+
+        expect(tooltipPolls(test.toggle)).toHaveLength(0);
+        expect(deepResearchQuota().remaining).toBeNull();
+        expect(lines).toContain("[cgpro:deep-research] tooltip: none");
+        expect(test.toggle.click).toHaveBeenCalledTimes(1);
+      } finally {
+        log.mockRestore();
+        resetDeepResearchQuota();
+      }
+    });
+
+    it("records exhaustion from a tooltip carrying the lighter-version sentence", async () => {
+      resetDeepResearchQuota();
+      const { lines, log } = capture();
+      try {
+        const test = scenario({
+          tooltip: "Your remaining queries are powered by a lighter version of deep research.",
+        });
+        test.toggle.evaluate.mockImplementationOnce(async () => "Deep research" as unknown as boolean);
+
+        await expect(setDeepResearch(test.page, true)).resolves.toBe(true);
+
+        expect(deepResearchQuota().exhaustedUntil).not.toBeNull();
+        expect(deepResearchQuota().remaining).toBeNull();
+        expect(lines).toContain("[cgpro:deep-research] light-version notice: resets_at=none");
+      } finally {
+        log.mockRestore();
+        resetDeepResearchQuota();
+      }
+    });
+
+    it("still clicks the toggle exactly once, after the hover", async () => {
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const test = scenario({ tooltip: "25 left" });
+        test.toggle.evaluate.mockImplementationOnce(async () => "Deep research" as unknown as boolean);
+
+        await expect(setDeepResearch(test.page, true)).resolves.toBe(true);
+
+        expect(test.toggle.click).toHaveBeenCalledTimes(1);
+        expect(test.toggle.hover.mock.invocationCallOrder[0])
+          .toBeLessThan(test.toggle.click.mock.invocationCallOrder[0]);
+      } finally {
+        log.mockRestore();
+        resetDeepResearchQuota();
+      }
+    });
+
+    it("reads the first visible tooltip that is neither the row's popover nor inside the row", async () => {
+      const test = scenario({ tooltip: "25 left" });
+      test.toggle.evaluate.mockImplementationOnce(async () => "Deep research" as unknown as boolean);
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await setDeepResearch(test.page, true);
+      } finally {
+        log.mockRestore();
+        resetDeepResearchQuota();
+      }
+      const [fn, arg] = tooltipPolls(test.toggle)[0] as [Function, Record<string, unknown>];
+      const node = (text: string, extra: Record<string, unknown> = {}) => ({
+        innerText: text, getClientRects: () => [{}], contains: () => false, ...extra,
+      });
+      const row = { getAttribute: (name: string) => name === "aria-describedby" ? "tip-1" : null, contains: () => false };
+      const element = { closest: () => row, getAttribute: () => null };
+      const popover = node("Deep research Get a detailed report", { contains: (other: unknown) => other === row });
+      const hidden = node("hidden", { getClientRects: () => [] });
+      const described = node("25 left");
+      const byId: Record<string, unknown> = { "tip-1": described };
+      const run = (ids: Record<string, unknown>, all: unknown[]) => runInNewContext(`(${fn.toString()})(element, arg)`, {
+        element, arg,
+        document: { getElementById: (id: string) => ids[id] ?? null, querySelectorAll: () => all },
+        window: { getComputedStyle: () => ({ visibility: "visible", display: "block" }) },
+      });
+
+      expect(run(byId, [popover])).toBe("25 left");
+      expect(run({}, [popover, hidden, node("12 left")])).toBe("12 left");
+      expect(run({}, [popover, hidden])).toBeNull();
+    });
+  });
+
   it("G4-A: an already-selected chip takes no reading and keeps the previous one", async () => {
     resetDeepResearchQuota();
     const test = scenario({ initiallySelected: true, effortLabel: "6Pro" });
@@ -261,8 +433,11 @@ describe("native Deep Research selection", () => {
     await expect(setDeepResearch(test.page, true)).resolves.toBe(true);
 
     expect(test.toggle.click).toHaveBeenCalledTimes(1);
-    // G4-A: the first evaluate is the read-only row read, the second the fallback.
-    expect(test.toggle.evaluate).toHaveBeenCalledTimes(2);
+    // G4-A: the first evaluate is the read-only row read, the second the
+    // fallback; G4-C's tooltip polls are left out of the count.
+    const nonTooltip = test.toggle.evaluate.mock.calls.filter(([, arg]) =>
+      !(arg && typeof arg === "object" && "tooltipSelectors" in arg));
+    expect(nonTooltip).toHaveLength(2);
   });
 
   it("fails closed when the native Deep Research row is missing", async () => {
