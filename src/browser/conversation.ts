@@ -1,7 +1,7 @@
 import type { Page, Locator } from "patchright";
 import { PREFLIGHT_CHROME, SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
-import { deepResearchQuota, recordDeepResearchRow, type DeepResearchQuota } from "./deep-research-quota.js";
+import { deepResearchQuota, parseDeepResearchExhausted, recordDeepResearchExhausted, recordDeepResearchRow, type DeepResearchQuota } from "./deep-research-quota.js";
 import { listProjects } from "../api/projects.js";
 import { fetchModelsWithReason, findProModel, type ChatgptModel } from "../api/models.js";
 import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, type ReplyStalledDetails, ReplyStalledError, SelectorBrokenError, type SubmittedTurnNotRenderedDetails, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../errors.js";
@@ -4942,11 +4942,13 @@ async function readTurnHeartbeat(
   elapsedMs: number,
   priorAssistantCount: number,
   priorAnyMessages: number | null,
+  deepResearch = false,
 ): Promise<{
   line: string;
   limit: TurnLimitAfterSubmit | null;
   notRendered: SubmittedTurnNotRenderedDetails | null;
   stall: TurnStalledObservation | null;
+  lightNotice: { resetsAt: string | null } | null;
 }> {
   const count = await page.locator(SELECTORS.assistantMessages.join(", ")).count();
   const msgs = await page.locator(SELECTORS.anyMessages.join(", ")).count();
@@ -4966,6 +4968,9 @@ async function readTurnHeartbeat(
   const haystack = `${alertText}\n${bubbleText}`;
   const working = stop || streaming === "true";
   const limitMatch = matchTurnLimitAlert(alerts.texts);
+  // P-035 2026-10-03 G4-A. On a Deep Research turn the same alert and bubble
+  // text may carry the light-version notice: a quota fact, never a failure.
+  const lightNotice = deepResearch ? parseDeepResearchExhausted(haystack, new Date()) : null;
   const noAssistantTurn = count <= priorAssistantCount && bubbleText.trim().length === 0 && !working;
   // Content-free: the visible alert count plus one shape per visible alert.
   const alertShapes = alerts.texts.map(alertShape).join(",");
@@ -5010,6 +5015,7 @@ async function readTurnHeartbeat(
           alertShapes,
         }
       : null,
+    lightNotice: lightNotice ? { resetsAt: lightNotice.resetsAt } : null,
   };
 }
 
@@ -5028,6 +5034,7 @@ function turnHeartbeat(
   page: Page,
   priorAssistantCount: number,
   priorAnyMessages: number | null,
+  deepResearch = false,
 ): {
   tick: () => Promise<void>;
   limitAfterSubmit: () => TurnLimitAfterSubmit | null;
@@ -5043,6 +5050,7 @@ function turnHeartbeat(
   let confirmed: TurnLimitAfterSubmit | null = null;
   let notRendered: SubmittedTurnNotRenderedDetails | null = null;
   let stalled: ReplyStalledDetails | null = null;
+  let lightNoticeRecorded = false;
   const tick = async (): Promise<void> => {
     try {
       const now = Date.now();
@@ -5050,7 +5058,12 @@ function turnHeartbeat(
       if (elapsed < TURN_HEARTBEAT_INTERVAL_MS) return;
       if (lastEmittedAt !== null && now - lastEmittedAt < TURN_HEARTBEAT_INTERVAL_MS) return;
       lastEmittedAt = now;
-      const read = await readTurnHeartbeat(page, elapsed, priorAssistantCount, priorAnyMessages);
+      const read = await readTurnHeartbeat(page, elapsed, priorAssistantCount, priorAnyMessages, deepResearch);
+      // Recorded once per turn; the turn itself goes on and returns its answer.
+      if (read.lightNotice !== null && !lightNoticeRecorded) {
+        lightNoticeRecorded = true;
+        recordDeepResearchExhausted(read.lightNotice.resetsAt);
+      }
       limitObservations = read.limit === null ? 0 : limitObservations + 1;
       if (read.limit !== null && limitObservations >= TURN_LIMIT_CONSECUTIVE_OBSERVATIONS && confirmed === null) {
         // P-035 G3 r45 (2026-09-28). The post-submit notice can name no date,
@@ -5156,6 +5169,8 @@ export async function waitTurnComplete(
     pollEvidence?: (force?: boolean) => Promise<void>;
     externalComplete?: () => boolean;
     confirmComplete?: () => Promise<boolean>;
+    /** G4-A: a Deep Research turn, whose heartbeat also reads the light-version notice. */
+    deepResearch?: boolean;
   } = {},
   /**
    * `SELECTORS.anyMessages` count captured before submit. Optional: null (the
@@ -5166,7 +5181,7 @@ export async function waitTurnComplete(
   let deadline = Date.now() + timeoutMs;
   let lastText = "";
   let lastChangedAt = Date.now();
-  const heartbeat = turnHeartbeat(page, priorAssistantCount, priorAnyMessages);
+  const heartbeat = turnHeartbeat(page, priorAssistantCount, priorAnyMessages, control.deepResearch === true);
 
   for (;;) {
     if (control.cancelled?.()) return;

@@ -613,6 +613,7 @@ function runAskInner(
           },
           externalComplete: opts.deepResearch ? () => nativeState.report !== null : undefined,
           confirmComplete: opts.deepResearch ? async () => nativeState.report !== null : confirmConnectorCompletion,
+          deepResearch: opts.deepResearch === true,
         }, submitCounts.priorAnyMessages ?? null);
       } catch (err) {
         if (debug) {
