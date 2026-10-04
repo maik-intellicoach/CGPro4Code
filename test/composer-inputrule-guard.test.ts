@@ -17,6 +17,7 @@ let composed = "";
 
 function fakeLocator() {
   return {
+    elementHandle: async () => ({ evaluate: async () => true, dispose: async () => {} }),
     click: async () => {},
     getAttribute: async () => null,
     innerText: async () => composed,
@@ -52,7 +53,8 @@ function fakePage(pasteBody: (body: string) => boolean, onLengthRead?: () => voi
     innerText: async () => composed,
     // Two distinct callers: the paste dispatch, which carries the body, and
     // the cheap length read, which carries nothing.
-    evaluate: async (_fn: unknown, body?: string) => {
+    evaluate: async (_fn: unknown, delivery?: string | { text: string }) => {
+        const body = typeof delivery === "object" ? delivery.text : delivery;
       if (body === undefined) {
         if (sleptSinceRead === 0) onLengthRead?.();
         sleptSinceRead = 0;
@@ -63,6 +65,7 @@ function fakePage(pasteBody: (body: string) => boolean, onLengthRead?: () => voi
     },
   };
   return {
+    url: () => "https://chatgpt.com/",
     locator: vi.fn(() => ({ count: async () => 1, first: () => composer })),
     keyboard: {
       press: vi.fn(async (key: string) => {

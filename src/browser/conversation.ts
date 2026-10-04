@@ -1,4 +1,4 @@
-import type { Page, Locator } from "patchright";
+import type { Page, Locator, ElementHandle } from "patchright";
 import { PREFLIGHT_CHROME, SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
 import { deepResearchQuota, parseDeepResearchExhausted, parseDeepResearchRemaining, recordDeepResearchExhausted, recordDeepResearchRow, recordDeepResearchTooltip, type DeepResearchQuota } from "./deep-research-quota.js";
@@ -3911,84 +3911,100 @@ export async function sendPrompt(
     .count()
     .catch(() => 0);
   if (cancelled?.()) return assistantCount();
-  const composer = await requireSelector(page, SELECTORS.composer, "composer");
-  await composer.click();
-  await page.waitForTimeout(120);
-  // Connector/plugin menus can route keyboard search text into the composer
-  // on some ChatGPT builds. Always replace the composer contents so a failed
-  // or stale picker query cannot contaminate the actual prompt.
-  if (!preserveExisting) {
-    await clearComposer(page);
-  }
-  // Put the caret in the composer's text flow before inserting anything. This
-  // replaces a "Meta+End" that could not do the job: see focusComposerEnd.
-  // Fail OPEN here and let the delivery check decide -- it is the thing that
-  // actually knows whether the prompt arrived.
-  if (!(await focusComposerEnd(page, composer))) {
-    console.error("[cgpro:composer] could not seat the caret in the composer text flow; inserting anyway");
-  }
-  // Composer is a contenteditable div on modern chatgpt.com. Insert the whole
-  // prompt in one CDP `Input.insertText` instead of typing it character by
-  // character: at 4ms/char a planning prompt spent MINUTES streaming synthetic
-  // keystrokes into a live React composer (invocation a9f3717e on 2026-08-27
-  // sat 4m46s between connector_selected and prompt_submitted). Every one of
-  // those keystrokes is a chance for an inline `@`/`/` menu to swallow the
-  // input and activate something — including the composer's file upload, which
-  // is how a native Finder dialog ended up on Maik's screen mid-run.
-  // insertText fires the same beforeinput/input events React listens for, but
-  // atomically and without triggering keyboard-driven menus.
-  // Escape hatch: CGPRO_TYPE_KEYSTROKES=1 restores the old per-character path.
-  if (process.env.CGPRO_TYPE_KEYSTROKES === "1") {
-    const lines = prompt.split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      if (i > 0) await page.keyboard.press("Shift+Enter");
-      await page.keyboard.type(lines[i], { delay: 4 });
-    }
-  } else {
-    await insertComposerText(page, prompt);
-  }
-  const priorAssistantCount = await assistantCount();
-  // P-035 G3 r38. Captured next to the assistant count, before the send: the
-  // not-rendered rule compares the live anyMessages count against this to prove
-  // the submitted turn (the user's own message included) never rendered.
-  if (submitCounts) submitCounts.priorAnyMessages = await anyMessageCount();
-  if (cancelled?.()) return priorAssistantCount;
-
-  // Typing may change inline modes. Verify the composed request, not just
-  // the empty composer, and let failures stop both click and Enter submission.
-  //
-  // A pre-submit refusal here (the Pro usage limit is the live one) fires
-  // AFTER the prompt is already in the composer. ChatGPT persists that draft
-  // across a lane restart, and the next preflight then refuses it as an
-  // unowned draft and wedges the lane until a human clears it. So this call
-  // removes what it itself inserted, and only while ownership is still
-  // provable here in the same call. The refusal itself is re-thrown
-  // unchanged: this is cleanup, not a different outcome.
+  const preparationUrl = page.url();
+  let composer: Locator;
   try {
-    await verifySubmission?.();
-  } catch (error) {
-    if (error instanceof PreSubmitInteractionError) {
-      await discardOwnedPresubmitDraft(page, composer, prompt, preserveExisting, ownedConnector);
+    composer = await requireSelector(page, SELECTORS.composer, "composer");
+  } catch {
+    throw new PreflightDraftProtectedError("prompt_target_unconfirmed");
+  }
+  const target = await capturePromptTarget(page, composer, preparationUrl);
+  try {
+    await requirePromptTextFlow(page, target, true);
+    // Connector/plugin menus can route keyboard search text into the composer
+    // on some ChatGPT builds. Always replace the composer contents so a failed
+    // or stale picker query cannot contaminate the actual prompt.
+    if (!preserveExisting) {
+      await clearComposer(page, () => requirePromptTextFlow(page, target, false, true));
     }
-    throw error;
-  }
-  if (cancelled?.()) return priorAssistantCount;
+    target.prefix = preserveExisting ? normaliseComposerText(await composer.innerText()) : "";
+    // Put the caret in the composer's text flow before inserting anything. This
+    // replaces a "Meta+End" that could not do the job: see focusComposerEnd.
+    await requirePromptTextFlow(page, target, true);
+    // Composer is a contenteditable div on modern chatgpt.com. Insert the whole
+    // prompt in one CDP `Input.insertText` instead of typing it character by
+    // character: at 4ms/char a planning prompt spent MINUTES streaming synthetic
+    // keystrokes into a live React composer (invocation a9f3717e on 2026-08-27
+    // sat 4m46s between connector_selected and prompt_submitted). Every one of
+    // those keystrokes is a chance for an inline `@`/`/` menu to swallow the
+    // input and activate something — including the composer's file upload, which
+    // is how a native Finder dialog ended up on Maik's screen mid-run.
+    // insertText fires the same beforeinput/input events React listens for, but
+    // atomically and without triggering keyboard-driven menus.
+    // Escape hatch: CGPRO_TYPE_KEYSTROKES=1 restores the old per-character path.
+    if (process.env.CGPRO_TYPE_KEYSTROKES === "1") {
+      const lines = prompt.split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        await requirePromptTextFlow(page, target);
+        if (i > 0) {
+          await page.keyboard.press("Shift+Enter");
+          await requirePromptTextFlow(page, target);
+        }
+        for (const character of lines[i]) {
+          await requirePromptTextFlow(page, target);
+          await page.keyboard.type(character, { delay: 4 });
+          await requirePromptTextFlow(page, target);
+        }
+      }
+    } else {
+      await insertComposerText(page, prompt, undefined, target);
+    }
+    const priorAssistantCount = await assistantCount();
+    // P-035 G3 r38. Captured next to the assistant count, before the send: the
+    // not-rendered rule compares the live anyMessages count against this to prove
+    // the submitted turn (the user's own message included) never rendered.
+    if (submitCounts) submitCounts.priorAnyMessages = await anyMessageCount();
+    if (cancelled?.()) return priorAssistantCount;
 
-  // Last thing before the send click: does the composer hold the prompt? This
-  // sits AFTER verifySubmission deliberately -- that step opens and closes the
-  // thinking-power menu, so anything it does to the draft has already happened.
-  await verifyComposerHoldsPrompt(page, composer, prompt, preserveExisting);
-  if (cancelled?.()) return priorAssistantCount;
+    // Typing may change inline modes. Verify the composed request, not just
+    // the empty composer, and let failures stop both click and Enter submission.
+    //
+    // A pre-submit refusal here (the Pro usage limit is the live one) fires
+    // AFTER the prompt is already in the composer. ChatGPT persists that draft
+    // across a lane restart, and the next preflight then refuses it as an
+    // unowned draft and wedges the lane until a human clears it. So this call
+    // removes what it itself inserted, and only while ownership is still
+    // provable here in the same call. The refusal itself is re-thrown
+    // unchanged: this is cleanup, not a different outcome.
+    await requirePromptTextFlow(page, target);
+    try {
+      await verifySubmission?.();
+    } catch (error) {
+      await requirePromptTextFlow(page, target, true);
+      if (error instanceof PreSubmitInteractionError) {
+        await discardOwnedPresubmitDraft(page, composer, prompt, preserveExisting, ownedConnector);
+      }
+      throw error;
+    }
+    if (cancelled?.()) return priorAssistantCount;
 
-  const clicked = await clickSendButtonWithRetries(page, cancelled);
-  if (!clicked && !cancelled?.()) {
-    // The final model check moves focus into a menu. Re-resolve the composer
-    // before the keyboard fallback instead of pressing Enter on that menu.
-    const currentComposer = await requireSelector(page, SELECTORS.composer, "composer");
-    await currentComposer.click();
-    if (!cancelled?.()) await page.keyboard.press("Enter");
+    // Last thing before the send click: does the composer hold the prompt? This
+    // sits AFTER verifySubmission deliberately -- that step opens and closes the
+    // thinking-power menu, so anything it does to the draft has already happened.
+    await requirePromptTextFlow(page, target, true);
+    await verifyComposerHoldsPrompt(page, composer, prompt, preserveExisting, target);
+    if (cancelled?.()) return priorAssistantCount;
+
+    const clicked = await clickSendButtonWithRetries(page, cancelled, () => requirePromptTextFlow(page, target));
+    if (!clicked && !cancelled?.()) {
+      // Restore the original composer with DOM focus before keyboard fallback.
+      await requirePromptTextFlow(page, target, true);
+      if (!cancelled?.()) await page.keyboard.press("Enter");
+    }
+    return priorAssistantCount;
+  } finally {
+    await target.original.dispose().catch(() => {});
   }
-  return priorAssistantCount;
 }
 
 /**
@@ -4063,6 +4079,82 @@ async function discardOwnedPresubmitDraft(
   }
 }
 
+/** Invocation-local identity: a locator alone can silently resolve a replacement document. */
+type PromptTarget = {
+  original: ElementHandle<HTMLElement | SVGElement>;
+  url: string;
+  prefix: string;
+};
+
+async function capturePromptTarget(page: Page, composer: Locator, url: string): Promise<PromptTarget> {
+  try {
+    if (page.url() !== url) throw new Error("unconfirmed surface");
+    const parsed = new URL(url);
+    if (parsed.origin !== "https://chatgpt.com"
+      || !(parsed.pathname === "/" || /^\/(c|g)\//.test(parsed.pathname))
+      || /\/settings(?:\/|$)/.test(parsed.pathname)) {
+      throw new Error("unconfirmed surface");
+    }
+    const original = await composer.elementHandle();
+    if (!original) throw new Error("unconfirmed identity");
+    if (page.url() !== url) {
+      await original.dispose().catch(() => {});
+      throw new Error("unconfirmed identity");
+    }
+    return { original, url, prefix: "" };
+  } catch {
+    throw new PreflightDraftProtectedError("prompt_target_unconfirmed");
+  }
+}
+
+async function requirePromptTextFlow(page: Page, target: PromptTarget, focus = false, selectionAllowed = false): Promise<void> {
+  const proof = async (caret: boolean): Promise<boolean> => {
+    if (page.url() !== target.url) return false;
+    const confirmed = await target.original.evaluate((element, expected) => {
+      const host = element as HTMLElement;
+      const matches = Array.from(document.querySelectorAll(expected.selector));
+      if (window.location.href !== expected.url || host.ownerDocument !== document
+        || !host.isConnected || matches.length !== 1 || matches[0] !== host
+        || (!(host instanceof HTMLTextAreaElement) && !host.isContentEditable)
+        || (host instanceof HTMLTextAreaElement && (host.disabled || host.readOnly))
+        || host.getClientRects().length === 0
+        || getComputedStyle(host).visibility !== "visible"
+        || getComputedStyle(host).display === "none") return false;
+      if (!expected.caret) return true;
+      if (host instanceof HTMLTextAreaElement) {
+        return document.activeElement === host && (expected.selectionAllowed || host.selectionStart === host.selectionEnd);
+      }
+      const selection = window.getSelection();
+      const inFlow = (node: Node | null): boolean => {
+        const endpoint = node instanceof Element ? node : node?.parentElement;
+        return endpoint != null && host.contains(endpoint)
+          && endpoint.closest('[contenteditable="false"]') === null;
+      };
+      return document.activeElement === host && selection != null
+        && selection.rangeCount === 1 && (expected.selectionAllowed || selection.isCollapsed)
+        && inFlow(selection.anchorNode) && inFlow(selection.focusNode);
+    }, { url: target.url, selector: joinSelectors(SELECTORS.composer), caret, selectionAllowed }).catch(() => false);
+    return confirmed && page.url() === target.url;
+  };
+  try {
+    // Focus restoration is explicit at preparation/model-menu boundaries only.
+    // Never repair focus loss during delivery: subsequent writes must refuse.
+    if (!await proof(false)) throw new Error("unconfirmed identity");
+    if (focus && !await focusComposerEnd(page, target.original)) throw new Error("unconfirmed caret");
+    if (!await proof(true)) throw new Error("unconfirmed text flow");
+  } catch {
+    throw new PreflightDraftProtectedError("prompt_target_unconfirmed");
+  }
+}
+
+/** Exact whole text, allowing only the markdown rendering already covered by fixtures. */
+function promptTargetHoldsCompleteText(landed: string, text: string, prefix: string): boolean {
+  const rendered = text.replace(/`/g, "").replace(/^#+ /gm, "").replace(/^\s*\d+\. /gm, "");
+  return [text, rendered].some(body =>
+    landed === normaliseComposerText(prefix + body)
+    || landed === normaliseComposerText(prefix + " " + body));
+}
+
 /**
  * Put `text` into the focused composer without emitting key events.
  *
@@ -4088,17 +4180,21 @@ async function insertComposerText(
   page: Page,
   text: string,
   force?: DeliveryPath,
+  target?: PromptTarget,
 ): Promise<DeliveryPath> {
   if (force !== "typed") {
     if (process.env.CGPRO_SKIP_COMPOSER_PASTE === "1" && force !== "paste") {
-      await insertLines(page, text.split("\n"));
+      await insertLines(page, text.split("\n"), target);
       return "typed";
     }
+    if (target) await requirePromptTextFlow(page, target);
     const composer = page.locator(joinSelectors(SELECTORS.composer)).first();
     const before = await composerTextLength(composer);
-    if ((await pasteComposerText(page, text)) || (await pasteLandedLate(page, before))) {
+    if ((await pasteComposerText(page, text, target)) || (await pasteLandedLate(page, before))) {
+      if (target) await requirePromptTextFlow(page, target);
       return "paste";
     }
+    if (target) await requirePromptTextFlow(page, target);
     if (force === "paste") {
       throw new PreSubmitInteractionError(
         "prompt_delivery_incomplete",
@@ -4107,7 +4203,7 @@ async function insertComposerText(
       );
     }
   }
-  await insertLines(page, text.split("\n"));
+  await insertLines(page, text.split("\n"), target);
   return "typed";
 }
 
@@ -4149,26 +4245,48 @@ async function composerTextLength(composer: Locator): Promise<number> {
     .catch(() => 0);
 }
 
-async function pasteComposerText(page: Page, text: string): Promise<boolean> {
+async function pasteComposerText(page: Page, text: string, target?: PromptTarget): Promise<boolean> {
+  if (target) await requirePromptTextFlow(page, target);
   if (process.env.CGPRO_SKIP_COMPOSER_PASTE === "1") return false;
   const composer = page.locator(joinSelectors(SELECTORS.composer)).first();
   const read = async (): Promise<number> => composerTextLength(composer);
   const before = await read();
+  if (target) await requirePromptTextFlow(page, target);
   const dispatched = await composer
-    .evaluate((element, body) => {
+    .evaluate((element, delivery) => {
+      // Check in the dispatch callback too: a locator can re-resolve while its
+      // evaluation is awaiting the browser. Never paste into a replacement.
+      if (delivery.original) {
+        const selection = window.getSelection();
+        const inFlow = (node: Node | null): boolean => {
+          const endpoint = node instanceof Element ? node : node?.parentElement;
+          return endpoint != null && element.contains(endpoint)
+            && endpoint.closest('[contenteditable="false"]') === null;
+        };
+        if (element !== delivery.original || !element.isConnected
+          || element.ownerDocument !== document || window.location.href !== delivery.url
+          || document.activeElement !== element
+          || document.querySelectorAll(delivery.selector).length !== 1
+          || (!((element instanceof HTMLTextAreaElement)
+            && element.selectionStart === element.selectionEnd)
+            && !(selection?.isCollapsed && selection.rangeCount === 1
+              && inFlow(selection.anchorNode) && inFlow(selection.focusNode)))) return null;
+      }
       const data = new DataTransfer();
-      data.setData("text/plain", body);
+      data.setData("text/plain", delivery.text);
       return element.dispatchEvent(
         new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }),
       );
-    }, text)
-    .then(() => true)
+    }, { text, original: target?.original, url: target?.url, selector: joinSelectors(SELECTORS.composer) })
+    .then(result => result === null ? null : true)
     .catch((error) => {
       console.error(
         `[cgpro:composer] paste delivery could not be dispatched (${error instanceof Error ? error.message : String(error)})`,
       );
       return false;
     });
+  if (dispatched === null) throw new PreflightDraftProtectedError("prompt_target_unconfirmed");
+  if (target) await requirePromptTextFlow(page, target);
   if (!dispatched) return false;
   // Poll rather than sleep once. A single 250 ms wait silently failed every
   // prompt above roughly 6,000 characters (measured 2026-09-18: 2.0 KB and
@@ -4178,6 +4296,7 @@ async function pasteComposerText(page: Page, text: string): Promise<boolean> {
   const deadline = Date.now() + COMPOSER_PASTE_SETTLE_MAX_MS;
   for (;;) {
     await page.waitForTimeout(COMPOSER_PASTE_POLL_MS);
+    if (target) await requirePromptTextFlow(page, target);
     if (await read() > before) return true;
     if (Date.now() >= deadline) return false;
   }
@@ -4326,54 +4445,62 @@ export async function probePromptDelivery(
  * ProseMirror selection at all. Focusing the contenteditable host directly and
  * collapsing a Range past the pill avoids both traps.
  */
-async function focusComposerEnd(page: Page, composer: Locator): Promise<boolean> {
+async function focusComposerEnd(page: Page, composer: Locator | ElementHandle<HTMLElement | SVGElement>): Promise<boolean> {
   for (let attempt = 0; attempt < COMPOSER_CARET_ATTEMPTS; attempt++) {
-    const seated = await composer
-      .evaluate((element) => {
-        const counter = window as unknown as {
-          __cgproInputCount?: number;
-          __cgproCommitCount?: number;
-        };
-        const marked = element as unknown as { __cgproCounted?: boolean };
-        if (marked.__cgproCounted !== true) {
-          marked.__cgproCounted = true;
-          // `beforeinput` is cancellable and fires BEFORE the mutation, so it
-          // counts attempts. `input` fires only after one committed. Counting
-          // just the first is what made 2026-09-17T03:36:43Z unreadable: 64
-          // events on a 64-line prompt was taken as proof every line landed,
-          // when a prevented insert increments it exactly the same way.
-          element.addEventListener("beforeinput", () => {
-            counter.__cgproInputCount = (counter.__cgproInputCount ?? 0) + 1;
-          });
-          element.addEventListener("input", () => {
-            counter.__cgproCommitCount = (counter.__cgproCommitCount ?? 0) + 1;
-          });
-        }
-        counter.__cgproInputCount = 0;
-        counter.__cgproCommitCount = 0;
+    const seatCaret = (element: HTMLElement | SVGElement): boolean => {
+      const counter = window as unknown as {
+        __cgproInputCount?: number;
+        __cgproCommitCount?: number;
+      };
+      const marked = element as unknown as { __cgproCounted?: boolean };
+      if (marked.__cgproCounted !== true) {
+        marked.__cgproCounted = true;
+        // `beforeinput` is cancellable and fires BEFORE the mutation, so it
+        // counts attempts. `input` fires only after one committed. Counting
+        // just the first is what made 2026-09-17T03:36:43Z unreadable: 64
+        // events on a 64-line prompt was taken as proof every line landed,
+        // when a prevented insert increments it exactly the same way.
+        element.addEventListener("beforeinput", () => {
+          counter.__cgproInputCount = (counter.__cgproInputCount ?? 0) + 1;
+        });
+        element.addEventListener("input", () => {
+          counter.__cgproCommitCount = (counter.__cgproCommitCount ?? 0) + 1;
+        });
+      }
+      counter.__cgproInputCount = 0;
+      counter.__cgproCommitCount = 0;
 
-        (element as HTMLElement).focus();
-        const range = document.createRange();
-        // The last BLOCK CHILD, not the host. Collapsing to the host's content
-        // end lands between block children, and ProseMirror can map that
-        // position straight back onto the pill's NodeSelection -- which is the
-        // state this function exists to escape.
-        range.selectNodeContents(element.lastElementChild ?? element);
-        range.collapse(false);
-        const selection = window.getSelection();
-        selection?.removeAllRanges();
-        selection?.addRange(range);
+      (element as HTMLElement).focus();
+      if (element instanceof HTMLTextAreaElement) {
+        element.setSelectionRange(element.value.length, element.value.length);
+        return document.activeElement === element;
+      }
+      const range = document.createRange();
+      // The last BLOCK CHILD, not the host. Collapsing to the host's content
+      // end lands between block children, and ProseMirror can map that
+      // position straight back onto the pill's NodeSelection -- which is the
+      // state this function exists to escape.
+      range.selectNodeContents(element.lastElementChild ?? element);
+      range.collapse(false);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
 
-        // Postcondition, not hope. Without it this is a blind write followed by
-        // a timeout, which is exactly how the previous three repairs passed
-        // their own checks and lost the prompt anyway.
-        const anchor = selection?.anchorNode ?? null;
-        const anchorElement = anchor instanceof Element ? anchor : anchor?.parentElement ?? null;
-        return document.activeElement === element
-          && anchorElement !== null
-          && element.contains(anchorElement)
-          && anchorElement.closest('[contenteditable="false"]') === null;
-      })
+      // Postcondition, not hope. Without it this is a blind write followed by
+      // a timeout, which is exactly how the previous three repairs passed
+      // their own checks and lost the prompt anyway.
+      const anchor = selection?.anchorNode ?? null;
+      const anchorElement = anchor instanceof Element ? anchor : anchor?.parentElement ?? null;
+      return document.activeElement === element
+        && anchorElement !== null
+        && element.contains(anchorElement)
+        && anchorElement.closest('[contenteditable="false"]') === null;
+    };
+    // Narrow before calling: Locator and ElementHandle expose incompatible
+    // generic evaluate overloads, even though this DOM callback fits both.
+    const seated = await ("elementHandle" in composer
+      ? composer.evaluate(seatCaret)
+      : composer.evaluate(seatCaret))
       .catch(() => false);
     if (seated) return true;
     await page.waitForTimeout(120);
@@ -4408,10 +4535,10 @@ const COMPOSER_CARET_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_COMPOSER_CA
  * append would duplicate the head, so that case still fails honestly.
  */
 async function verifyComposerHoldsPrompt(
-  page: Page, composer: Locator, text: string, preserveExisting: boolean,
+  page: Page, composer: Locator, text: string, preserveExisting: boolean, target?: PromptTarget,
 ): Promise<void> {
   if (text.trim().length === 0) return;
-  if (process.env.CGPRO_SKIP_COMPOSER_VERIFY === "1") return;
+  if (!target && process.env.CGPRO_SKIP_COMPOSER_VERIFY === "1") return;
 
   const want = normaliseComposerText(text);
   // Fail CLOSED on an unreadable composer. The old code returned early there,
@@ -4419,7 +4546,8 @@ async function verifyComposerHoldsPrompt(
   // but not writing and not SUBMITTING are different things, and submitting a
   // prompt we could not verify is the expensive half.
   let landed = await readComposer(page, composer);
-  if (landed !== null && composerHoldsPrompt(landed, want)) {
+  if (target) await requirePromptTextFlow(page, target);
+  if (landed !== null && (target ? promptTargetHoldsCompleteText(landed, text, target.prefix) : composerHoldsPrompt(landed, want))) {
     // Passing this check is not the same as losing nothing: it allows a 10%
     // shortfall by design. After the 2026-09-18 paste repair the expected
     // shortfall is zero, so say so when it is not, rather than letting a
@@ -4442,16 +4570,19 @@ async function verifyComposerHoldsPrompt(
     console.error(
       `[cgpro:composer] composer ${landed === null ? "could not be read" : `holds ${landed.length} of ${want.length} expected characters`}; re-inserting once (${retry})`,
     );
+    if (target) await requirePromptTextFlow(page, target, true);
     if (retry === "clear") {
-      await clearComposer(page);
+      await clearComposer(page, target ? () => requirePromptTextFlow(page, target, false, true) : undefined);
     }
     // Re-seat the caret in the composer's text flow. An earlier version clicked
     // the composer here, which is what a centre-click does to a composer holding
     // only a pill: it re-focused the pill and the retry inserted nothing either.
-    await focusComposerEnd(page, composer);
-    await insertLines(page, text.split("\n"));
+    if (target) await requirePromptTextFlow(page, target, true);
+    else await focusComposerEnd(page, composer);
+    await insertLines(page, text.split("\n"), target);
     landed = await readComposer(page, composer);
-    if (landed !== null && composerHoldsPrompt(landed, want)) return;
+    if (target) await requirePromptTextFlow(page, target);
+    if (landed !== null && (target ? promptTargetHoldsCompleteText(landed, text, target.prefix) : composerHoldsPrompt(landed, want))) return;
   }
   // Diagnostics, because "33 of 2982 landed" twice with identical numbers does
   // not say WHICH of two very different faults this is: the prompt never
@@ -4739,10 +4870,14 @@ const COMPOSER_READ_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_COMPOSER_REA
  */
 let lastInsert = { lines: 0, requested: 0, chars: 0 };
 
-async function insertLines(page: Page, lines: string[]): Promise<void> {
+async function insertLines(page: Page, lines: string[], target?: PromptTarget): Promise<void> {
   lastInsert = { lines: lines.length, requested: 0, chars: 0 };
   for (let i = 0; i < lines.length; i++) {
-    if (i > 0) await page.keyboard.press("Shift+Enter");
+    if (target) await requirePromptTextFlow(page, target);
+    if (i > 0) {
+      await page.keyboard.press("Shift+Enter");
+      if (target) await requirePromptTextFlow(page, target);
+    }
     const line = lines[i];
     if (line.length === 0) continue;
     // A line whose inline-code span closes at its end is destroyed by the
@@ -4757,12 +4892,14 @@ async function insertLines(page: Page, lines: string[]): Promise<void> {
       const before = await composerTextLength(
         page.locator(joinSelectors(SELECTORS.composer)).first(),
       );
-      if (!(await pasteComposerText(page, line) || await pasteLandedLate(page, before))) {
+      if (!(await pasteComposerText(page, line, target) || await pasteLandedLate(page, before))) {
+        if (target) await requirePromptTextFlow(page, target);
         await page.keyboard.insertText(line);
       }
     } else {
       await page.keyboard.insertText(line);
     }
+    if (target) await requirePromptTextFlow(page, target);
     lastInsert.requested += 1;
     lastInsert.chars += line.length;
   }
@@ -4782,11 +4919,13 @@ const SEND_CLICK_MAX_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_SEND_CLICK_
  * (C-092 H2: `clicked` used to be set unconditionally after the first
  * attempt, so the fallback was dead code).
  */
-async function clickSendButtonWithRetries(page: Page, cancelled?: () => boolean): Promise<boolean> {
+async function clickSendButtonWithRetries(page: Page, cancelled?: () => boolean, guard?: () => Promise<void>): Promise<boolean> {
   for (let attempt = 0; attempt < SEND_CLICK_MAX_ATTEMPTS; attempt++) {
     if (cancelled?.()) return false;
     const send = await waitForEnabledSendButton(page);
     if (!send) return false;
+    if (cancelled?.()) return false;
+    await guard?.();
     if (cancelled?.()) return false;
     try {
       await send.click({ timeout: 4_000 });

@@ -772,7 +772,9 @@ function runAskInner(
       if (filing) filing.preSubmitVerified = true;
       return { conversationId, finalText, events: collected, filing };
     } catch (err) {
-      if (nativeChipPreSubmit && session) {
+      // Protected refusal proves no submission, but not a safe cleanup target.
+      // Preserve the found page and propagate the original error unchanged.
+      if (nativeChipPreSubmit && session && !(err instanceof PreflightDraftProtectedError)) {
         // G3-B: this turn selected the chip but never submitted. Best effort
         // only: the original error still propagates unchanged.
         nativeChipPreSubmit = false;

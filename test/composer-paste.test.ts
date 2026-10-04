@@ -39,7 +39,8 @@ describe("composer paste delivery", () => {
       // Two distinct callers: the paste dispatch, which carries the body, and
       // the cheap length read, which carries nothing and must not be treated
       // as a paste of `undefined`.
-      evaluate: async (_fn: unknown, body?: string) => {
+      evaluate: async (_fn: unknown, delivery?: string | { text: string }) => {
+        const body = typeof delivery === "object" ? delivery.text : delivery;
         if (body === undefined) return composed.length;
         if (delivers === "throws") throw new Error("Illegal invocation");
         if (delivers === "all") composed += body;
@@ -47,6 +48,7 @@ describe("composer paste delivery", () => {
       },
     };
     return {
+      url: () => "https://chatgpt.com/",
       locator: vi.fn(() => ({ count: async () => 1, first: () => composer })),
       keyboard: {
         press: vi.fn(async (key: string) => {
@@ -75,6 +77,7 @@ describe("composer paste delivery", () => {
     // what the fake page currently holds, or the completeness check is testing
     // a constant rather than the delivery.
     requireSelector.mockImplementation(async () => ({
+      elementHandle: async () => ({ evaluate: async () => true, dispose: async () => {} }),
       click: async () => {},
       getAttribute: async () => null,
       innerText: async () => composed,
@@ -234,7 +237,8 @@ describe("composer paste delivery", () => {
         let settled = false;
         const composer = {
           innerText: async () => composed,
-          evaluate: async (_fn: unknown, body?: string) => {
+          evaluate: async (_fn: unknown, delivery?: string | { text: string }) => {
+        const body = typeof delivery === "object" ? delivery.text : delivery;
             if (body === undefined) {
               if (settled) composed = prompt;
               return composed.length;
@@ -271,7 +275,8 @@ describe("composer paste delivery", () => {
         const shortfallRaw = "first line\nsecond ends in\nthird line";
         const composer = {
           innerText: async () => composed,
-          evaluate: async (_fn: unknown, body?: string) => {
+          evaluate: async (_fn: unknown, delivery?: string | { text: string }) => {
+        const body = typeof delivery === "object" ? delivery.text : delivery;
             if (body === undefined) return composed.length;
             composed = shortfallRaw;
             return true;

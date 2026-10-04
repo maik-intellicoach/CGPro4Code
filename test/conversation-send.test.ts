@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { Page } from "patchright";
+import { runInNewContext } from "node:vm";
+import { PreflightDraftProtectedError } from "../src/errors.js";
 
 // waitForEnabledSendButton resolves the send button via firstResolved —
 // mock it so we can control exactly which Locator each attempt sees,
@@ -15,6 +17,8 @@ vi.mock("../src/browser/chatgpt.js", () => ({
 // Bound retries small so a "all attempts fail" test doesn't need to wait
 // out the real default.
 process.env.CGPRO_SEND_CLICK_ATTEMPTS = "2";
+process.env.CGPRO_COMPOSER_PASTE_POLL_MS = "1";
+process.env.CGPRO_COMPOSER_PASTE_SETTLE_MAX_MS = "1";
 
 // Every test in this file is about the TYPED delivery path and its partial
 // writes. Paste is now the default and is covered in composer-paste.test.ts;
@@ -42,6 +46,7 @@ let selectedAll = false;
 
 function fakeLocator(overrides: { click?: () => Promise<void>; innerText?: string } = {}) {
   return {
+    elementHandle: async () => ({ evaluate: async () => { caretInComposer = true; return true; }, dispose: async () => {} }),
     click: overrides.click ?? (async () => {}),
     getAttribute: async () => null, // disabled=null, aria-disabled!=="true" -> enabled
     innerText: async () => overrides.innerText ?? composed,
@@ -68,6 +73,7 @@ function fakePage(dropAfter = Infinity, dropFirst = 0): Page {
     composed += text;
   };
   return {
+    url: () => "https://chatgpt.com/",
     locator: vi.fn(() => ({ count: async () => 0 })),
     keyboard: {
       press: vi.fn(async (key: string) => {
@@ -190,7 +196,11 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     firstResolved.mockResolvedValue(fakeLocator({ click }));
     const prompt = `${"planning context ".repeat(120)}\ninvocation_id="e4adf507"`;
     composed = "p035-low-risk-workstation-intelli"; // the mention, alone
-    const page = fakePage(Infinity, 1); // the first insert goes nowhere
+    const initialLines = prompt.split("\n");
+    // Swallow the WHOLE first delivery: both text writes and Shift+Enter.
+    // Dropping only its first write leaves a partial prompt, which must refuse.
+    const initialWrites = initialLines.filter(line => line.length > 0).length + initialLines.length - 1;
+    const page = fakePage(Infinity, initialWrites);
 
     await sendPrompt(page, prompt, true);
 
@@ -198,6 +208,9 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     expect(page.keyboard.press).not.toHaveBeenCalledWith("Backspace"); // mention kept
     expect(composed).toContain("p035-low-risk-workstation-intelli");
     expect(composed).toContain('invocation_id="e4adf507"');
+    expect(composed).toBe("p035-low-risk-workstation-intelli" + prompt);
+    expect(page.keyboard.insertText).toHaveBeenCalledTimes(4); // two complete attempts
+    expect(vi.mocked(page.keyboard.press).mock.calls.filter(call => call[0] === "Shift+Enter")).toHaveLength(2);
   });
 
   it("recovers when the connector pill holds focus and insertText is dropped", async () => {
@@ -296,7 +309,7 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
 
     await sendPrompt(page, "hello", true, undefined, async () => { order.push("verify"); });
 
-    expect(order).toEqual(["insert", "verify", "read-composer", "send"]);
+    expect(order).toEqual(["read-composer", "insert", "verify", "read-composer", "send"]);
   });
 
   it("refuses to submit when the composer cannot be read at all", async () => {
@@ -383,7 +396,13 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
 
   it("restores composer focus for Enter after verification moved focus into a menu", async () => {
     let focus = "none";
-    requireSelector.mockResolvedValue(fakeLocator({ click: async () => { focus = "composer"; } }));
+    requireSelector.mockResolvedValue({
+      ...fakeLocator(),
+      elementHandle: async () => ({
+        evaluate: async () => { focus = "composer"; return true; },
+        dispose: async () => {},
+      }),
+    });
     firstResolved.mockResolvedValue(fakeLocator({ click: async () => { throw new Error("detached"); } }));
     const page = fakePage();
     vi.mocked(page.keyboard.press).mockImplementation(async (key) => {
@@ -436,5 +455,302 @@ describe("composerHoldsPrompt (P-035 2026-09-17)", () => {
   it("falls back to the length floor when the prompt has no invariant token", () => {
     expect(composerHoldsPrompt("hi there", "hi there")).toBe(true);
     expect(composerHoldsPrompt("hi", "hi there ok fine yes no")).toBe(false);
+  });
+});
+
+
+/**
+ * Parent-only original/candidate comparisons use public sendPrompt, never import
+ * candidate private helpers. The same fixture loads unchanged on original source.
+ * All caret, identity and paste callbacks run against these DOM nodes in a VM.
+ */
+function textFlowFixture(options: {
+  chip?: boolean;
+  caret?: "false" | "throw" | "timeout" | "atom" | "focus-atom" | "expanded";
+  paste?: "all" | "nothing" | "throws";
+  afterPaste?: "url" | "document" | "focus";
+  afterWrite?: "url" | "focus";
+  loseAfterWrites?: number;
+  swallowWrites?: number;
+  duplicate?: boolean;
+  cancelAfterWrites?: number;
+  multiple?: boolean;
+  hidden?: boolean;
+  sendFails?: boolean;
+  loseDuringSend?: boolean;
+} = {}) {
+  const state = {
+    url: "https://chatgpt.com/c/fixture", text: "", writes: 0, settingsWrites: 0,
+    cancelled: false, chip: options.chip !== false, active: null as unknown,
+    document: {} as Record<string, unknown>, focusCalls: 0,
+  };
+  class FixtureElement {
+    parentElement: FixtureElement | null = null;
+    children: FixtureElement[] = [];
+    atom = false;
+    ownerDocument = state.document;
+    isConnected = true;
+    isContentEditable = true;
+    __cgproCounted = false;
+    get lastElementChild() { return this.children.at(-1) ?? null; }
+    get innerText() { return (state.chip ? "Deep Research " : "") + state.text; }
+    addEventListener() {}
+    getClientRects() { return options.hidden ? [] : [{}]; }
+    contains(node: unknown): boolean {
+      return node === this || this.children.some(child => child.contains(node));
+    }
+    closest(): FixtureElement | null { return this.atom ? this : this.parentElement?.closest() ?? null; }
+    focus() {
+      state.focusCalls++;
+      if (options.caret === "throw") throw new Error("focus rejected");
+      if (options.caret === "timeout") throw new Error("Timeout 30000ms exceeded");
+      state.active = options.caret === "false" ? {} : this;
+    }
+    dispatchEvent(event: { clipboardData: { body: string } }) {
+      if (options.paste === "throws") throw new Error("paste rejected");
+      if (options.paste !== "nothing") state.text += event.clipboardData.body;
+      if (options.afterPaste === "url") state.url = "https://chatgpt.com/settings/plugins-settings/apps/connector_openai_deep_research";
+      if (options.afterPaste === "document") state.document = {};
+      if (options.afterPaste === "focus") state.active = {};
+      return true;
+    }
+  }
+  class FixtureTextarea extends FixtureElement {}
+  const host = new FixtureElement();
+  const paragraph = new FixtureElement();
+  const chip = new FixtureElement(); chip.atom = true; chip.isContentEditable = false;
+  host.children = [paragraph]; paragraph.parentElement = host;
+  paragraph.children = [chip]; chip.parentElement = paragraph;
+  const selection = {
+    anchorNode: null as FixtureElement | null, focusNode: null as FixtureElement | null,
+    rangeCount: 1, isCollapsed: true,
+    removeAllRanges() {},
+    addRange(range: { node: FixtureElement }) {
+      this.anchorNode = options.caret === "atom" ? chip : range.node;
+      this.focusNode = options.caret === "focus-atom" ? chip : this.anchorNode;
+      this.isCollapsed = options.caret !== "expanded";
+    },
+  };
+  Object.assign(state.document, {
+    get activeElement() { return state.active; },
+    querySelectorAll: () => options.multiple ? [host, new FixtureElement()] : [host],
+    createRange: () => ({
+      node: host,
+      selectNodeContents(node: FixtureElement) { this.node = node; },
+      collapse() {},
+    }),
+  });
+  // Object.assign copies accessors as values; preserve a live activeElement.
+  Object.defineProperty(state.document, "activeElement", { get: () => state.active });
+  const window = { location: { get href() { return state.url; } }, getSelection: () => selection };
+  class DataTransfer {
+    body = "";
+    setData(_type: string, body: string) { this.body = body; }
+  }
+  class ClipboardEvent {
+    clipboardData: DataTransfer;
+    constructor(_type: string, init: { clipboardData: DataTransfer }) { this.clipboardData = init.clipboardData; }
+  }
+  const evaluate = async (callback: Function, argument?: unknown) => runInNewContext(
+    `(${callback.toString()})(element, argument)`, {
+      element: host, argument: argument && typeof argument === "object" && "original" in argument
+        ? { ...argument, original: argument.original ? host : undefined } : argument, document: state.document, window, Element: FixtureElement,
+      HTMLTextAreaElement: FixtureTextarea, DataTransfer, ClipboardEvent,
+      getComputedStyle: () => ({ visibility: "visible", display: "block" }),
+    },
+  );
+  const original = { evaluate, dispose: vi.fn(async () => {}) };
+  const composer = {
+    elementHandle: async () => original,
+    evaluate,
+    innerText: async () => host.innerText,
+    click: vi.fn(async () => {
+      // Old centre-click actually activates the preserved linked native chip.
+      if (state.chip) state.url = "https://chatgpt.com/settings/plugins-settings/apps/connector_openai_deep_research";
+      else state.active = host;
+    }),
+  };
+  const send = {
+    getAttribute: async () => null,
+    click: vi.fn(async () => {
+      if (options.loseDuringSend) state.url = "https://chatgpt.com/settings";
+      if (options.sendFails) throw new Error("send detached");
+    }),
+  };
+  const write = async (text: string) => {
+    state.writes++;
+    if (state.url.includes("/settings") || state.active !== host || state.document !== host.ownerDocument) {
+      state.settingsWrites++; return;
+    }
+    if (state.writes > (options.swallowWrites ?? 0)) state.text += options.duplicate ? text + text : text;
+    if (state.writes === (options.loseAfterWrites ?? 1)) {
+      if (options.afterWrite === "url") state.url = "https://chatgpt.com/settings";
+      if (options.afterWrite === "focus") state.active = {};
+    }
+    if (state.writes === options.cancelAfterWrites) state.cancelled = true;
+  };
+  const page = {
+    url: () => state.url,
+    locator: () => ({ first: () => composer, count: async () => 0 }),
+    waitForTimeout: async () => {},
+    evaluate: async () => '{"fixture":true}',
+    keyboard: {
+      insertText: vi.fn(write), type: vi.fn(write),
+      press: vi.fn(async (key: string) => {
+        if (key === "Shift+Enter") await write("\n");
+        if (key === "Meta+A") selection.isCollapsed = false;
+        if (key === "Backspace" || key === "Delete") {
+          state.text = ""; selection.isCollapsed = true;
+        }
+      }),
+    },
+  } as unknown as Page;
+  requireSelector.mockResolvedValue(composer);
+  firstResolved.mockResolvedValue(send);
+  return { page, state, composer, send, original };
+}
+
+describe("invocation-local native text-flow boundary (parent comparison)", () => {
+  const prompt = "Exact first line\nkeep `inline-code`\ncomplete final contract-token";
+  beforeEach(() => {
+    delete process.env.CGPRO_TYPE_KEYSTROKES;
+    delete process.env.CGPRO_SKIP_COMPOSER_VERIFY;
+    process.env.CGPRO_SKIP_COMPOSER_PASTE = "1";
+  });
+  const refused = async (fixture: ReturnType<typeof textFlowFixture>, body = prompt) => {
+    await expect(sendPrompt(fixture.page, body, true)).rejects.toMatchObject({
+      name: "PreflightDraftProtectedError", code: "preflight_draft_protected",
+      reason: "prompt_target_unconfirmed", promptSubmitted: false,
+    });
+    expect(fixture.state.settingsWrites).toBe(0);
+    expect(fixture.send.click).not.toHaveBeenCalled();
+    expect(fixture.page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+    expect(fixture.page.keyboard.press).not.toHaveBeenCalledWith("Backspace");
+    expect(fixture.composer.click).not.toHaveBeenCalled();
+  };
+
+  it("preserves the linked native chip and whole prompt without activating settings", async () => {
+    const f = textFlowFixture();
+    await sendPrompt(f.page, prompt, true);
+    expect(f.state.url).toBe("https://chatgpt.com/c/fixture");
+    expect(f.state.chip).toBe(true);
+    expect(f.state.text).toBe(prompt);
+    expect(f.state.settingsWrites).toBe(0);
+    expect(f.composer.click).not.toHaveBeenCalled();
+    expect(f.send.click).toHaveBeenCalledTimes(1);
+    expect(f.original.dispose).toHaveBeenCalledTimes(1);
+  });
+  it("records zero settings writes on uncertain target refusal", async () => {
+    const f = textFlowFixture({ caret: "false" });
+    const failure = await sendPrompt(f.page, prompt, true).catch(error => error);
+    // Assert the observed wrong-surface writes first: this fails behaviorally
+    // on original code, rather than using an import/compilation failure.
+    expect(f.state.settingsWrites).toBe(0);
+    expect(failure).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(f.send.click).not.toHaveBeenCalled();
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Backspace");
+  });
+  it.each(["false", "throw", "timeout", "atom", "focus-atom", "expanded"] as const)(
+    "refuses a %s caret without any write", async caret => {
+      const f = textFlowFixture({ caret }); await refused(f);
+      expect(f.state.writes).toBe(0);
+    },
+  );
+  it.each(["url", "document", "focus"] as const)("refuses %s change during awaited paste", async afterPaste => {
+    delete process.env.CGPRO_SKIP_COMPOSER_PASTE;
+    const f = textFlowFixture({ afterPaste, paste: "nothing" }); await refused(f);
+    expect(f.state.writes).toBe(0);
+  });
+  it.each(["nothing", "throws"] as const)("keeps same-surface %s paste-to-typed fallback", async paste => {
+    delete process.env.CGPRO_SKIP_COMPOSER_PASTE;
+    const f = textFlowFixture({ paste });
+    // No inline code in this case, so a per-line failed paste cannot mask fallback.
+    const body = "whole first line\nwhole second line";
+    await sendPrompt(f.page, body, true);
+    expect(f.state.text).toBe(body); expect(f.state.chip).toBe(true);
+    expect(f.state.settingsWrites).toBe(0); expect(f.send.click).toHaveBeenCalledTimes(1);
+  });
+  it.each(["url", "focus"] as const)("stops immediately after mid-typed %s loss", async afterWrite => {
+    const f = textFlowFixture({ afterWrite }); await refused(f);
+    expect(f.state.writes).toBe(1);
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Shift+Enter");
+  });
+  it("guards inline-code paste after a whole-prompt paste miss", async () => {
+    delete process.env.CGPRO_SKIP_COMPOSER_PASTE;
+    const f = textFlowFixture({ paste: "nothing" });
+    const realEvaluate = f.composer.evaluate;
+    f.composer.evaluate = async (callback, arg) => {
+      const result = await realEvaluate(callback, arg);
+      if (arg === "keep `inline-code`" || (typeof arg === "object" && arg !== null && "text" in arg && arg.text === "keep `inline-code`")) f.state.url = "https://chatgpt.com/settings";
+      return result;
+    };
+    await refused(f);
+    expect(f.state.text).toBe("Exact first line\n");
+    expect(f.page.keyboard.insertText).not.toHaveBeenCalledWith("keep `inline-code`");
+  });
+  it("guards compatibility typing without an environment bypass", async () => {
+    process.env.CGPRO_TYPE_KEYSTROKES = "1";
+    try {
+      const f = textFlowFixture({ afterWrite: "url" }); await refused(f);
+      expect(f.page.keyboard.type).toHaveBeenCalledTimes(1);
+    } finally { delete process.env.CGPRO_TYPE_KEYSTROKES; }
+  });
+  it("safely appends a swallowed prompt once, retaining the native chip", async () => {
+    const f = textFlowFixture({ swallowWrites: 1 });
+    await sendPrompt(f.page, "complete delivery-token", true);
+    expect(f.state.text).toBe("complete delivery-token"); expect(f.state.chip).toBe(true);
+    expect(f.page.keyboard.insertText).toHaveBeenCalledTimes(2);
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Backspace");
+  });
+  it("refuses unsafe reinsertion after model verification replaces the document", async () => {
+    const f = textFlowFixture({ swallowWrites: 1 });
+    await expect(sendPrompt(f.page, "whole delivery-token", true, undefined, async () => {
+      f.state.document = {};
+    })).rejects.toBeInstanceOf(PreflightDraftProtectedError);
+    expect(f.state.writes).toBe(1); expect(f.send.click).not.toHaveBeenCalled();
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Backspace");
+  });
+  it("restores DOM focus after model menus and for Enter fallback", async () => {
+    const f = textFlowFixture({ sendFails: true });
+    await sendPrompt(f.page, prompt, true, undefined, async () => { f.state.active = {}; });
+    expect(f.state.text).toBe(prompt); expect(f.state.active).not.toBeNull();
+    expect(f.composer.click).not.toHaveBeenCalled();
+    expect(f.page.keyboard.press).toHaveBeenCalledWith("Enter");
+  });
+  it("refuses Enter if failed Send attempts changed the surface", async () => {
+    const f = textFlowFixture({ sendFails: true, loseDuringSend: true });
+    await expect(sendPrompt(f.page, prompt, true)).rejects.toBeInstanceOf(PreflightDraftProtectedError);
+    expect(f.send.click).toHaveBeenCalledTimes(1);
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+  });
+  it("honors cancellation before final verification and any submit", async () => {
+    const f = textFlowFixture({ cancelAfterWrites: 1 }); const verify = vi.fn();
+    await sendPrompt(f.page, "complete delivery-token", true, () => f.state.cancelled, verify);
+    expect(verify).not.toHaveBeenCalled(); expect(f.send.click).not.toHaveBeenCalled();
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+  });
+  it("keeps final native-mode disappearance terminal with no submit or deletion", async () => {
+    const f = textFlowFixture();
+    await expect(sendPrompt(f.page, prompt, true, undefined, async () => {
+      throw new Error("native mode missing");
+    })).rejects.toThrow("native mode missing");
+    expect(f.state.text).toBe(prompt); expect(f.send.click).not.toHaveBeenCalled();
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Backspace");
+  });
+  it.each([{ multiple: true }, { hidden: true }])("refuses ambiguous or invisible original composer %j", async options => {
+    const f = textFlowFixture(options); await refused(f); expect(f.state.writes).toBe(0);
+  });
+  it("rejects duplicate whole text even when the legacy length/tail check would pass", async () => {
+    const f = textFlowFixture({ duplicate: true });
+    await expect(sendPrompt(f.page, "complete delivery-token", true)).rejects.toMatchObject({ code: "prompt_delivery_incomplete" });
+    expect(f.send.click).not.toHaveBeenCalled();
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+  });
+  it("still permits an ordinary empty editable composer", async () => {
+    const f = textFlowFixture({ chip: false });
+    await sendPrompt(f.page, "ordinary complete prompt", false);
+    expect(f.state.text).toBe("ordinary complete prompt"); expect(f.send.click).toHaveBeenCalledTimes(1);
   });
 });

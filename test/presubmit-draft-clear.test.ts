@@ -42,6 +42,7 @@ let caretInComposer = true;
 
 function fakeLocator(state: ComposerState) {
   return {
+    elementHandle: async () => ({ evaluate: async () => { caretInComposer = true; return true; }, dispose: async () => {} }),
     click: async () => { caretInComposer = true; },
     getAttribute: async () => null,
     innerText: async () => state.text,
@@ -58,6 +59,7 @@ function fakeLocator(state: ComposerState) {
  */
 function fakePage(state: ComposerState, options: { ignoreClear?: boolean } = {}): Page {
   return {
+    url: () => state.url,
     locator: vi.fn(() => ({ count: async () => 0 })),
     keyboard: {
       press: vi.fn(async (key: string) => {

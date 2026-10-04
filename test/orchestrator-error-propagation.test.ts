@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { BrowserContext, Page } from "patchright";
 import type { Session } from "../src/browser/session.js";
 import type { StreamEvent } from "../src/core/stream.js";
-import { ConnectorEvidenceRateLimitError, PreSubmitInteractionError, TurnTimeoutError } from "../src/errors.js";
+import { ConnectorEvidenceRateLimitError, PreflightDraftProtectedError, PreSubmitInteractionError, TurnTimeoutError } from "../src/errors.js";
 
 const requireAccount = vi.fn();
 const verifyFiling = vi.fn();
@@ -1140,5 +1140,65 @@ describe("bounded connector HTTP 429 failure", () => {
       await events;
       expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(6);
     } finally { clock.mockRestore(); }
+  });
+});
+
+
+describe("protected prompt target propagation (parent-owned execution)", () => {
+  it("retains terminal protected code with no resend, stop, close or submitted event", async () => {
+    const refusal = new PreflightDraftProtectedError("prompt_target_unconfirmed");
+    sendPrompt.mockRejectedValueOnce(refusal);
+    const active = session();
+    const runner = runAskOnSession({ prompt: "whole request", timeoutSec: 1200, headless: false }, active);
+    const result = runner.result.catch(error => error);
+    const events = await collect(runner.events);
+    expect(await result).toBe(refusal);
+    expect(events).toContainEqual({
+      type: "error", message: refusal.message, code: "preflight_draft_protected",
+      phase: "prompt_delivery", promptSubmitted: false,
+    });
+    expect(events.some(event => event.type === "tool" && event.name === "prompt-submitted")).toBe(false);
+    expect(sendPrompt).toHaveBeenCalledTimes(1);
+    expect(waitTurnComplete).not.toHaveBeenCalled();
+    expect(stopCurrentTurn).not.toHaveBeenCalled();
+    expect(active.close).not.toHaveBeenCalled();
+  });
+
+  it("still removes its owned native chip on an ordinary safe pre-submit refusal", async () => {
+    const refusal = new PreSubmitInteractionError("pro_usage_limit_reached", "model_verification", "Pro limit");
+    sendPrompt.mockRejectedValueOnce(refusal);
+    const active = session();
+    const runner = runAskOnSession({ prompt: "owned native request", deepResearch: true, timeoutSec: 1200, headless: false }, active);
+    const result = runner.result.catch(error => error);
+    const events = await collect(runner.events);
+    expect(await result).toBe(refusal);
+    expect(setDeepResearch.mock.calls.filter(call => call[1] === false)).toHaveLength(1);
+    expect(setDeepResearch).toHaveBeenCalledWith(active.page, false);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "error", code: "pro_usage_limit_reached", phase: "model_verification", promptSubmitted: false,
+    }));
+    expect(events.some(event => event.type === "tool" && event.name === "prompt-submitted")).toBe(false);
+    expect(sendPrompt).toHaveBeenCalledTimes(1);
+    expect(waitTurnComplete).not.toHaveBeenCalled();
+    expect(stopCurrentTurn).not.toHaveBeenCalled();
+    expect(active.close).not.toHaveBeenCalled();
+  });
+
+  // No-submit certainty does not establish cleanup ownership. This assertion
+  // must fail on original source and pass with the protected-refusal boundary.
+  it("leaves an unconfirmed native target untouched instead of removing its chip", async () => {
+    const refusal = new PreflightDraftProtectedError("prompt_target_unconfirmed");
+    sendPrompt.mockRejectedValueOnce(refusal);
+    const active = session();
+    const runner = runAskOnSession({ prompt: "whole native request", deepResearch: true, timeoutSec: 1200, headless: false }, active);
+    const result = runner.result.catch(error => error);
+    const events = await collect(runner.events);
+    expect(await result).toBe(refusal);
+    expect(events.some(event => event.type === "tool" && event.name === "prompt-submitted")).toBe(false);
+    expect(sendPrompt).toHaveBeenCalledTimes(1);
+    expect(setDeepResearch.mock.calls.filter(call => call[1] === false)).toHaveLength(0);
+    expect(waitTurnComplete).not.toHaveBeenCalled();
+    expect(stopCurrentTurn).not.toHaveBeenCalled();
+    expect(active.close).not.toHaveBeenCalled();
   });
 });
