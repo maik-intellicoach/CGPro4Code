@@ -1202,3 +1202,54 @@ describe("protected prompt target propagation (parent-owned execution)", () => {
     expect(active.close).not.toHaveBeenCalled();
   });
 });
+
+describe("native interaction preflight admission", () => {
+  const opts = { model: "gpt-6-pro" as const, deepResearch: true as const, probePrompt: "whole frozen probe", gizmoId: "g-p-project", expectedAccountEmail: "account@example.test" };
+  it("uses the shared guarded no-submit call and gates ready on its cleanup evidence", async () => {
+    sendPrompt.mockImplementationOnce(async (_page, prompt, preserve, cancelled, verify, connector, counts, probe) => {
+      expect(prompt).toBe(opts.probePrompt); expect(preserve).toBe(true);
+      expect(cancelled).toBeUndefined(); expect(connector).toBeUndefined(); expect(counts).toBeUndefined();
+      expect(probe.noSubmit).toBe(true);
+      await probe.prepare(); await probe.verify(async () => {});
+      probe.result = { requestedChars: prompt.length, arrivedChars: prompt.length, complete: true, deliveredBy: "typed" };
+      return 0;
+    });
+    const result = await runInteractionPreflight(opts, session());
+    expect(result).toMatchObject({ nativeDeepResearchVerified: true, connectorVerified: false, power: 4, promptDelivery: { complete: true } });
+    expect(setDeepResearch).toHaveBeenCalledWith(expect.anything(), true);
+    expect(setConnector).not.toHaveBeenCalled(); expect(probePromptDelivery).not.toHaveBeenCalled();
+    expect(clearComposer).not.toHaveBeenCalled(); expect(goHome).toHaveBeenCalledTimes(1);
+    expect(requireAccount).toHaveBeenCalledTimes(3);
+  });
+  it("rejects a delivery call that returns without cleanup proof", async () => {
+    await expect(runInteractionPreflight(opts, session())).rejects.toThrow("native preflight cleanup unverified");
+    expect(clearComposer).not.toHaveBeenCalled(); expect(goHome).toHaveBeenCalledTimes(1);
+  });
+  it.each([new PreflightDraftProtectedError("prompt_target_unconfirmed"), new Error("cleanup failed")])("preserves delivery refusal without outer cleanup or retry: %s", async failure => {
+    sendPrompt.mockRejectedValueOnce(failure);
+    await expect(runInteractionPreflight(opts, session())).rejects.toBe(failure);
+    expect(sendPrompt).toHaveBeenCalledTimes(1); expect(clearComposer).not.toHaveBeenCalled();
+    expect(goHome).toHaveBeenCalledTimes(1); expect(setDeepResearch).not.toHaveBeenCalledWith(expect.anything(), false);
+  });
+  it.each(["account", "model"])("refuses late %s gate failure with no cleanup or ready result", async gate => {
+    const original = new Error(`late ${gate} verification failed`);
+    if (gate === "account") requireAccount.mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined).mockRejectedValueOnce(original);
+    else ensureProSixMaximum.mockRejectedValueOnce(original);
+    sendPrompt.mockImplementationOnce(async (_page, _prompt, _preserve, _cancel, _verify, _connector, _counts, probe) => {
+      await probe.verify(async () => {});
+    });
+    await expect(runInteractionPreflight(opts, session())).rejects.toBe(original);
+    expect(clearComposer).not.toHaveBeenCalled(); expect(goHome).toHaveBeenCalledTimes(1);
+    expect(sendPrompt).toHaveBeenCalledTimes(1);
+  });
+  it("refuses changed Project URL after account recheck before returning proof", async () => {
+    const active = session(); let url = "https://chatgpt.com/g/fixture";
+    active.page.url = () => url;
+    requireAccount.mockImplementation(async () => { if (requireAccount.mock.calls.length === 3) url = "https://chatgpt.com/settings"; });
+    sendPrompt.mockImplementationOnce(async (_page, _prompt, _preserve, _cancel, _verify, _connector, _counts, probe) => {
+      await probe.verify(async () => {});
+    });
+    await expect(runInteractionPreflight(opts, active)).rejects.toBeInstanceOf(PreflightDraftProtectedError);
+    expect(clearComposer).not.toHaveBeenCalled(); expect(goHome).toHaveBeenCalledTimes(1);
+  });
+});

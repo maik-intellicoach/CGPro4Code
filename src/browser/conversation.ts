@@ -3901,6 +3901,13 @@ export async function sendPrompt(
    * and its own unknown-prior path (the rule stays off).
    */
   submitCounts?: { priorAnyMessages?: number },
+  /** Internal admission only: never submit; populate evidence after exact cleanup. */
+  probe?: {
+    noSubmit: true;
+    prepare?: () => Promise<void>;
+    verify?: (checkTarget: () => Promise<void>) => Promise<void>;
+    result?: PromptDeliveryProbe;
+  },
 ): Promise<number> {
   const assistantCount = async (): Promise<number> => page
     .locator(SELECTORS.assistantMessages.join(", "))
@@ -3919,8 +3926,16 @@ export async function sendPrompt(
     throw new PreflightDraftProtectedError("prompt_target_unconfirmed");
   }
   const target = await capturePromptTarget(page, composer, preparationUrl);
+  let deliveredBy: DeliveryPath = "typed";
   try {
     await requirePromptTextFlow(page, target, true);
+    if (probe?.prepare) {
+      await assertPreflightDraftSafe(page);
+      await probe.prepare();
+      // Mode selection may move focus, but never earns a replacement target.
+      await requirePromptTextFlow(page, target, true);
+      await assertPreflightDraftSafe(page);
+    }
     // Connector/plugin menus can route keyboard search text into the composer
     // on some ChatGPT builds. Always replace the composer contents so a failed
     // or stale picker query cannot contaminate the actual prompt.
@@ -3957,7 +3972,7 @@ export async function sendPrompt(
         }
       }
     } else {
-      await insertComposerText(page, prompt, undefined, target);
+      deliveredBy = await insertComposerText(page, prompt, undefined, target);
     }
     const priorAssistantCount = await assistantCount();
     // P-035 G3 r38. Captured next to the assistant count, before the send: the
@@ -3979,9 +3994,11 @@ export async function sendPrompt(
     await requirePromptTextFlow(page, target);
     try {
       await verifySubmission?.();
+      await probe?.verify?.(() => requirePromptTextFlow(page, target, true));
     } catch (error) {
+      if (probe) throw error;
       await requirePromptTextFlow(page, target, true);
-      if (error instanceof PreSubmitInteractionError) {
+      if (!probe && error instanceof PreSubmitInteractionError) {
         await discardOwnedPresubmitDraft(page, composer, prompt, preserveExisting, ownedConnector);
       }
       throw error;
@@ -3995,6 +4012,41 @@ export async function sendPrompt(
     await verifyComposerHoldsPrompt(page, composer, prompt, preserveExisting, target);
     if (cancelled?.()) return priorAssistantCount;
 
+    if (probe?.noSubmit) {
+      // Exclusive return BEFORE either submission mechanism. Exact identity,
+      // whole owned body and safe rich-content shape precede EVERY deletion.
+      let arrivedChars = -1;
+      const owned = async (selectionAllowed = false): Promise<void> => {
+        await requirePromptTextFlow(page, target, false, selectionAllowed);
+        await assertPreflightDraftSafe(page, { text: prompt });
+        if (!await firstResolved(page, SELECTORS.deepResearchSelected)) {
+          throw new PreflightDraftProtectedError("prompt_target_unconfirmed");
+        }
+        const landed = await readComposer(page, composer);
+        if (landed === null || !promptTargetHoldsCompleteText(landed, prompt, target.prefix)) {
+          throw new PreflightDraftProtectedError("prompt_target_unconfirmed");
+        }
+        arrivedChars = landed.slice(normaliseComposerText(target.prefix).length).trim().length;
+        await requirePromptTextFlow(page, target, false, selectionAllowed);
+      };
+      await owned();
+      await page.keyboard.press("Meta+A");
+      await owned(true);
+      await page.keyboard.press("Backspace");
+      await requirePromptTextFlow(page, target);
+      await assertPreflightDraftSafe(page);
+      const residue = await readComposer(page, composer);
+      if (residue === null || residue.length !== 0
+        || await firstResolved(page, SELECTORS.deepResearchSelected)
+        || await deepResearchMention(page, false)) {
+        throw new Error("native preflight cleanup unverified");
+      }
+      await requirePromptTextFlow(page, target);
+      const requestedChars = normaliseComposerText(prompt).length;
+      probe.result = { requestedChars, arrivedChars, complete: true, deliveredBy };
+      return priorAssistantCount;
+    }
+
     const clicked = await clickSendButtonWithRetries(page, cancelled, () => requirePromptTextFlow(page, target));
     if (!clicked && !cancelled?.()) {
       // Restore the original composer with DOM focus before keyboard fallback.
@@ -4002,6 +4054,9 @@ export async function sendPrompt(
       if (!cancelled?.()) await page.keyboard.press("Enter");
     }
     return priorAssistantCount;
+  } catch (error) {
+    if (probe) console.error("[cgpro:preflight] native cleanup incomplete; uncertain draft retained");
+    throw error;
   } finally {
     await target.original.dispose().catch(() => {});
   }

@@ -1273,7 +1273,12 @@ export async function handleRequest(
     } finally {
       state.readerBudget.release();
     }
-    if (!body || body.model !== "gpt-6-pro" || typeof body.connector !== "string" || !body.connector.trim() ||
+    const native = body?.deepResearch === true;
+    const validMode = body !== null && (native
+      ? body?.connector === undefined && typeof body.probePrompt === "string" && !!body.probePrompt.trim()
+        && body.probeDeliveryPath === undefined
+      : body?.deepResearch === undefined && typeof body?.connector === "string" && !!body.connector.trim());
+    if (!body || body.model !== "gpt-6-pro" || !validMode ||
         typeof body.gizmoId !== "string" || !/^g-p-[A-Za-z0-9_-]+$/.test(body.gizmoId) ||
         (body.gizmoShortUrl !== undefined && !/^[A-Za-z0-9_-]+$/.test(body.gizmoShortUrl)) ||
         typeof body.expectedAccountEmail !== "string" || body.expectedAccountEmail.length > 320 ||

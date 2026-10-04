@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { Page } from "patchright";
 import { runInNewContext } from "node:vm";
+import { joinSelectors, PREFLIGHT_CHROME, SELECTORS } from "../src/browser/selectors.js";
 import { PreflightDraftProtectedError } from "../src/errors.js";
 
 // waitForEnabledSendButton resolves the send button via firstResolved —
@@ -465,6 +466,9 @@ describe("composerHoldsPrompt (P-035 2026-09-17)", () => {
  * All caret, identity and paste callbacks run against these DOM nodes in a VM.
  */
 function textFlowFixture(options: {
+  nativeProbe?: boolean;
+  cleanupFails?: boolean;
+  foreignControl?: boolean;
   chip?: boolean;
   caret?: "false" | "throw" | "timeout" | "atom" | "focus-atom" | "expanded";
   paste?: "all" | "nothing" | "throws";
@@ -492,14 +496,39 @@ function textFlowFixture(options: {
     isConnected = true;
     isContentEditable = true;
     __cgproCounted = false;
+    tagName = "DIV";
+    attributes: Array<{ name: string }> = [];
+    cloneText: string | undefined;
+    get textContent(): string { return this.atom ? (options.nativeProbe ? "Deep research" : "Deep Research") : (this.cloneText ?? state.text) + this.children.map(child => child.atom ? child.textContent : "").join(""); }
+    getAttribute() { return null; }
+    hasAttribute() { return false; }
+    matches(selector: string) {
+      return this.atom && (selector === '[contenteditable="false"]' || selector === PREFLIGHT_CHROME.deepResearchChipAtom);
+    }
+    querySelectorAll(selector: string): FixtureElement[] {
+      const descendants = this.children.flatMap(child => [child, ...child.querySelectorAll("*")]);
+      return selector === "*" ? descendants : descendants.filter(child => child.matches(selector));
+    }
+    querySelector(selector: string) { return this.querySelectorAll(selector)[0] ?? null; }
+    remove() { if (this.parentElement) this.parentElement.children = this.parentElement.children.filter(child => child !== this); }
+    cloneNode(): FixtureElement {
+      const copy = new FixtureElement(); copy.tagName = this.tagName; copy.atom = this.atom;
+      copy.cloneText = state.text;
+      copy.children = this.children.map(child => { const cloned = child.cloneNode(); cloned.parentElement = copy; return cloned; });
+      return copy;
+    }
     get lastElementChild() { return this.children.at(-1) ?? null; }
-    get innerText() { return (state.chip ? "Deep Research " : "") + state.text; }
+    get innerText() { return (state.chip ? (options.nativeProbe ? "Deep research " : "Deep Research ") : "") + state.text; }
     addEventListener() {}
     getClientRects() { return options.hidden ? [] : [{}]; }
     contains(node: unknown): boolean {
       return node === this || this.children.some(child => child.contains(node));
     }
-    closest(): FixtureElement | null { return this.atom ? this : this.parentElement?.closest() ?? null; }
+    closest(selector: string): FixtureElement | null {
+      if (options.nativeProbe && selector === "form") return form;
+      if (selector !== '[contenteditable="false"]') return null;
+      return this.atom ? this : this.parentElement?.closest(selector) ?? null;
+    }
     focus() {
       state.focusCalls++;
       if (options.caret === "throw") throw new Error("focus rejected");
@@ -517,8 +546,10 @@ function textFlowFixture(options: {
   }
   class FixtureTextarea extends FixtureElement {}
   const host = new FixtureElement();
-  const paragraph = new FixtureElement();
-  const chip = new FixtureElement(); chip.atom = true; chip.isContentEditable = false;
+  const form = new FixtureElement(); form.tagName = "FORM";
+  form.children = [host]; host.parentElement = form;
+  const paragraph = new FixtureElement(); paragraph.tagName = "P";
+  const chip = new FixtureElement(); chip.tagName = "A"; chip.atom = true; chip.isContentEditable = false;
   host.children = [paragraph]; paragraph.parentElement = host;
   paragraph.children = [chip]; chip.parentElement = paragraph;
   const selection = {
@@ -533,7 +564,9 @@ function textFlowFixture(options: {
   };
   Object.assign(state.document, {
     get activeElement() { return state.active; },
-    querySelectorAll: () => options.multiple ? [host, new FixtureElement()] : [host],
+    querySelectorAll: (selector: string) => selector === joinSelectors(SELECTORS.composer)
+      ? (options.multiple ? [host, new FixtureElement()] : [host]) : [],
+    createTreeWalker: () => ({ nextNode: () => false }),
     createRange: () => ({
       node: host,
       selectNodeContents(node: FixtureElement) { this.node = node; },
@@ -551,11 +584,13 @@ function textFlowFixture(options: {
     clipboardData: DataTransfer;
     constructor(_type: string, init: { clipboardData: DataTransfer }) { this.clipboardData = init.clipboardData; }
   }
-  const evaluate = async (callback: Function, argument?: unknown) => runInNewContext(
-    `(${callback.toString()})(element, argument)`, {
+  const evaluate = async (callback: Function, argument?: unknown, pageCallback = false) => runInNewContext(
+    `(${callback.toString()})(${pageCallback ? "argument" : "element, argument"})`, {
       element: host, argument: argument && typeof argument === "object" && "original" in argument
         ? { ...argument, original: argument.original ? host : undefined } : argument, document: state.document, window, Element: FixtureElement,
       HTMLTextAreaElement: FixtureTextarea, DataTransfer, ClipboardEvent,
+      location: { get href() { return state.url; }, get origin() { return new URL(state.url).origin; } },
+      NodeFilter: { SHOW_TEXT: 4 },
       getComputedStyle: () => ({ visibility: "visible", display: "block" }),
     },
   );
@@ -593,20 +628,31 @@ function textFlowFixture(options: {
     url: () => state.url,
     locator: () => ({ first: () => composer, count: async () => 0 }),
     waitForTimeout: async () => {},
-    evaluate: async () => '{"fixture":true}',
+    evaluate: async (callback: Function, argument?: unknown) => options.nativeProbe
+      ? evaluate(callback, argument, true) : '{"fixture":true}',
     keyboard: {
       insertText: vi.fn(write), type: vi.fn(write),
       press: vi.fn(async (key: string) => {
         if (key === "Shift+Enter") await write("\n");
         if (key === "Meta+A") selection.isCollapsed = false;
         if (key === "Backspace" || key === "Delete") {
-          state.text = ""; selection.isCollapsed = true;
+          if (!options.cleanupFails) {
+            state.text = "";
+            if (options.nativeProbe) { state.chip = false; paragraph.children = []; }
+          }
+          selection.isCollapsed = true;
         }
       }),
     },
   } as unknown as Page;
   requireSelector.mockResolvedValue(composer);
-  firstResolved.mockResolvedValue(send);
+  firstResolved.mockImplementation(async (_page, selectors) => options.nativeProbe && selectors === SELECTORS.deepResearchSelected ? (state.chip ? composer : null) : send);
+  if (options.foreignControl) {
+    const unknown = new FixtureElement(); unknown.tagName = "BUTTON";
+    form.children.push(unknown); unknown.parentElement = form;
+    const query = form.querySelectorAll.bind(form);
+    form.querySelectorAll = selector => selector === 'button, [role="button"]' ? [unknown] : query(selector);
+  }
   return { page, state, composer, send, original };
 }
 
@@ -752,5 +798,95 @@ describe("invocation-local native text-flow boundary (parent comparison)", () =>
     const f = textFlowFixture({ chip: false });
     await sendPrompt(f.page, "ordinary complete prompt", false);
     expect(f.state.text).toBe("ordinary complete prompt"); expect(f.send.click).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Parent-only original comparison: copy this candidate test file onto baseline
+// 87a5d046f9d0bb83d1fda8ebf4cfd17349dac1a9 in a separate parent-managed checkout.
+// Run the HTTP test named "admits exclusive native preflight on the existing lease".
+// Original production should load normally and fail statusCode === 200 (expected 400);
+// candidate must pass. No new imports/API are needed for that comparison.
+// Parent command: npm test -- test/daemon-http.test.ts -t "admits exclusive native preflight on the existing lease"
+// Then candidate: npm test -- test/conversation-send.test.ts test/preflight-draft.test.ts
+// test/orchestrator-error-propagation.test.ts test/daemon-http.test.ts test/daemon-slots.test.ts
+// Both runs, compiler and build are deliberately UNRUN in this source lane.
+describe("native admission exclusive no-submit boundary", () => {
+  const body = "Complete frozen first line\ncomplete final contract-token";
+  beforeEach(() => { process.env.CGPRO_SKIP_COMPOSER_PASTE = "1"; });
+  const probe = () => ({ noSubmit: true as const, result: undefined as import("../src/browser/conversation.js").PromptDeliveryProbe | undefined });
+  it("delivers around the real linked chip then proves empty cleanup without Send or Enter", async () => {
+    const f = textFlowFixture({ nativeProbe: true }); const evidence = probe();
+    await sendPrompt(f.page, body, true, undefined, async () => {
+      expect(f.state.chip).toBe(true); expect(f.state.text).toBe(body);
+    }, undefined, undefined, evidence);
+    expect(f.send.click).not.toHaveBeenCalled(); expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+    expect(evidence.result).toEqual({ requestedChars: body.length, arrivedChars: body.length, complete: true, deliveredBy: "typed" });
+    expect(f.state.text).toBe(""); expect(f.state.chip).toBe(false);
+    expect(f.state.settingsWrites).toBe(0); expect(f.composer.click).not.toHaveBeenCalled();
+  });
+  it.each(["url", "document", "focus"] as const)("refuses %s change during delivery without cleanup", async afterPaste => {
+    delete process.env.CGPRO_SKIP_COMPOSER_PASTE;
+    const f = textFlowFixture({ nativeProbe: true, afterPaste }); const evidence = probe();
+    await expect(sendPrompt(f.page, body, true, undefined, undefined, undefined, undefined, evidence)).rejects.toBeInstanceOf(PreflightDraftProtectedError);
+    expect(evidence.result).toBeUndefined(); expect(f.send.click).not.toHaveBeenCalled();
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Backspace");
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Enter"); expect(f.state.settingsWrites).toBe(0);
+  });
+  it.each(["native mode missing", "model lost", "account mismatch", "Project mismatch"])("preserves primary %s refusal and draft", async reason => {
+    const f = textFlowFixture({ nativeProbe: true }); const evidence = probe(); const original = new Error(reason);
+    await expect(sendPrompt(f.page, body, true, undefined, async () => { throw original; }, undefined, undefined, evidence)).rejects.toBe(original);
+    expect(evidence.result).toBeUndefined(); expect(f.state.text).toBe(body);
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Backspace"); expect(f.send.click).not.toHaveBeenCalled();
+  });
+  it("protects a changed target during native preparation before any prompt write", async () => {
+    const f = textFlowFixture({ nativeProbe: true });
+    const evidence = { ...probe(), prepare: async () => { f.state.document = {}; } };
+    await expect(sendPrompt(f.page, body, true, undefined, undefined, undefined, undefined, evidence)).rejects.toBeInstanceOf(PreflightDraftProtectedError);
+    expect(f.state.writes).toBe(0); expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Backspace");
+    expect(f.send.click).not.toHaveBeenCalled(); expect(evidence.result).toBeUndefined();
+  });
+  it("refuses chip loss after verification before cleanup", async () => {
+    const f = textFlowFixture({ nativeProbe: true }); const evidence = probe();
+    await expect(sendPrompt(f.page, body, true, undefined, async () => { f.state.chip = false; }, undefined, undefined, evidence)).rejects.toBeDefined();
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Backspace"); expect(f.send.click).not.toHaveBeenCalled();
+    expect(evidence.result).toBeUndefined();
+  });
+  it("refuses foreign whole-body content added during verification", async () => {
+    const f = textFlowFixture({ nativeProbe: true }); const evidence = probe();
+    await expect(sendPrompt(f.page, body, true, undefined, async () => { f.state.text += " foreign"; }, undefined, undefined, evidence)).rejects.toBeDefined();
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Backspace"); expect(f.send.click).not.toHaveBeenCalled();
+    expect(evidence.result).toBeUndefined();
+  });
+  it("never clears after URL changes during selection for cleanup", async () => {
+    const f = textFlowFixture({ nativeProbe: true }); const evidence = probe();
+    const press = vi.mocked(f.page.keyboard.press).getMockImplementation()!;
+    vi.mocked(f.page.keyboard.press).mockImplementation(async (key, options) => {
+      await press(key, options);
+      if (key === "Meta+A") f.state.url = "https://chatgpt.com/settings";
+    });
+    await expect(sendPrompt(f.page, body, true, undefined, undefined, undefined, undefined, evidence)).rejects.toBeInstanceOf(PreflightDraftProtectedError);
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Backspace"); expect(f.send.click).not.toHaveBeenCalled();
+    expect(evidence.result).toBeUndefined();
+  });
+  it("refuses foreign control at exact-owned cleanup without deleting", async () => {
+    const f = textFlowFixture({ nativeProbe: true, foreignControl: true }); const evidence = probe();
+    await expect(sendPrompt(f.page, body, true, undefined, undefined, undefined, undefined, evidence)).rejects.toBeInstanceOf(PreflightDraftProtectedError);
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Backspace"); expect(evidence.result).toBeUndefined();
+  });
+  it("never returns evidence after cleanup fails", async () => {
+    const f = textFlowFixture({ nativeProbe: true, cleanupFails: true }); const evidence = probe();
+    await expect(sendPrompt(f.page, body, true, undefined, undefined, undefined, undefined, evidence)).rejects.toBeInstanceOf(PreflightDraftProtectedError);
+    expect(evidence.result).toBeUndefined(); expect(f.send.click).not.toHaveBeenCalled();
+  });
+  it("refuses a swallowed whole prompt after the bounded same-target retry", async () => {
+    const f = textFlowFixture({ nativeProbe: true, swallowWrites: Infinity }); const evidence = probe();
+    await expect(sendPrompt(f.page, body, true, undefined, undefined, undefined, undefined, evidence)).rejects.toMatchObject({ code: "prompt_delivery_incomplete" });
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Backspace"); expect(f.send.click).not.toHaveBeenCalled();
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Enter"); expect(evidence.result).toBeUndefined();
+  });
+  it("refuses incomplete or duplicate body before deleting or submitting", async () => {
+    const f = textFlowFixture({ nativeProbe: true, duplicate: true }); const evidence = probe();
+    await expect(sendPrompt(f.page, body, true, undefined, undefined, undefined, undefined, evidence)).rejects.toMatchObject({ code: "prompt_delivery_incomplete" });
+    expect(f.page.keyboard.press).not.toHaveBeenCalledWith("Backspace"); expect(f.send.click).not.toHaveBeenCalled(); expect(evidence.result).toBeUndefined();
   });
 });

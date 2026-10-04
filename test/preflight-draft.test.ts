@@ -3264,3 +3264,14 @@ describe("own native Deep Research chip, app mention form", () => {
     }
   });
 });
+
+describe("native preflight initial draft admission", () => {
+  it.each([{ text: "foreign draft" }, { unknownButton: true }, { attachment: true }])(
+    "refuses real DOM foreign state before home or native selection: %j", async initial => {
+      const f = fixture(initial);
+      await expect(runInteractionPreflight({ model: "gpt-6-pro", deepResearch: true, probePrompt: "whole native probe", gizmoId: "g-p-project", expectedAccountEmail: "a@b.test" }, { page: f.page } as unknown as Session)).rejects.toBeInstanceOf(PreflightDraftProtectedError);
+      expect(goHome).not.toHaveBeenCalled(); expect(clearComposer).not.toHaveBeenCalled();
+      expect(setConnector).not.toHaveBeenCalled(); expect(f.page.keyboard.press).not.toHaveBeenCalled();
+    },
+  );
+});

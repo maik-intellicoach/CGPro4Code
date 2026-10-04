@@ -358,6 +358,24 @@ describe("bounded preflight lease lifecycle", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
+  const nativeBody = { model: "gpt-6-pro", deepResearch: true, probePrompt: "whole native probe", gizmoId: "g-p-fixture", expectedAccountEmail: "a@b.test" };
+  it("native no-submit success uses the existing lease and release", async () => {
+    const { state, page } = fixture();
+    runInteractionPreflight.mockResolvedValue({ nativeDeepResearchVerified: true, connectorVerified: false });
+    const request = call(state, "POST", "/preflight", nativeBody);
+    await request.pending;
+    expect(request.res.statusCode).toBe(200); expect(state.queue.busy).toBe(false);
+    expect(page.close).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
+  });
+  it("native timeout retains quarantine if its original work never settles", async () => {
+    const { state, page } = fixture();
+    const work = deferred(); runInteractionPreflight.mockReturnValue(work.promise);
+    const request = call(state, "POST", "/preflight", nativeBody);
+    await flush(); await vi.advanceTimersByTimeAsync(300_000); await request.pending;
+    expect(page.close).toHaveBeenCalled(); expect(state.slots![0].leasedBy).toBe("preflight-quarantined");
+    expect(state.queue.busy).toBe(true); expect(state.interaction.state).toBe("degraded");
+    work.reject(new Error("closed")); await flush();
+  });
   it("normal success releases once without closing its page", async () => {
     const { state, page } = fixture();
     runInteractionPreflight.mockResolvedValue({ model: "gpt-6-pro" });
@@ -435,7 +453,7 @@ describe("bounded preflight lease lifecycle", () => {
     expect(state.queue.busy).toBe(true);
   });
 
-  it("disconnect closes only the preflight page and preserves a sibling paid ask", async () => {
+  it.each([body, nativeBody])("disconnect closes only the preflight page and preserves a sibling paid ask: %j", async requestBody => {
     process.env.CGPRO_DAEMON_SLOTS = "2";
     const { state, page, session } = fixture();
     const paid = pendingRunner("paid-conversation");
@@ -450,7 +468,7 @@ describe("bounded preflight lease lifecycle", () => {
     });
     vi.mocked(session.context.newPage).mockResolvedValue(probe as any);
     runInteractionPreflight.mockReturnValue(work.promise);
-    const request = call(state, "POST", "/preflight", body);
+    const request = call(state, "POST", "/preflight", requestBody);
     await flush();
     request.res.emit("close");
     await request.pending;

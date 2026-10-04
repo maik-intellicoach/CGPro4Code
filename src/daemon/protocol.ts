@@ -172,9 +172,8 @@ export interface InteractionStatus {
   failureCode?: string;
 }
 
-export interface PreflightRequest {
+interface PreflightIdentity {
   model: "gpt-6-pro";
-  connector: string;
   gizmoId: string;
   gizmoShortUrl?: string;
   expectedAccountEmail: string;
@@ -183,6 +182,12 @@ export interface PreflightRequest {
   /** Force `paste` or `typed`, so a delivery fault can be pinned to one path. */
   probeDeliveryPath?: "paste" | "typed";
 }
+
+/** Native admission never accepts a connector or a partial/optional prompt. */
+export type PreflightRequest = PreflightIdentity & (
+  | { connector: string; deepResearch?: never }
+  | { deepResearch: true; connector?: never; probePrompt: string; probeDeliveryPath?: never }
+);
 
 export interface ReloadResponse {
   ok: boolean;

@@ -1846,3 +1846,43 @@ describe("daemon-side Deep Research quota read", () => {
     expect(state.queue.busy).toBe(false);
   });
 });
+
+it("admits exclusive native preflight on the existing lease", async () => {
+  const result = {
+    accountVerified: true, projectVerified: true, connectorVerified: false,
+    nativeDeepResearchVerified: true, model: "gpt-6-pro", power: 4,
+    promptDelivery: { requestedChars: 14, arrivedChars: 14, complete: true, deliveredBy: "typed" },
+  };
+  runInteractionPreflight.mockResolvedValue(result);
+  const state = fakeState();
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST", url: "/preflight", headers: { authorization: "Bearer test-token" } });
+  const body = { model: "gpt-6-pro", deepResearch: true, probePrompt: "complete probe", gizmoId: "g-p-project", expectedAccountEmail: "account@example.test" };
+  const pending = handleRequest(req, res, state); sendBody(req, body); await pending;
+  // Load-bearing behavioral original/candidate comparison: original returns
+  // 400 here, with existing handleRequest importing and executing normally.
+  expect((res as unknown as FakeRes).statusCode).toBe(200);
+  expect(runInteractionPreflight.mock.calls[0][0]).toEqual(body);
+  expect(parseJsonBody(res as unknown as FakeRes)).toEqual({ ok: true, ...result });
+  expect(state.interaction.state).toBe("ready");
+  expect(state.queue.tryAcquire()).toBe(true); state.queue.release();
+});
+
+it.each([
+  { probePrompt: undefined }, { probePrompt: "" }, { probePrompt: "  \n " },
+  { probePrompt: 7 }, { connector: "connector" }, { connector: null },
+  { deepResearch: false }, { probeDeliveryPath: "typed" },
+  { gizmoId: "foreign-project" }, { expectedAccountEmail: "malformed" }, { model: "gpt-6" },
+])("refuses invalid exclusive native admission before lease: %j", async fields => {
+  const state = fakeState();
+  const req = new FakeReq() as unknown as IncomingMessage;
+  const res = new FakeRes() as unknown as ServerResponse;
+  Object.assign(req, { method: "POST", url: "/preflight", headers: { authorization: "Bearer test-token" } });
+  const pending = handleRequest(req, res, state);
+  sendBody(req, { model: "gpt-6-pro", deepResearch: true, probePrompt: "full probe", gizmoId: "g-p-project", expectedAccountEmail: "account@example.test", ...fields });
+  await pending;
+  expect((res as unknown as FakeRes).statusCode).toBe(400);
+  expect(runInteractionPreflight).not.toHaveBeenCalled();
+  expect(state.queue.tryAcquire()).toBe(true); state.queue.release();
+});

@@ -82,9 +82,8 @@ export interface AskRunner {
   cancel: () => Promise<void>;
 }
 
-export interface InteractionPreflightOptions {
+interface InteractionPreflightIdentity {
   model: "gpt-6-pro";
-  connector: string;
   gizmoId: string;
   gizmoShortUrl?: string;
   expectedAccountEmail: string;
@@ -94,11 +93,17 @@ export interface InteractionPreflightOptions {
   probeDeliveryPath?: DeliveryPath;
 }
 
+export type InteractionPreflightOptions = InteractionPreflightIdentity & (
+  | { connector: string; deepResearch?: never }
+  | { deepResearch: true; connector?: never; probePrompt: string; probeDeliveryPath?: never }
+);
+
 export interface InteractionPreflightResult {
   accountVerified: true;
   projectVerified: true;
   /** True only when the connector phase ran and succeeded; false when it was skipped. */
   connectorVerified: boolean;
+  nativeDeepResearchVerified?: true;
   model: "gpt-6-pro";
   power: number;
   promptDelivery?: PromptDeliveryProbe;
@@ -177,6 +182,37 @@ export async function runInteractionPreflight(
     mark("account-project");
     await requireAccount(page, opts.expectedAccountEmail);
     mark("composer");
+    if (opts.deepResearch === true) {
+      // No connector pipeline, centre click, or outer navigation cleanup on
+      // this path. The delivery call owns the exact target and its cleanup.
+      const projectUrl = page.url();
+      await guard();
+      let power = 0;
+      const probe = {
+        noSubmit: true as const,
+        prepare: async () => { await setDeepResearch(page, true); },
+        verify: async (checkTarget: () => Promise<void>) => {
+          if (page.url() !== projectUrl) throw new PreflightDraftProtectedError("prompt_target_unconfirmed");
+          await requireSelector(page, SELECTORS_DUMP.deepResearchSelected, "native Deep Research before submission", 8_000);
+          await checkTarget();
+          await requireAccount(page, opts.expectedAccountEmail);
+          await checkTarget();
+          power = (await ensureProSixMaximum(page)).power;
+          await checkTarget();
+          if (page.url() !== projectUrl) throw new PreflightDraftProtectedError("prompt_target_unconfirmed");
+          await requireSelector(page, SELECTORS_DUMP.deepResearchSelected, "native Deep Research before submission", 8_000);
+        },
+        result: undefined as PromptDeliveryProbe | undefined,
+      };
+      mark("prompt-delivery");
+      await sendPrompt(page, opts.probePrompt, true, undefined, undefined, undefined, undefined, probe);
+      if (!probe.result?.complete) throw new Error("native preflight cleanup unverified");
+      return {
+        accountVerified: true, projectVerified: true, connectorVerified: false,
+        nativeDeepResearchVerified: true, model: "gpt-6-pro", power,
+        promptDelivery: probe.result,
+      };
+    }
     await clearComposer(page, guard);
     // P-035 2026-09-28 r36. The ordinary watchdog preflight stops at the model
     // check and never types into the live composer. `setConnector` typed `@`
@@ -226,7 +262,7 @@ export async function runInteractionPreflight(
   } finally {
     // Never let finally undo the guard's refusal. A second read also catches
     // drafts that arrived while a model/account operation failed.
-    if (admitted && !protectedDraft) {
+    if (opts.deepResearch !== true && admitted && !protectedDraft) {
       try {
         await guard();
         mark("cleanup-escape");
