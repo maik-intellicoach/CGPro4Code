@@ -4,7 +4,7 @@ import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "
 import { deepResearchQuota, parseDeepResearchExhausted, parseDeepResearchRemaining, recordDeepResearchExhausted, recordDeepResearchRow, recordDeepResearchTooltip, type DeepResearchQuota } from "./deep-research-quota.js";
 import { listProjects } from "../api/projects.js";
 import { fetchModelsWithReason, findProModel, type ChatgptModel } from "../api/models.js";
-import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, type PreSubmitInteractionPhase, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, type ReplyStalledDetails, ReplyStalledError, SelectorBrokenError, type SubmittedTurnNotRenderedDetails, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../errors.js";
+import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, type ReplyStalledDetails, ReplyStalledError, SelectorBrokenError, type SubmittedTurnNotRenderedDetails, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation, streamBreakCount } from "../core/stream.js";
 
 /**
@@ -2267,7 +2267,7 @@ async function assertConnectorAttached(page: Page, connectorName: string): Promi
     // The picker is gone - reopen the composer "+" tools popover, where an
     // attached tool row reports its checked state.
     const composer = await requireSelector(page, SELECTORS.composer, "composer");
-    await focusComposer(page, composer, "connector_selection");
+    await focusComposer(page, composer);
     if (!(await openComposerToolsPopover(page))) {
       await recordConnectorDiagnostics(page);
       throw new Error(notAttached("composer tools popover did not open"));
@@ -2394,7 +2394,7 @@ async function clickConnector(page: Page, row: Locator, name: string): Promise<v
 async function clearTypedConnectorQuery(page: Page, composer: Locator, protectDraft: boolean): Promise<void> {
   if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
   await page.keyboard.press("Escape").catch(() => undefined);
-  await focusComposer(page, composer, "connector_selection");
+  await focusComposer(page, composer);
   if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
   await page.keyboard.press("Meta+A");
   if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
@@ -2424,7 +2424,7 @@ export async function setConnector(page: Page, name: string, protectDraft = fals
   // steps that clear it actually run. The `{ text: "@" }` guards below are
   // unchanged: they judge a different, already-cleared surface.
   if (protectDraft) await assertPreflightDraftSafe(page, { connector: connectorName });
-  await focusComposer(page, composer, "connector_selection");
+  await focusComposer(page, composer);
   if (protectDraft) await assertPreflightDraftSafe(page, { connector: connectorName });
   await page.keyboard.press("Meta+A");
   if (protectDraft) await assertPreflightDraftSafe(page, { connector: connectorName });
@@ -3910,7 +3910,7 @@ export async function assertPreflightDraftSafe(
 export async function clearComposer(page: Page, guard?: () => Promise<void>): Promise<void> {
   await guard?.();
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
-  await focusComposer(page, composer, "prompt_delivery");
+  await focusComposer(page, composer);
   await guard?.();
   await page.keyboard.press("Meta+A");
   await guard?.();
@@ -3953,7 +3953,7 @@ export async function sendPrompt(
     .catch(() => 0);
   if (cancelled?.()) return assistantCount();
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
-  await focusComposer(page, composer, "prompt_delivery");
+  await focusComposer(page, composer);
   await page.waitForTimeout(120);
   // Connector/plugin menus can route keyboard search text into the composer
   // on some ChatGPT builds. Always replace the composer contents so a failed
@@ -4026,7 +4026,13 @@ export async function sendPrompt(
     // The final model check moves focus into a menu. Re-resolve the composer
     // before the keyboard fallback instead of pressing Enter on that menu.
     const currentComposer = await requireSelector(page, SELECTORS.composer, "composer");
-    await focusComposer(page, currentComposer, "prompt_delivery");
+    try {
+      await focusComposer(page, currentComposer);
+    } catch (error) {
+      // A send click above may already have submitted, so a failure here is an
+      // uncertain send: untyped, never a pre-submit refusal the facade retries.
+      throw new Error(`composer focus failed after send attempts: ${(error as Error).message}`);
+    }
     if (!cancelled?.()) await page.keyboard.press("Enter");
   }
   return priorAssistantCount;
@@ -4088,7 +4094,7 @@ async function discardOwnedPresubmitDraft(
     }
     // Playwright's own keyboard, scoped to the composer this call focused:
     // select the whole draft, then delete it.
-    await focusComposer(page, composer, "prompt_delivery");
+    await focusComposer(page, composer);
     await page.keyboard.press("Meta+A");
     await page.keyboard.press("Delete");
     const remaining = await readComposer(page, composer);
@@ -4291,7 +4297,7 @@ export async function probePromptDelivery(
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
   const guard = ownedConnector === undefined ? undefined : () => assertPreflightDraftSafe(page, { connector: ownedConnector });
   await guard?.();
-  await focusComposer(page, composer, "prompt_delivery");
+  await focusComposer(page, composer);
   await page.waitForTimeout(120);
   await clearComposer(page, guard);
   if (guard) await assertPreflightDraftSafe(page);
@@ -4440,7 +4446,10 @@ const COMPOSER_CARET_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_COMPOSER_CA
  * URL change across the focus is a typed pre-submit failure, not a missing
  * composer.
  */
-export async function focusComposer(page: Page, composer: Locator, phase: PreSubmitInteractionPhase): Promise<void> {
+// Codes carry the phase the facade's pre-submit allowlist pairs them with
+// (cgpro_openai_facade.py PRE_SUBMIT_INTERACTION_ERRORS); any other pairing is
+// recorded as an upstream fault and never recovered.
+export async function focusComposer(page: Page, composer: Locator): Promise<void> {
   const before = page.url();
   const focused = await composer.evaluate((element) => {
     const host = element as HTMLElement;
@@ -4475,7 +4484,7 @@ export async function focusComposer(page: Page, composer: Locator, phase: PreSub
     if (!point) {
       throw new PreSubmitInteractionError(
         "prompt_delivery_incomplete",
-        phase,
+        "prompt_delivery",
         "ChatGPT composer could not be focused without clicking a link or chip",
       );
     }
@@ -4487,9 +4496,23 @@ export async function focusComposer(page: Page, composer: Locator, phase: PreSub
     try { where = new URL(after).pathname.split("/")[1] ?? ""; } catch { /* unparsable stays unknown */ }
     throw new PreSubmitInteractionError(
       "chat_surface_unconfirmed",
-      phase,
+      "model_verification",
       `ChatGPT composer focus navigated away from the chat surface (to /${where})`,
     );
+  }
+  if (!focused) {
+    // The click must actually move focus into the composer, or the caller's
+    // keyboard edits land in whatever control still holds it.
+    const took = await composer
+      .evaluate((element) => element.contains(document.activeElement), undefined, { timeout: PICKER_READ_TIMEOUT_MS })
+      .catch(() => false);
+    if (!took) {
+      throw new PreSubmitInteractionError(
+        "prompt_delivery_incomplete",
+        "prompt_delivery",
+        "ChatGPT composer did not take focus after the fallback click",
+      );
+    }
   }
 }
 

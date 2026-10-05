@@ -23,6 +23,7 @@ process.env.CGPRO_SEND_CLICK_ATTEMPTS = "2";
 process.env.CGPRO_SKIP_COMPOSER_PASTE = "1";
 
 const { sendPrompt, composerHoldsPrompt } = await import("../src/browser/conversation.js");
+const { PreSubmitInteractionError } = await import("../src/errors.js");
 
 // What the fake composer currently holds. sendPrompt reads the composer back to
 // confirm the whole prompt landed, so a stub that answers a constant string no
@@ -393,6 +394,22 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
     });
     await sendPrompt(page, "hello", true, undefined, async () => { focus = "menu"; });
     expect(page.keyboard.press).toHaveBeenCalledWith("Enter");
+  });
+
+  it("fails the Enter fallback as an uncertain send, never a retryable pre-submit refusal", async () => {
+    // A swallowed send click may already have submitted, so a focus failure here
+    // must not reach the facade as promptSubmitted:false.
+    let clicked = false;
+    requireSelector.mockResolvedValue({ ...fakeLocator(), evaluate: async () => (clicked ? null : true) });
+    firstResolved.mockResolvedValue(fakeLocator({ click: async () => { clicked = true; throw new Error("detached"); } }));
+    const page = fakePage();
+
+    const error = await sendPrompt(page, "hello", true).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(PreSubmitInteractionError);
+    expect(error.message).toContain("composer focus failed after send attempts");
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Enter");
   });
 });
 

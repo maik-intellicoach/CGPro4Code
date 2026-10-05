@@ -200,11 +200,14 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
  */
 function installDiagnostics(context: BrowserContext, page: Page): void {
   const diag = (msg: string) => process.stderr.write(`[cgpro-diag] ${msg}\n`);
-  const path = (url: string) => url.split("?")[0].slice(0, 160);
+  // Query strings and fragments can carry tokens (the user websocket's `verify=`),
+  // so they never reach the log, in URLs or in free browser text.
+  const redact = (text: string) => text.replace(/[?#][^\s'"]*/g, "?…");
+  const path = (url: string) => redact(url).slice(0, 160);
   context.on("console", (m) => {
-    if (m.type() === "error" || m.type() === "warning") diag(`console.${m.type()} ${m.text().slice(0, 240)}`);
+    if (m.type() === "error" || m.type() === "warning") diag(`console.${m.type()} ${redact(m.text()).slice(0, 240)}`);
   });
-  context.on("weberror", (e) => diag(`pageerror ${e.error().message.slice(0, 240)}`));
+  context.on("weberror", (e) => diag(`pageerror ${redact(e.error().message).slice(0, 240)}`));
   context.on("requestfailed", (r) => diag(`requestfailed ${r.method()} ${path(r.url())} ${r.failure()?.errorText}`));
   context.on("response", (r) => {
     if (r.status() >= 400) diag(`http ${r.status()} ${r.request().method()} ${path(r.url())}`);

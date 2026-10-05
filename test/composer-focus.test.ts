@@ -32,7 +32,7 @@ interface Scenario {
  * A composer that holds only the chip. `focusable: false` models a host whose
  * focus() does not take; `cornerHit` says what each corner probe hits.
  */
-function scenario(options: { focusable?: boolean; cornerHit?: "chip" | "host"; navigateOnFocus?: boolean } = {}): Scenario {
+function scenario(options: { focusable?: boolean; cornerHit?: "chip" | "host"; navigateOnFocus?: boolean; clickFocuses?: boolean } = {}): Scenario {
   const state = { url: PROJECT_URL, active: null as unknown };
   const presses: string[] = [];
   const chip = {
@@ -61,6 +61,7 @@ function scenario(options: { focusable?: boolean; cornerHit?: "chip" | "host"; n
     // The centre click: on this composer it lands on the chip and follows it.
     click: vi.fn(async (opts?: { position?: unknown }) => {
       if (!opts?.position) state.url = PLUGIN_URL;
+      else if (options.clickFocuses !== false) state.active = host;
     }),
     evaluate: vi.fn(async (fn: Function, arg: unknown) =>
       runInNewContext(`(${fn.toString()})(element, arg)`, { element: host, arg, document, window })),
@@ -122,6 +123,20 @@ describe("composer focus never follows the plugin-chip link (P-035 2026-10-05)",
     expect(s.composer.click).toHaveBeenCalledTimes(1);
     expect(s.composer.click.mock.calls[0][0]).toMatchObject({ position: { x: 394, y: 34 } });
     expect(s.state.url).toBe(PROJECT_URL);
+    expect(s.state.active).not.toBeNull();
+    expect(s.presses).toEqual(["Meta+A", "Backspace"]);
+  });
+
+  it("refuses before any keystroke when the fallback click leaves focus elsewhere", async () => {
+    const s = scenario({ focusable: false, cornerHit: "host", clickFocuses: false });
+    requireSelector.mockResolvedValue(s.composer);
+
+    const error = await clearComposer(s.page).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(PreSubmitInteractionError);
+    expect(error).toMatchObject({ code: "prompt_delivery_incomplete", phase: "prompt_delivery", promptSubmitted: false });
+    expect(s.composer.click).toHaveBeenCalledTimes(1);
+    expect(s.presses).toEqual([]);
   });
 
   it("names a navigation during the focus as a typed pre-submit failure, not a missing composer", async () => {
@@ -132,7 +147,7 @@ describe("composer focus never follows the plugin-chip link (P-035 2026-10-05)",
     const error = await clearComposer(s.page, guard).catch((caught) => caught);
 
     expect(error).toBeInstanceOf(PreSubmitInteractionError);
-    expect(error).toMatchObject({ code: "chat_surface_unconfirmed", phase: "prompt_delivery", promptSubmitted: false });
+    expect(error).toMatchObject({ code: "chat_surface_unconfirmed", phase: "model_verification", promptSubmitted: false });
     expect(error.message).toContain("/plugins");
     // Only the guard before the focus ran; nothing was typed on the plugin page.
     expect(guard).toHaveBeenCalledTimes(1);
