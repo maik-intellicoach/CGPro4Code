@@ -85,6 +85,7 @@ function fakePage(dropAfter = Infinity, dropFirst = 0): Page {
       insertText: vi.fn(async (text: string) => write(text)),
     },
     waitForTimeout: vi.fn(async () => {}),
+    url: () => "https://chatgpt.com/g/g-p-test/project",
     // The refusal path captures page state before throwing. It must never be the
     // reason a turn fails, so the real one is wrapped in .catch() and this stub
     // only has to exist.
@@ -383,7 +384,8 @@ describe("sendPrompt send-button fallback (C-092 H2)", () => {
 
   it("restores composer focus for Enter after verification moved focus into a menu", async () => {
     let focus = "none";
-    requireSelector.mockResolvedValue(fakeLocator({ click: async () => { focus = "composer"; } }));
+    // P-035 2026-10-05. Focus returns through the in-page focus, not a centre click.
+    requireSelector.mockResolvedValue({ ...fakeLocator(), evaluate: async () => { focus = "composer"; return true; } });
     firstResolved.mockResolvedValue(fakeLocator({ click: async () => { throw new Error("detached"); } }));
     const page = fakePage();
     vi.mocked(page.keyboard.press).mockImplementation(async (key) => {

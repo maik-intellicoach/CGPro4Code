@@ -24,6 +24,20 @@ interface FakeRow {
   onSelected?: () => void;
   /** Exact-label pill mounted in the same form as the prompt textarea. */
   inComposer?: boolean;
+  /** P-035 2026-10-05. Entry in the left rail (Customize > Plugins). */
+  inNav?: boolean;
+  /** P-035 2026-10-05. Href of the nearest enclosing anchor, if any. */
+  href?: string;
+  /** Distinguishes same-label rows in `clickedLabels`. */
+  id?: string;
+}
+
+/** DOM `closest` over a fake row, for the selectors the lookups use. */
+function fakeClosest(row: FakeRow, selector: string): unknown {
+  if (selector === "form") return row.inComposer ? { querySelector: () => ({}) } : null;
+  if (selector.includes("nav")) return row.inNav ? {} : null;
+  if (selector.includes("/plugins/")) return row.href?.includes("/plugins/") ? {} : null;
+  return null;
 }
 
 const firstResolved = vi.fn();
@@ -34,7 +48,8 @@ const plus = {
 
 vi.mock("../src/browser/chatgpt.js", () => ({
   firstResolved: (...args: unknown[]) => firstResolved(...args),
-  requireSelector: vi.fn(async () => ({ click: vi.fn(async () => {}) })),
+  // P-035 2026-10-05. The composer is focused in-page, never clicked.
+  requireSelector: vi.fn(async () => ({ click: vi.fn(async () => {}), evaluate: vi.fn(async () => true) })),
 }));
 
 const { attachedState, setConnector } = await import("../src/browser/conversation.js");
@@ -72,6 +87,7 @@ function makePage() {
       type: vi.fn(async () => {}),
     },
     waitForTimeout: vi.fn(async () => {}),
+    url: () => "https://chatgpt.com/g/g-p-test/project",
     clickedLabels: [] as string[],
     locator: () => makeCandidates(),
   } as unknown as Page & { keyboard: { press: ReturnType<typeof vi.fn> } };
@@ -100,7 +116,7 @@ function makePage() {
     locator: () => rowLoc(row?.parent),
     click: async () => {
       if (row) {
-        page.clickedLabels.push(row.label);
+        page.clickedLabels.push(row.id ?? row.label);
         await row.onSelected?.();
       }
     },
@@ -111,7 +127,7 @@ function makePage() {
     get parentElement() {
       return row.parent ? domRow(row.parent) : null;
     },
-    closest: (selector: string) => (selector === "form" && row.inComposer ? { querySelector: () => ({}) } : null),
+    closest: (selector: string) => fakeClosest(row, selector),
   });
 
   const devLoc = () => ({
@@ -133,6 +149,7 @@ function makePage() {
       return fn(sourceRows.map((row) => ({
         getBoundingClientRect: () => (row.visible ? { width: 10, height: 10 } : { width: 0, height: 0 }),
         checkVisibility: () => row.visible,
+        closest: (selector: string) => fakeClosest(row, selector),
         get innerText() {
           innerTextReads.push(row.label);
           return row.label;
@@ -679,5 +696,47 @@ describe("failed connector click clears its typed @ (r33)", () => {
     // Three pre-attach guards plus the three the cleanup runs: the cleanup is
     // guarded exactly like the picker-missing branch, not only its presses.
     expect(vi.mocked(page.evaluate).mock.calls).toHaveLength(6);
+  });
+});
+
+// P-035 2026-10-05. In ChatGPT's Plugins UI the connector chip in the composer
+// and the left rail's Customize > Plugins entry are links to `/plugins/<id>`:
+// clicking either navigates away from the Project (ms1980 `visible picker
+// entries=[]` after `first-click-done`; intelli's click-timeout on
+// `span ... .nth(2)`). Only the @-picker row may be clicked.
+describe("connector clicks only ever target the @-picker row (P-035 2026-10-05)", () => {
+  it("treats the lane's own composer-mounted chip as attached and never clicks it", async () => {
+    const scenario = makePage();
+    scenario.setRows([
+      { label: "connector", visible: true, attrs: {}, inComposer: true, href: "/plugins/plugin_asdk_app_x", id: "chip" },
+    ]);
+    const { page } = scenario;
+
+    await expect(setConnector(page, "connector")).resolves.toBeUndefined();
+
+    expect(page.clickedLabels).toEqual([]);
+    expect(page.keyboard.press).toHaveBeenCalledWith("Escape");
+  });
+
+  it("skips sidebar entries and /plugins/ links outside the composer and clicks the picker row", async () => {
+    const scenario = makePage();
+    scenario.setRows([
+      { label: "connector", visible: true, attrs: {}, inNav: true, href: "/plugins/plugin_asdk_app_x", id: "sidebar" },
+      { label: "connector", visible: true, attrs: {}, href: "/plugins/plugin_asdk_app_x", id: "plugin-link" },
+      {
+        label: "connector",
+        visible: true,
+        attrs: {},
+        id: "picker",
+        onSelected: () => scenario.setRows([
+          { label: "connector", visible: true, attrs: {}, inComposer: true, href: "/plugins/plugin_asdk_app_x", id: "chip" },
+        ]),
+      },
+    ]);
+    const { page } = scenario;
+
+    await expect(setConnector(page, "connector")).resolves.toBeUndefined();
+
+    expect(page.clickedLabels).toEqual(["picker"]);
   });
 });

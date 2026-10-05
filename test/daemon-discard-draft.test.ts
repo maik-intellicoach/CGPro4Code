@@ -63,6 +63,9 @@ function fixture(initial: Partial<Surface> = {}) {
     querySelectorAll: () => (state.expand ? [control] : []),
   };
   const click = vi.fn(async () => {});
+  // P-035 2026-10-05. The clear focuses the composer in-page; a centre click
+  // could follow the connector chip's /plugins/ link.
+  const focus = vi.fn(async () => true);
   const composer = {
     isConnected: true,
     getClientRects: () => [{}],
@@ -76,6 +79,7 @@ function fixture(initial: Partial<Surface> = {}) {
     getAttribute: () => null,
     querySelectorAll: () => [],
     click,
+    evaluate: focus,
   };
   const document = {
     body: { childNodes: [composer] },
@@ -135,7 +139,7 @@ function fixture(initial: Partial<Surface> = {}) {
       NodeFilter: { SHOW_TEXT: 4 },
     })),
   } as unknown as Page;
-  return { state, page, composer, click, presses };
+  return { state, page, composer, click, focus, presses };
 }
 interface Surface {
   chip: string | null;
@@ -221,11 +225,12 @@ describe("POST /discard-owned-draft", () => {
   });
 
   it("issues the clear only after the ownership proof, and only once", async () => {
-    const { page, presses, click } = fixture();
+    const { page, presses, click, focus } = fixture();
     const result = await discard(stateFor(page), { connector: CONNECTOR, text: TEXT });
     expect(result.status).toBe(200);
     expect(presses).toEqual(["Meta+A", "Backspace"]);
-    expect(click).toHaveBeenCalledTimes(1);
+    expect(focus).toHaveBeenCalledTimes(1);
+    expect(click).not.toHaveBeenCalled();
   });
 
   // P-035 2026-09-28 r24. ChatGPT marks each paragraph our automation pasted
@@ -251,14 +256,15 @@ describe("POST /discard-owned-draft", () => {
   it("clears an exact multi-line pasted prompt whose rendered breaks differ", async () => {
     const source = "line one\nline two\nline three";
     const rendered = "line one\n\nline two\n\nline three";
-    const { page, presses, click } = fixture({ text: rendered, rich: [{
+    const { page, presses, click, focus } = fixture({ text: rendered, rich: [{
       tagName: "P", attributes: [{ name: "data-prompt-literal-paste", value: "" }], textContent: rendered,
     }] });
     const result = await discard(stateFor(page), { connector: CONNECTOR, text: source });
     expect(result.status).toBe(200);
     expect(JSON.parse(result.body)).toEqual({ cleared: true });
     expect(presses).toEqual(["Meta+A", "Backspace"]);
-    expect(click).toHaveBeenCalledTimes(1);
+    expect(focus).toHaveBeenCalledTimes(1);
+    expect(click).not.toHaveBeenCalled();
   });
 
   it("refuses one extra character in the draft and touches nothing", async () => {
@@ -369,13 +375,14 @@ describe("POST /discard-owned-draft provenance mode", () => {
     `${HEADER}\nUSER: ${request}\n${MARKER}\ninvocation_id="${UUID}"`;
 
   it("clears a composed draft proven by header, marker and invocation id", async () => {
-    const { page, presses, click } = fixture({ text: composed() });
+    const { page, presses, click, focus } = fixture({ text: composed() });
     const result = await discard(stateFor(page), { connector: CONNECTOR, prefix: HEADER, marker: MARKER });
     expect(result.status).toBe(200);
     expect(JSON.parse(result.body)).toEqual({ cleared: true });
     // Proof before the clear, and one clear only.
     expect(presses).toEqual(["Meta+A", "Backspace"]);
-    expect(click).toHaveBeenCalledTimes(1);
+    expect(focus).toHaveBeenCalledTimes(1);
+    expect(click).not.toHaveBeenCalled();
     // The lane was re-proven empty after a fresh home.
     expect(goHome).toHaveBeenCalledTimes(2);
   });
@@ -495,7 +502,7 @@ describe("POST /discard-owned-draft provenance mode", () => {
     const serialised = `${CONNECTOR} ${composed()}`;
 
     it("clears a composed draft whose hidden mirror carries the whole serialised copy", async () => {
-      const { page, presses, click } = fixture({
+      const { page, presses, click, focus } = fixture({
         text: composed(), mirror: { text: serialised, ariaHidden: true },
       });
       const result = await discard(stateFor(page), { connector: CONNECTOR, prefix: HEADER, marker: MARKER });
@@ -504,7 +511,8 @@ describe("POST /discard-owned-draft provenance mode", () => {
       // Proof before the clear, one clear only, and the lane re-proven empty
       // after a fresh home (the mirror went with the draft).
       expect(presses).toEqual(["Meta+A", "Backspace"]);
-      expect(click).toHaveBeenCalledTimes(1);
+      expect(focus).toHaveBeenCalledTimes(1);
+      expect(click).not.toHaveBeenCalled();
       expect(goHome).toHaveBeenCalledTimes(2);
     });
 
@@ -546,7 +554,7 @@ describe("POST /discard-owned-draft provenance mode", () => {
       + `invocation_id\\="${UUID}"`;
 
     it("clears a composed draft whose hidden mirror is a Markdown-escaped copy", async () => {
-      const { page, presses, click } = fixture({
+      const { page, presses, click, focus } = fixture({
         text: composed(), mirror: { text: escaped(), ariaHidden: true },
       });
       const result = await discard(stateFor(page), { connector: CONNECTOR, prefix: HEADER, marker: MARKER });
@@ -555,7 +563,8 @@ describe("POST /discard-owned-draft provenance mode", () => {
       // Proof before the clear, one clear only, and the lane re-proven empty
       // after a fresh home (the escaped mirror went with the draft).
       expect(presses).toEqual(["Meta+A", "Backspace"]);
-      expect(click).toHaveBeenCalledTimes(1);
+      expect(focus).toHaveBeenCalledTimes(1);
+      expect(click).not.toHaveBeenCalled();
       expect(goHome).toHaveBeenCalledTimes(2);
     });
 

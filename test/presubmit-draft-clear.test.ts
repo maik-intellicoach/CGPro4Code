@@ -73,6 +73,7 @@ function fakePage(state: ComposerState, options: { ignoreClear?: boolean } = {})
       type: vi.fn(async (text: string) => { state.text += text; }),
     },
     waitForTimeout: vi.fn(async () => {}),
+    url: () => "https://chatgpt.com/g/g-p-test/project",
     evaluate: vi.fn(async (fn: Function, arg: unknown) => {
       if (!state.readable) throw new Error("synthetic evaluation failure with private content");
       const mention = state.mention ?? "";

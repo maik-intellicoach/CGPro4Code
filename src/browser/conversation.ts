@@ -4,7 +4,7 @@ import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "
 import { deepResearchQuota, parseDeepResearchExhausted, parseDeepResearchRemaining, recordDeepResearchExhausted, recordDeepResearchRow, recordDeepResearchTooltip, type DeepResearchQuota } from "./deep-research-quota.js";
 import { listProjects } from "../api/projects.js";
 import { fetchModelsWithReason, findProModel, type ChatgptModel } from "../api/models.js";
-import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, type ReplyStalledDetails, ReplyStalledError, SelectorBrokenError, type SubmittedTurnNotRenderedDetails, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../errors.js";
+import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, type PreSubmitInteractionPhase, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, type ReplyStalledDetails, ReplyStalledError, SelectorBrokenError, type SubmittedTurnNotRenderedDetails, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation, streamBreakCount } from "../core/stream.js";
 
 /**
@@ -2048,7 +2048,20 @@ export function exactConnectorLabelIndex(labels: string[], name: string): number
  */
 const PICKER_READ_TIMEOUT_MS = 1_000;
 
-async function visibleComposerTool(page: Page, name: string): Promise<Locator | null> {
+/**
+ * P-035 2026-10-05. Which exact-label elements a lookup may return. In the
+ * Plugins UI the connector chip in the composer is a link to `/plugins/<id>`,
+ * and the left rail's Customize > Plugins list repeats the name: clicking
+ * either navigates away (ms1980 `visible picker entries=[]` after
+ * `first-click-done`; intelli's attempt-1/2 click on `span ... .nth(2)`). A
+ * row about to be CLICKED is resolved with "exclude", so only the @-picker row
+ * qualifies; attachment checks use "include", which also admits the composer
+ * chip as proof. Sidebar entries and `/plugins/` links outside the composer
+ * never qualify.
+ */
+type ComposerChipScope = "exclude" | "include";
+
+async function visibleComposerTool(page: Page, name: string, chips: ComposerChipScope = "exclude"): Promise<Locator | null> {
   // Let the browser narrow the DOM before crossing the automation boundary, then
   // decide visibility and the exact label in ONE in-page pass per selector.
   // Previews of earlier Project chats ("@<connector> SYSTEM: ...") also contain
@@ -2059,13 +2072,20 @@ async function visibleComposerTool(page: Page, name: string): Promise<Locator | 
   const matchingCandidate = async (selector: string): Promise<Locator | null> => {
     const candidates = page.locator(selector).filter({ hasText: name });
     const [index, scanned] = await candidates
-      .evaluateAll((elements, label) => [elements.findIndex((element) => {
+      .evaluateAll((elements, [label, allowChip]) => [elements.findIndex((element) => {
         const el = element as HTMLElement;
         const box = el.getBoundingClientRect();
-        return box.width > 0 && box.height > 0 &&
+        if (!(box.width > 0 && box.height > 0 &&
           el.checkVisibility({ visibilityProperty: true }) &&
-          el.innerText.replace(/\s+/g, " ").trim().toLocaleLowerCase() === label;
-      }), elements.length], expected)
+          el.innerText.replace(/\s+/g, " ").trim().toLocaleLowerCase() === label)) return false;
+        // Same composer proof as `isComposerMountedTool`.
+        const inComposer = Boolean(el.closest("form")?.querySelector(
+          "#prompt-textarea, [data-testid=\"prompt-textarea\"], [data-composer-markdown]",
+        ));
+        if (inComposer) return allowChip;
+        return el.closest('nav, aside, [role="navigation"]') === null
+          && el.closest('a[href*="/plugins/"]') === null;
+      }), elements.length], [expected, chips === "include"] as const)
       .catch(() => [-1, 0]);
     // Diagnostic for the picker-click stall (P-035 2026-09-26): how many page
     // elements a locator that resolves by this filter must scan.
@@ -2084,10 +2104,12 @@ async function visibleComposerTool(page: Page, name: string): Promise<Locator | 
   return matchingCandidate("span");
 }
 
-async function waitForComposerTool(page: Page, name: string, timeoutMs = 8_000): Promise<Locator | null> {
+async function waitForComposerTool(
+  page: Page, name: string, timeoutMs = 8_000, chips: ComposerChipScope = "exclude",
+): Promise<Locator | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const tool = await visibleComposerTool(page, name);
+    const tool = await visibleComposerTool(page, name, chips);
     if (tool) return tool;
     await page.waitForTimeout(250);
   }
@@ -2239,13 +2261,13 @@ async function assertConnectorAttached(page: Page, connectorName: string): Promi
   const notAttached = (detail: string): string =>
     `ChatGPT connector "${connectorName}" was clicked but never became attached to the composer (${detail}).`;
 
-  let row = await visibleComposerTool(page, connectorName);
+  let row = await visibleComposerTool(page, connectorName, "include");
   if (row && (await isComposerMountedTool(row))) return;
   if (!row) {
     // The picker is gone - reopen the composer "+" tools popover, where an
     // attached tool row reports its checked state.
     const composer = await requireSelector(page, SELECTORS.composer, "composer");
-    await composer.click();
+    await focusComposer(page, composer, "connector_selection");
     if (!(await openComposerToolsPopover(page))) {
       await recordConnectorDiagnostics(page);
       throw new Error(notAttached("composer tools popover did not open"));
@@ -2253,7 +2275,7 @@ async function assertConnectorAttached(page: Page, connectorName: string): Promi
     // Direct row first: a non-MCP connector can be directly visible and
     // attached in the reopened popover alongside a Developer-mode entry.
     // Accept it before entering Developer mode, which can clear the row.
-    row = await visibleComposerTool(page, connectorName);
+    row = await visibleComposerTool(page, connectorName, "include");
     if (row && ((await isComposerMountedTool(row)) || (await attachedState(row)))) {
       await page.keyboard.press("Escape").catch(() => undefined);
       return;
@@ -2267,7 +2289,7 @@ async function assertConnectorAttached(page: Page, connectorName: string): Promi
       await developerMode.click({ timeout: 5_000 });
       await page.waitForTimeout(300);
     }
-    row = await waitForComposerTool(page, connectorName, 5_000);
+    row = await waitForComposerTool(page, connectorName, 5_000, "include");
     if (!row) {
       await recordConnectorDiagnostics(page);
       throw new Error(notAttached("no exact-label row for the requested tool in the reopened picker"));
@@ -2303,6 +2325,21 @@ function clickStallReason(error: Error): string {
     .slice(-2).join(" | ").slice(0, 240) || "no call log";
 }
 
+/**
+ * P-035 2026-10-05. The only row a connector click may target: an @-picker
+ * row, never the composer chip, a sidebar entry or a `/plugins/` link (see
+ * {@link ComposerChipScope}). None left to click is a typed pre-submit stop.
+ */
+async function pickerRowToClick(page: Page, name: string): Promise<Locator> {
+  const row = await visibleComposerTool(page, name, "exclude");
+  if (row) return row;
+  throw new PreSubmitInteractionError(
+    "connector_control_activation_timeout",
+    "connector_selection",
+    `ChatGPT connector "${name}" has no picker row to click outside the composer`,
+  );
+}
+
 async function clickConnector(page: Page, row: Locator, name: string): Promise<void> {
   const clickStart = Date.now();
   const mark = (what: string) => console.error(`[cgpro:connector] click-sub ${what} ms=${Date.now() - clickStart}`);
@@ -2316,7 +2353,7 @@ async function clickConnector(page: Page, row: Locator, name: string): Promise<v
     // attachment that mounted while the first click was timing out.
     if (!(error instanceof Error) || !error.message.includes("Timeout")) throw error;
     console.error(`[cgpro:connector] click-timeout attempt=1 reason=${clickStallReason(error)}`);
-    const refreshed = await waitForComposerTool(page, name);
+    const refreshed = await waitForComposerTool(page, name, 8_000, "include");
     mark(`refresh-lookup found=${Boolean(refreshed)}`);
     if (!refreshed) {
       throw new PreSubmitInteractionError(
@@ -2327,12 +2364,13 @@ async function clickConnector(page: Page, row: Locator, name: string): Promise<v
       );
     }
     if (await isComposerMountedTool(refreshed) || await attachedState(refreshed)) return;
+    const retryRow = await pickerRowToClick(page, name);
     try {
-      await refreshed.click({ timeout: 5_000 });
+      await retryRow.click({ timeout: 5_000 });
     } catch (retryError) {
       if (!(retryError instanceof Error) || !retryError.message.includes("Timeout")) throw retryError;
       console.error(`[cgpro:connector] click-timeout attempt=2 reason=${clickStallReason(retryError)}`);
-      const finalRow = await waitForComposerTool(page, name);
+      const finalRow = await waitForComposerTool(page, name, 8_000, "include");
       if (finalRow && (await isComposerMountedTool(finalRow) || await attachedState(finalRow))) return;
       throw new PreSubmitInteractionError(
         "connector_control_activation_timeout",
@@ -2356,7 +2394,7 @@ async function clickConnector(page: Page, row: Locator, name: string): Promise<v
 async function clearTypedConnectorQuery(page: Page, composer: Locator, protectDraft: boolean): Promise<void> {
   if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
   await page.keyboard.press("Escape").catch(() => undefined);
-  await composer.click();
+  await focusComposer(page, composer, "connector_selection");
   if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
   await page.keyboard.press("Meta+A");
   if (protectDraft) await assertPreflightDraftSafe(page, { text: "@" });
@@ -2386,7 +2424,7 @@ export async function setConnector(page: Page, name: string, protectDraft = fals
   // steps that clear it actually run. The `{ text: "@" }` guards below are
   // unchanged: they judge a different, already-cleared surface.
   if (protectDraft) await assertPreflightDraftSafe(page, { connector: connectorName });
-  await composer.click();
+  await focusComposer(page, composer, "connector_selection");
   if (protectDraft) await assertPreflightDraftSafe(page, { connector: connectorName });
   await page.keyboard.press("Meta+A");
   if (protectDraft) await assertPreflightDraftSafe(page, { connector: connectorName });
@@ -2395,18 +2433,20 @@ export async function setConnector(page: Page, name: string, protectDraft = fals
   await page.waitForTimeout(300);
   step("at-sign-typed");
 
-  let connector = await waitForComposerTool(page, connectorName);
+  let connector = await waitForComposerTool(page, connectorName, 8_000, "include");
   step("picker-wait");
   if (connector) {
     // Already attached - skip the click (clicking an attached row can
-    // toggle it off) and accept the honest state.
-    if (await attachedState(connector)) {
+    // toggle it off) and accept the honest state. P-035 2026-10-05: a chip
+    // mounted in the composer is attached too, and clicking it follows its
+    // `/plugins/` link.
+    if ((await attachedState(connector)) || (await isComposerMountedTool(connector))) {
       await page.keyboard.press("Escape").catch(() => undefined);
       step("already-attached");
       return;
     }
     try {
-      await clickConnector(page, connector, connectorName);
+      await clickConnector(page, await pickerRowToClick(page, connectorName), connectorName);
       step("picker-click");
       await page.waitForTimeout(300);
       await assertConnectorAttached(page, connectorName);
@@ -2447,7 +2487,7 @@ export async function setConnector(page: Page, name: string, protectDraft = fals
     throw new Error(`ChatGPT connector picker is unavailable; could not select "${connectorName}".`);
   }
 
-  connector = await visibleComposerTool(page, connectorName);
+  connector = await visibleComposerTool(page, connectorName, "include");
   if (!connector) {
     // Personal Pro custom MCP connectors live behind the distinct
     // "Developer mode" entry in the plus menu. They are connected apps but
@@ -2459,7 +2499,7 @@ export async function setConnector(page: Page, name: string, protectDraft = fals
     if ((await developerMode.count().catch(() => 0)) > 0 && (await developerMode.isVisible().catch(() => false))) {
       await developerMode.click({ timeout: 5_000 });
       await page.waitForTimeout(300);
-      connector = await waitForComposerTool(page, connectorName);
+      connector = await waitForComposerTool(page, connectorName, 8_000, "include");
     }
   }
   if (!connector) {
@@ -2478,7 +2518,7 @@ export async function setConnector(page: Page, name: string, protectDraft = fals
       // root; it has no fillable textbox in the DOM.
       await page.keyboard.type(connectorName);
     }
-    connector = await waitForComposerTool(page, connectorName);
+    connector = await waitForComposerTool(page, connectorName, 8_000, "include");
   }
   if (!connector) {
     // Some ChatGPT builds put installed apps one level below the main
@@ -2491,7 +2531,7 @@ export async function setConnector(page: Page, name: string, protectDraft = fals
     if ((await gateway.count().catch(() => 0)) > 0 && (await gateway.isVisible().catch(() => false))) {
       await gateway.click({ timeout: 5_000 });
       await page.waitForTimeout(300);
-      connector = await visibleComposerTool(page, connectorName);
+      connector = await visibleComposerTool(page, connectorName, "include");
     }
   }
 
@@ -2502,13 +2542,14 @@ export async function setConnector(page: Page, name: string, protectDraft = fals
   }
 
   // Already attached: the row reports the mounted state - skip the click.
-  if (await attachedState(connector)) {
+  // P-035 2026-10-05: so does a composer-mounted chip, which must never be clicked.
+  if ((await attachedState(connector)) || (await isComposerMountedTool(connector))) {
     await page.keyboard.press("Escape").catch(() => undefined);
     return;
   }
 
   try {
-    await clickConnector(page, connector, connectorName);
+    await clickConnector(page, await pickerRowToClick(page, connectorName), connectorName);
   } catch (error) {
     if (!protectDraft) await recordConnectorDiagnostics(page);
     await page.keyboard.press("Escape").catch(() => undefined);
@@ -3869,7 +3910,7 @@ export async function assertPreflightDraftSafe(
 export async function clearComposer(page: Page, guard?: () => Promise<void>): Promise<void> {
   await guard?.();
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
-  await composer.click();
+  await focusComposer(page, composer, "prompt_delivery");
   await guard?.();
   await page.keyboard.press("Meta+A");
   await guard?.();
@@ -3912,7 +3953,7 @@ export async function sendPrompt(
     .catch(() => 0);
   if (cancelled?.()) return assistantCount();
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
-  await composer.click();
+  await focusComposer(page, composer, "prompt_delivery");
   await page.waitForTimeout(120);
   // Connector/plugin menus can route keyboard search text into the composer
   // on some ChatGPT builds. Always replace the composer contents so a failed
@@ -3985,7 +4026,7 @@ export async function sendPrompt(
     // The final model check moves focus into a menu. Re-resolve the composer
     // before the keyboard fallback instead of pressing Enter on that menu.
     const currentComposer = await requireSelector(page, SELECTORS.composer, "composer");
-    await currentComposer.click();
+    await focusComposer(page, currentComposer, "prompt_delivery");
     if (!cancelled?.()) await page.keyboard.press("Enter");
   }
   return priorAssistantCount;
@@ -4047,7 +4088,7 @@ async function discardOwnedPresubmitDraft(
     }
     // Playwright's own keyboard, scoped to the composer this call focused:
     // select the whole draft, then delete it.
-    await composer.click();
+    await focusComposer(page, composer, "prompt_delivery");
     await page.keyboard.press("Meta+A");
     await page.keyboard.press("Delete");
     const remaining = await readComposer(page, composer);
@@ -4250,7 +4291,7 @@ export async function probePromptDelivery(
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
   const guard = ownedConnector === undefined ? undefined : () => assertPreflightDraftSafe(page, { connector: ownedConnector });
   await guard?.();
-  await composer.click();
+  await focusComposer(page, composer, "prompt_delivery");
   await page.waitForTimeout(120);
   await clearComposer(page, guard);
   if (guard) await assertPreflightDraftSafe(page);
@@ -4382,6 +4423,75 @@ async function focusComposerEnd(page: Page, composer: Locator): Promise<boolean>
 }
 
 const COMPOSER_CARET_ATTEMPTS = Math.max(1, Number(process.env.CGPRO_COMPOSER_CARET_ATTEMPTS ?? 3));
+
+/**
+ * Focus the composer without a pointer click on its centre.
+ *
+ * P-035 2026-10-05. ChatGPT renamed connectors to Plugins, and the connector
+ * chip in the composer is now a link to `/plugins/<id>`. When the composer
+ * holds only that chip its centre IS the chip, so `composer.click()` followed
+ * the link: every ms1980 preflight from 2026-10-03 19:12 +08 landed on the
+ * "Customize" plugin page and the next guard refused `composer_count:0`.
+ *
+ * Focus the editable host in-page and collapse the caret to its end (the same
+ * move `focusComposerEnd` proved on 2026-09-17), so Meta+A then Backspace still
+ * clear a chip. Only if that focus fails is there a click, and only at a corner
+ * point proven to hit the composer outside any anchor or non-editable chip. A
+ * URL change across the focus is a typed pre-submit failure, not a missing
+ * composer.
+ */
+export async function focusComposer(page: Page, composer: Locator, phase: PreSubmitInteractionPhase): Promise<void> {
+  const before = page.url();
+  const focused = await composer.evaluate((element) => {
+    const host = element as HTMLElement;
+    host.focus();
+    if (host.tagName === "TEXTAREA") {
+      const area = host as HTMLTextAreaElement;
+      area.setSelectionRange(area.value.length, area.value.length);
+    } else {
+      const range = document.createRange();
+      range.selectNodeContents(host.lastElementChild ?? host);
+      range.collapse(false);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    }
+    return document.activeElement === host;
+  }, undefined, { timeout: PICKER_READ_TIMEOUT_MS }).catch(() => false);
+  if (!focused) {
+    const point = await composer.evaluate((element) => {
+      const box = element.getBoundingClientRect();
+      const inset = 6;
+      for (const [x, y] of [
+        [box.width - inset, box.height - inset], [inset, box.height - inset],
+        [box.width - inset, inset], [inset, inset],
+      ]) {
+        if (x <= 0 || y <= 0) continue;
+        const hit = document.elementFromPoint(box.left + x, box.top + y);
+        if (hit && element.contains(hit) && hit.closest('a, [contenteditable="false"]') === null) return { x, y };
+      }
+      return null;
+    }, undefined, { timeout: PICKER_READ_TIMEOUT_MS }).catch(() => null);
+    if (!point) {
+      throw new PreSubmitInteractionError(
+        "prompt_delivery_incomplete",
+        phase,
+        "ChatGPT composer could not be focused without clicking a link or chip",
+      );
+    }
+    await composer.click({ position: point, timeout: 5_000 });
+  }
+  const after = page.url();
+  if (after !== before) {
+    let where = "unknown";
+    try { where = new URL(after).pathname.split("/")[1] ?? ""; } catch { /* unparsable stays unknown */ }
+    throw new PreSubmitInteractionError(
+      "chat_surface_unconfirmed",
+      phase,
+      `ChatGPT composer focus navigated away from the chat surface (to /${where})`,
+    );
+  }
+}
 
 /**
  * Refuse to send a prompt the composer does not actually hold.

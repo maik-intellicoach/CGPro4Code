@@ -61,6 +61,7 @@ describe("composer paste delivery", () => {
         insertText: vi.fn(async (text: string) => { composed += text; }),
       },
       waitForTimeout: vi.fn(async () => {}),
+      url: () => "https://chatgpt.com/g/g-p-test/project",
       evaluate: vi.fn(async () => '{"stub":true}'),
     } as unknown as Page;
   }
@@ -258,6 +259,7 @@ describe("composer paste delivery", () => {
             insertText: vi.fn(async (text: string) => { composed += text; }),
           },
           waitForTimeout: vi.fn(async () => {}),
+          url: () => "https://chatgpt.com/g/g-p-test/project",
           evaluate: vi.fn(async () => '{"stub":true}'),
         } as unknown as Page;
 
@@ -292,6 +294,7 @@ describe("composer paste delivery", () => {
             insertText: vi.fn(async (text: string) => { composed += text; }),
           },
           waitForTimeout: vi.fn(async () => {}),
+          url: () => "https://chatgpt.com/g/g-p-test/project",
           evaluate: vi.fn(async () => '{"stub":true}'),
         } as unknown as Page;
 

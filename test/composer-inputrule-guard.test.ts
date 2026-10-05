@@ -80,6 +80,7 @@ function fakePage(pasteBody: (body: string) => boolean, onLengthRead?: () => voi
       }),
     },
     waitForTimeout: vi.fn(async () => { sleptSinceRead += 1; }),
+    url: () => "https://chatgpt.com/g/g-p-test/project",
     evaluate: vi.fn(async () => '{"stub":true}'),
   } as unknown as Page;
 }
