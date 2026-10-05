@@ -114,6 +114,11 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
       // P-035 2026-10-05. With `viewport: null` a headless window is 756x435, narrow
       // enough to collapse ChatGPT's desktop layout; give it a desktop-sized window.
       launchArgs.push("--window-size=1440,900");
+      // Headless otherwise reports an 800x600 screen behind a 1440x900 window, which
+      // no real display produces. Mirror what the headed lanes report (W270 PRO,
+      // 31px menu bar), so the account sees one consistent device across modes.
+      // ponytail: fixed display; read the real one if the lanes move machine.
+      launchArgs.push("--screen-info={0,0 2560x1440 workAreaTop=31}");
     }
     context = await chromium.launchPersistentContext(dir, {
       headless,
@@ -166,6 +171,7 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
   }
 
   installFileChooserGuard(context, page);
+  if (process.env.CGPRO_DIAG === "1") installDiagnostics(context, page);
 
   // Enforce the background posture per WINDOW, not once at launch. The first
   // window is parked before this function returns so the caller never races a
@@ -185,6 +191,57 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
       }
     },
   };
+}
+
+/**
+ * P-035 2026-10-05, CGPRO_DIAG=1 only: why a headless app shell can stall unhydrated.
+ * Logs page errors, failed or rejected requests (path only, no query), and a
+ * fingerprint snapshot to stderr so headed and headless launches can be diffed.
+ */
+function installDiagnostics(context: BrowserContext, page: Page): void {
+  const diag = (msg: string) => process.stderr.write(`[cgpro-diag] ${msg}\n`);
+  const path = (url: string) => url.split("?")[0].slice(0, 160);
+  context.on("console", (m) => {
+    if (m.type() === "error" || m.type() === "warning") diag(`console.${m.type()} ${m.text().slice(0, 240)}`);
+  });
+  context.on("weberror", (e) => diag(`pageerror ${e.error().message.slice(0, 240)}`));
+  context.on("requestfailed", (r) => diag(`requestfailed ${r.method()} ${path(r.url())} ${r.failure()?.errorText}`));
+  context.on("response", (r) => {
+    if (r.status() >= 400) diag(`http ${r.status()} ${r.request().method()} ${path(r.url())}`);
+  });
+  for (const delay of [15_000, 60_000]) {
+    setTimeout(() => {
+      page
+        .evaluate(() => {
+          const gl = document.createElement("canvas").getContext("webgl");
+          const dbg = gl?.getExtension("WEBGL_debug_renderer_info");
+          const n = navigator as Navigator & { deviceMemory?: number; userAgentData?: { platform: string } };
+          return {
+            url: location.pathname,
+            webdriver: n.webdriver,
+            platform: n.platform,
+            uaPlatform: n.userAgentData?.platform,
+            cores: n.hardwareConcurrency,
+            memory: n.deviceMemory,
+            languages: n.languages,
+            plugins: n.plugins.length,
+            screen: [screen.width, screen.height, screen.availWidth, screen.availHeight, screen.colorDepth],
+            outer: [outerWidth, outerHeight],
+            inner: [innerWidth, innerHeight],
+            dpr: devicePixelRatio,
+            notification: typeof Notification === "undefined" ? "absent" : Notification.permission,
+            chrome: Object.keys((window as unknown as { chrome?: object }).chrome ?? {}),
+            webgl: dbg ? [gl!.getParameter(dbg.UNMASKED_VENDOR_WEBGL), gl!.getParameter(dbg.UNMASKED_RENDERER_WEBGL)] : null,
+            focus: document.hasFocus(),
+            visibility: document.visibilityState,
+            composer: !!document.querySelector("#prompt-textarea"),
+            sidebarLinks: document.querySelectorAll("nav a").length,
+          };
+        })
+        .then((fp) => diag(`fingerprint@${delay / 1000}s ${JSON.stringify(fp)}`))
+        .catch((err: Error) => diag(`fingerprint@${delay / 1000}s failed ${err.message.slice(0, 160)}`));
+    }, delay).unref();
+  }
 }
 
 /**

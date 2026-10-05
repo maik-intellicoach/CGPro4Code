@@ -154,6 +154,7 @@ describe("headless user agent", () => {
     expect(headlessArgs).toContain(`--user-agent=${headlessUA.replace("HeadlessChrome/", "Chrome/")}`);
     expect(headlessArgs.join(" ")).not.toContain("Headless");
     expect(headlessArgs).toContain("--window-size=1440,900");
+    expect(headlessArgs).toContain("--screen-info={0,0 2560x1440 workAreaTop=31}");
 
     launch.mockClear();
     await openSession({
@@ -166,5 +167,6 @@ describe("headless user agent", () => {
     const headedArgs = launchPersistentContext.mock.lastCall![1].args as string[];
     expect(headedArgs.some((arg) => arg.startsWith("--user-agent"))).toBe(false);
     expect(headedArgs).not.toContain("--window-size=1440,900");
+    expect(headedArgs.some((arg) => arg.startsWith("--screen-info"))).toBe(false);
   });
 });
