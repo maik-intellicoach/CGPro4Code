@@ -109,7 +109,12 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
 
   let context: BrowserContext;
   try {
-    if (headless) launchArgs.push(`--user-agent=${await headedUserAgent(useSystemChrome ? "chrome" : undefined)}`);
+    if (headless) {
+      launchArgs.push(`--user-agent=${await headedUserAgent(useSystemChrome ? "chrome" : undefined)}`);
+      // P-035 2026-10-05. With `viewport: null` a headless window is 756x435, narrow
+      // enough to collapse ChatGPT's desktop layout; give it a desktop-sized window.
+      launchArgs.push("--window-size=1440,900");
+    }
     context = await chromium.launchPersistentContext(dir, {
       headless,
       channel: useSystemChrome ? "chrome" : undefined,
