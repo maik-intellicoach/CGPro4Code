@@ -733,20 +733,17 @@ export async function closeDaemonSession(session: Session): Promise<void> {
 export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<void> {
   log.info(`daemon-server starting (pid=${process.pid})`);
 
-  // Headed by default: the long-standing claim is that chatgpt.com challenges
-  // headless Chromium even with a warmed profile. That claim carries no test
-  // date and predates Chrome 132 removing the separate headless shell, so
-  // CGPRO_HEADLESS=1 exists to MEASURE it on one lane at a time. Absent the
-  // env var nothing changes. Screening evidence must cover several separate
-  // launches and a long turn before anyone considers moving the default; one
-  // lucky pass is not evidence (P-035 D23.s14, 2026-09-17).
+  // CGPRO_HEADLESS=1 launches headless. The daemon itself stays headed when the
+  // variable is absent; P-035's ensure_cgpro_running.sh sets it to 1 by default
+  // since 2026-10-05 (G6), after the UA and screen fingerprint fixes in session.ts
+  // passed screening with real Pro turns.
   const headless = process.env.CGPRO_HEADLESS === "1";
   const session = await openSession({
     headed: !headless,
     profilePath: opts.profile,
     background: opts.background ?? true,
   });
-  if (headless) log.info("launched HEADLESS (CGPRO_HEADLESS=1) - screening mode, not the default");
+  if (headless) log.info("launched HEADLESS (CGPRO_HEADLESS=1)");
 
   let account: { email?: string; plan: string; proModelAvailable: boolean };
   try {
