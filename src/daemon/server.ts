@@ -787,7 +787,9 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
   }
   log.info("auth verified, starting http listener");
 
-  const state = createServerState(session, opts, account);
+  // A headless lane has no window to show or park, so the work posture stays off
+  // (P-035 2026-10-05). Headed lanes get `opts` unchanged.
+  const state = createServerState(session, headless ? { ...opts, background: false } : opts, account);
 
   const server = createServer((req, res) => {
     handleRequest(req, res, state).catch((err: unknown) => {

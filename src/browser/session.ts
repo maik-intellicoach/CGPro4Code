@@ -109,6 +109,7 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
 
   let context: BrowserContext;
   try {
+    if (headless) launchArgs.push(`--user-agent=${await headedUserAgent(useSystemChrome ? "chrome" : undefined)}`);
     context = await chromium.launchPersistentContext(dir, {
       headless,
       channel: useSystemChrome ? "chrome" : undefined,
@@ -125,6 +126,7 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
       timezoneId: Intl.DateTimeFormat().resolvedOptions().timeZone,
       // Intentionally NOT setting userAgent: real Chrome already presents a
       // valid, current UA; pinning it would mismatch sec-ch-ua headers.
+      // Headless is the one exception, handled by `headedUserAgent` above.
       acceptDownloads: false,
       ignoreHTTPSErrors: false,
     });
@@ -178,6 +180,33 @@ export async function openSession(opts: SessionOptions = {}): Promise<Session> {
       }
     },
   };
+}
+
+/**
+ * The UA string the installed Chrome presents when headed, read from the binary
+ * itself so no version number is ever hard-coded.
+ *
+ * P-035 2026-10-05. Headless Chrome names itself "HeadlessChrome/<v>" in the UA
+ * string, and chatgpt.com's edge answers that with a 403 "Just a moment..."
+ * challenge. Screened on Chrome 154 with fresh empty profiles, three cold
+ * launches each: unmodified headless was challenged 3/3; the same launch with
+ * only `--user-agent` fixed reached the ChatGPT app 3/3. The client-hint brands
+ * already read "Google Chrome" in headless on 154, so the UA string is the whole
+ * difference, and a CDP override with brand metadata added nothing. A launch
+ * switch rather than a per-page override, because it also covers workers.
+ *
+ * Costs one short throwaway headless launch (temporary profile, no network),
+ * paid only by headless sessions.
+ */
+export async function headedUserAgent(channel: "chrome" | undefined): Promise<string> {
+  const browser = await chromium.launch({ headless: true, channel });
+  try {
+    const cdp = await browser.newBrowserCDPSession();
+    const { userAgent } = (await cdp.send("Browser.getVersion")) as { userAgent: string };
+    return userAgent.replace("HeadlessChrome/", "Chrome/");
+  } finally {
+    await browser.close();
+  }
 }
 
 /**

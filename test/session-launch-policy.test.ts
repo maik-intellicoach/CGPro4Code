@@ -4,10 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const launchPersistentContext = vi.hoisted(() => vi.fn());
+const launch = vi.hoisted(() => vi.fn());
 const ensureInterceptorInstalled = vi.hoisted(() => vi.fn());
 
 vi.mock("patchright", () => ({
-  chromium: { launchPersistentContext },
+  chromium: { launchPersistentContext, launch },
 }));
 
 vi.mock("../src/core/stream.js", () => ({
@@ -121,5 +122,47 @@ describe("background window posture", () => {
     });
 
     expect(context.newCDPSession).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * P-035 2026-10-05. chatgpt.com's edge challenges the "HeadlessChrome/<v>" UA
+ * string (403 "Just a moment..."), and lets the same headless launch through
+ * once only that string is fixed. Headed launches must stay untouched.
+ */
+describe("headless user agent", () => {
+  const headlessUA =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/154.0.0.0 Safari/537.36";
+
+  it("presents the installed Chrome's headed UA when headless, and changes nothing when headed", async () => {
+    const send = vi.fn(async () => ({ userAgent: headlessUA }));
+    const close = vi.fn(async () => undefined);
+    launch.mockReset().mockResolvedValue({ newBrowserCDPSession: vi.fn(async () => ({ send })), close });
+    const context = { pages: () => [{ on: vi.fn() }], newPage: vi.fn(), close: vi.fn(), on: vi.fn() };
+    launchPersistentContext.mockReset().mockResolvedValue(context);
+
+    await openSession({
+      profilePath: mkdtempSync(join(tmpdir(), "cgpro-headless-ua-")),
+      headed: false,
+      useSystemChrome: true,
+    });
+
+    expect(launch).toHaveBeenCalledWith({ headless: true, channel: "chrome" });
+    expect(send).toHaveBeenCalledWith("Browser.getVersion");
+    expect(close).toHaveBeenCalled();
+    const headlessArgs = launchPersistentContext.mock.lastCall![1].args as string[];
+    expect(headlessArgs).toContain(`--user-agent=${headlessUA.replace("HeadlessChrome/", "Chrome/")}`);
+    expect(headlessArgs.join(" ")).not.toContain("Headless");
+
+    launch.mockClear();
+    await openSession({
+      profilePath: mkdtempSync(join(tmpdir(), "cgpro-headless-ua-")),
+      headed: true,
+      background: false,
+      useSystemChrome: true,
+    });
+    expect(launch).not.toHaveBeenCalled();
+    const headedArgs = launchPersistentContext.mock.lastCall![1].args as string[];
+    expect(headedArgs.some((arg) => arg.startsWith("--user-agent"))).toBe(false);
   });
 });
