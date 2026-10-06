@@ -76,7 +76,7 @@ async function collect(events: AsyncIterable<StreamEvent>): Promise<StreamEvent[
 function session(): Session {
   return {
     context: {},
-    page: { url: () => "https://chatgpt.com/", locator: () => ({ count: async () => 1 }) } as unknown as Page,
+    page: { url: () => "https://chatgpt.com/", locator: () => ({ count: async () => 1 }), waitForTimeout: async () => {} } as unknown as Page,
     close: vi.fn(async () => {}),
   } as unknown as Session;
 }
@@ -890,6 +890,37 @@ describe("runAskOnSession connector contract", () => {
     await expect(runner.result).resolves.toMatchObject({ finalText: "/tmp/path.md" });
     expect(events).toContainEqual({ type: "done", finalText: "/tmp/path.md" });
     // No DOM slug and no finished record -> the r43 mismatch still fires.
+    expect(events).toContainEqual({ type: "tool", name: "model-mismatch", meta: { wanted: "gpt-6-pro", got: null } });
+  });
+
+  // P-035 2026-10-06, invocation 9acb0d39. Connector-off turns never polled the
+  // record, so with no DOM slug every Pro extended-research turn failed got:null.
+  it("takes a connector-off turn's model from the conversation record, keeping DOM text", async () => {
+    waitTurnComplete.mockResolvedValueOnce(undefined);
+    currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
+    latestAssistantModelSlug.mockResolvedValue(null);
+    readLatestAssistantText.mockResolvedValue("dom reply");
+    fetchLatestTurnConnectorState.mockResolvedValue(finishedBackendMessage());
+
+    const runner = runAskOnSession({ prompt: "plan", model: "gpt-6-pro", timeoutSec: 1_200, headless: false }, session());
+    const events = await collect(runner.events);
+    await expect(runner.result).resolves.toMatchObject({ finalText: "dom reply" });
+    expect(fetchLatestTurnConnectorState).toHaveBeenCalledWith(expect.anything(), "11111111-1111-1111-1111-111111111111", undefined, 10_000, false);
+    expect(events.some((event) => event.type === "tool" && event.name === "model-mismatch")).toBe(false);
+  });
+
+  it("never takes a connector-off identity from an earlier turn in a resumed conversation", async () => {
+    waitTurnComplete.mockResolvedValueOnce(undefined);
+    currentConversationId.mockReturnValue("11111111-1111-1111-1111-111111111111");
+    fetchNativeResearchUserNodes.mockResolvedValue(new Set(["old-user"]));
+    latestAssistantModelSlug.mockResolvedValue(null);
+    readLatestAssistantText.mockResolvedValue("dom reply");
+    fetchLatestTurnConnectorState.mockResolvedValue(finishedBackendMessage({ currentUserNodeId: "old-user" }));
+
+    const runner = runAskOnSession({ prompt: "plan", model: "gpt-6-pro", timeoutSec: 1_200, headless: false }, session());
+    const events = await collect(runner.events);
+    await runner.result;
+    expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(3);
     expect(events).toContainEqual({ type: "tool", name: "model-mismatch", meta: { wanted: "gpt-6-pro", got: null } });
   });
 

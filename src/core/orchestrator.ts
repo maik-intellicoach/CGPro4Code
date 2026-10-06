@@ -401,9 +401,9 @@ function runAskInner(
 
       await attachImages(page, opts.images ?? []);
 
-      // A stale GET after Send must never satisfy this run with an old report.
-      const existingNativeConversation = opts.deepResearch || opts.connector !== undefined
-        ? currentConversationId(page) ?? opts.conversationId : null;
+      // A stale GET after Send must never satisfy this run with an old report,
+      // or (connector-off turns) with an old message's model identity.
+      const existingNativeConversation = currentConversationId(page) ?? opts.conversationId ?? null;
       const priorNativeUsers = existingNativeConversation
         ? await fetchNativeResearchUserNodes(page, existingNativeConversation) : new Set<string>();
 
@@ -705,6 +705,23 @@ function runAskInner(
         }
       }
 
+      // Connector-off turns never poll the record above, so once the 2026-09-28
+      // markup dropped `data-message-model-slug` their identity was always null and
+      // every such Pro turn failed as model-mismatch (P-035 2026-10-06, 9acb0d39).
+      // Read the record here too, bounded, for identity only; text stays DOM.
+      const domModel = nativeState.report ? null : await latestAssistantModelSlug(page);
+      if (opts.connector === undefined && !nativeState.report && !domModel && conversationId) {
+        for (let attempt = 0; attempt < 3 && !finishedConnectorMessage(); attempt++) {
+          if (attempt > 0) await page.waitForTimeout(2_000);
+          try {
+            const state = await fetchLatestTurnConnectorState(page, conversationId, undefined, 10_000, false);
+            if (state.currentUserNodeId && !priorNativeUsers.has(state.currentUserNodeId)) connectorSnapshot = state;
+          } catch (error) {
+            log(`record identity read failed: ${(error as Error).message}`);
+          }
+        }
+      }
+
       // The forced read above has just refreshed the conversation record, so the
       // finished connector message is now the fallback identity for the model.
       // The DOM slug is tried first; when the markup dropped
@@ -712,7 +729,7 @@ function runAskInner(
       const finishedMessage = finishedConnectorMessage();
       const actualModel = nativeState.report
         ? nativeState.report.model
-        : (await latestAssistantModelSlug(page)) ?? finishedMessage?.currentModelSlug ?? null;
+        : domModel ?? finishedMessage?.currentModelSlug ?? null;
       log(`actualModel=${actualModel ?? "(unknown)"} conv=${conversationId ?? "(none)"}`);
 
       // Native research uses a separate app engine. Maik approved the verified
