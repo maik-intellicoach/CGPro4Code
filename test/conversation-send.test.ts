@@ -50,6 +50,8 @@ function fakeLocator(overrides: { click?: () => Promise<void>; innerText?: strin
     // selection past the pill. A plain click does NOT do this -- it targets the
     // element centre, which on a composer holding only a pill is the pill.
     evaluate: async () => { caretInComposer = true; return true; }, // seated
+    // The composer's form holds no remove-labelled control (no attachment card).
+    locator: () => ({ locator: () => ({ count: async () => 0 }) }),
   };
 }
 

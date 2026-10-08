@@ -2804,10 +2804,10 @@ interface EmbedShape {
 }
 
 /** An admission that ignored an inert empty node under the provenance proof (P-035 2026-10-08). */
-type PreflightInertAdmission = { admitted: true; inertTokenHtml: string; childCount: number; outline: string };
+type PreflightInertAdmission = { admitted: true; childCount: number; outline: string };
 
-/** What an admission reports back about the ignored inert node: capped outerHTML, child count, tag outline. */
-export type PreflightAdmission = { inertTokenHtml: string; childCount: number; outline: string };
+/** What an admission reports back about the ignored inert node: child count and tag outline, never its markup. */
+export type PreflightAdmission = { childCount: number; outline: string };
 
 /** The content-free diagnostics a single refusal may carry beside its reason. */
 type PreflightDiagnostic =
@@ -3287,21 +3287,31 @@ export async function assertPreflightDraftSafe(
       // elements: no attribute at all, no text, and none of the media/input
       // tags below. So `<br>`, empty spans and nested empty divs pass; anything
       // that could carry content still refuses.
+      //
+      // P-035 review F2/F3 2026-10-08. The blocked tags bind the root too (an
+      // empty CANVAS or INPUT root holds a bitmap or a value that textContent
+      // never shows), and every child NODE is judged, not just elements: a
+      // comment is invisible to textContent and `children` yet holds text.
+      // Only element and (whitespace, by the textContent rule) text nodes pass.
       const inertBlockedTags = [
-        "img", "video", "audio", "iframe", "input", "textarea", "canvas", "svg", "object", "embed",
+        "img", "video", "audio", "iframe", "input", "textarea", "canvas", "svg", "object", "embed", "template",
       ];
       const inertDescendants = (element: Element, budget = { left: 50 }): boolean =>
-        Array.from(element.children ?? []).every(child => {
+        Array.from(element.childNodes).every(child => {
           budget.left -= 1;
-          return budget.left >= 0
-            && !inertBlockedTags.includes((child.tagName ?? "").toLowerCase())
-            && Array.from(child.attributes ?? []).length === 0
-            && (child.textContent ?? "").trim() === ""
-            && inertDescendants(child, budget);
+          if (budget.left < 0) return false;
+          if (child.nodeType === 3) return true;
+          if (child.nodeType !== 1) return false;
+          const node = child as Element;
+          return !inertBlockedTags.includes((node.tagName ?? "").toLowerCase())
+            && Array.from(node.attributes ?? []).length === 0
+            && (node.textContent ?? "").trim() === ""
+            && inertDescendants(node, budget);
         });
       const inertToken = (token: HTMLElement): boolean => {
         try {
           return token.getAttribute("contenteditable") === "false"
+            && !inertBlockedTags.includes((token.tagName ?? "").toLowerCase())
             && Array.from(token.attributes).every(attribute => attribute.name === "contenteditable")
             && (token.textContent ?? "").trim() === ""
             && inertDescendants(token);
@@ -3317,11 +3327,13 @@ export async function assertPreflightDraftSafe(
         return `${tag}>[${shown.join(",")}]`;
       };
       const inertTokens = owned.provenance !== undefined ? outermostTokens.filter(inertToken) : [];
-      let inertTokenHtml: string | null = null;
+      // Reported as a generated tag outline and child count only, never the
+      // node's own markup (P-035 review F3 2026-10-08).
+      let inertIgnored = false;
       let inertChildCount = 0;
       let inertOutline = "";
       if (inertTokens.length > 0) {
-        try { inertTokenHtml = String(inertTokens[0].outerHTML ?? "").slice(0, 200); } catch { inertTokenHtml = ""; }
+        inertIgnored = true;
         try {
           inertChildCount = (inertTokens[0].children ?? []).length;
           inertOutline = tagOutline(inertTokens[0]).slice(0, 200);
@@ -3927,8 +3939,8 @@ export async function assertPreflightDraftSafe(
         }
         return { reason: "foreign_text", foreignShape: foreignShape(node) };
       }
-      return inertTokenHtml === null ? true
-        : { admitted: true as const, inertTokenHtml, childCount: inertChildCount, outline: inertOutline };
+      return !inertIgnored ? true
+        : { admitted: true as const, childCount: inertChildCount, outline: inertOutline };
     }, {
       selector: joinSelectors(SELECTORS.composer), chromeSelectors: PREFLIGHT_CHROME, owned,
       tokenShapeValues: TOKEN_SHAPE_VALUES,
@@ -3937,7 +3949,7 @@ export async function assertPreflightDraftSafe(
     else if (typeof outcome === "string") reason = outcome;
     else if (typeof outcome === "object" && "admitted" in outcome) {
       safe = true;
-      admission = { inertTokenHtml: outcome.inertTokenHtml, childCount: outcome.childCount, outline: outcome.outline };
+      admission = { childCount: outcome.childCount, outline: outcome.outline };
     }
     else if (typeof outcome === "object" && "reason" in outcome) {
       // P-035 2026-09-28 r16. The sole-owned-token text refusal carries the
@@ -4247,7 +4259,8 @@ export async function sendPrompt(
  * lane's page lease admits no other writer in between. Only then are those
  * cards removed through their own X, and the ownership proof above still
  * decides the text. A form that already held one, or an unreadable count
- * (`-1`), removes nothing.
+ * (`-1`), removes nothing, and a card that may be this call's there is
+ * `clear_failed` (review V1 2026-10-08).
  *
  * Exactly one content-free line is logged, and it never carries page or
  * prompt text.
@@ -4314,12 +4327,19 @@ function formRemoveControls(composer: Locator): Locator {
  * Remove the pasted-text cards this call's own paste produced, through their
  * own X. Only when the form held no remove control before this call inserted
  * anything (`before === 0`): then every one present now is ours. Returns how
- * many were removed (0 when none, or when `before` is not 0), or null when a
- * card survived its X.
+ * many were removed (0 when none), or null when a card survived its X.
+ *
+ * P-035 review V1 2026-10-08. With an unreadable (`-1`) or non-zero `before`
+ * no card can be proven ours, so nothing is clicked; but a card this call may
+ * have added (any card when `before` is unknown, more than `before` otherwise)
+ * is null too, so the send refuses rather than submit it beside the prompt.
  */
 async function removeOwnPastedCards(composer: Locator, before: number): Promise<number | null> {
-  if (before !== 0) return 0;
   const controls = formRemoveControls(composer);
+  if (before !== 0) {
+    const now = await controls.count();
+    return (before < 0 ? now > 0 : now > before) ? null : 0;
+  }
   const cards = await controls.count();
   // Bounded: one paste makes one card. Each click removes one, so the first
   // match is always the next card still present.

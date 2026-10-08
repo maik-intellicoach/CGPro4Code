@@ -150,11 +150,18 @@ function fixture(initial: Partial<State> = {}) {
           matches: selector => answers(node, selector),
           querySelector: selector => tokens.find(token => token !== element && element.contains(token)
             && token.matches(selector)) ?? null,
+          nodeType: 1,
           get children() { return tokens.filter(token => token.parentElement === element); },
+          // Element children, then any comment nodes (P-035 review F3): a
+          // comment is in childNodes and outerHTML, never in textContent.
+          get childNodes() {
+            return [...element.children, ...(node.comments ?? []).map(data => ({ nodeType: 8, data, textContent: data }))];
+          },
           get outerHTML() {
             const tag = node.tagName.toLowerCase();
             const attrs = (node.attributes ?? []).map(attribute => ` ${attribute.name}="${attribute.value ?? ""}"`).join("");
-            return `<${tag}${attrs}>${node.textContent ?? ""}</${tag}>`;
+            const comments = (node.comments ?? []).map(data => `<!--${data}-->`).join("");
+            return `<${tag}${attrs}>${node.textContent ?? ""}${comments}</${tag}>`;
           },
         };
         tokens.push(element);
@@ -374,6 +381,8 @@ interface TokenNode {
   attributes?: Array<{ name: string; value?: string }>;
   /** G3-B (fifth run): non-token wrappers around a ROOT token, nearest first. */
   wrappers?: TokenWrapper[];
+  /** P-035 review F3: HTML comments inside this node, by their text. */
+  comments?: string[];
 }
 /** G3-B (fifth run): one non-`[contenteditable="false"]` ancestor of a root token. */
 interface TokenWrapper {
@@ -396,8 +405,11 @@ interface FixtureToken {
   remove: () => void;
   matches: (selector: string) => boolean;
   querySelector: (selector: string) => FixtureToken | null;
+  readonly nodeType: number;
   /** Element children (the token nodes built below this one). */
   readonly children: FixtureToken[];
+  /** Element children, then comment nodes. */
+  readonly childNodes: Array<FixtureToken | { nodeType: number; data: string; textContent: string }>;
   readonly outerHTML: string;
 }
 /** One synthetic ancestor of the foreign text node, nearest first. */
@@ -2114,10 +2126,10 @@ describe("composed-draft provenance proof (r26)", () => {
     const chip: TokenNode = { tagName: "SPAN", textContent: "fixture" };
     const proof = { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } };
 
-    it("is ignored beside the owned chip under the provenance proof, and its outerHTML returned", async () => {
+    it("is ignored beside the owned chip under the provenance proof, and its tag outline returned", async () => {
       const test = fixture({ tokenTree: [chip, { tagName: "DIV", attributes: [CE] }], text: composed() });
       await expect(assertPreflightDraftSafe(test.page, proof))
-        .resolves.toEqual({ inertTokenHtml: '<div contenteditable="false"></div>', childCount: 0, outline: "div" });
+        .resolves.toEqual({ childCount: 0, outline: "div" });
       expect(test.removedTokens.map(token => token.tagName)).toEqual(["DIV", "SPAN"]);
     });
 
@@ -2162,6 +2174,42 @@ describe("composed-draft provenance proof (r26)", () => {
         ).catch(caught => caught);
         expect(error).toBeInstanceOf(PreflightDraftProtectedError);
         expect(error.reason).toBe("connector_token_text");
+      }
+    });
+
+    // P-035 review F2 2026-10-08: an empty CANVAS or INPUT root holds a bitmap
+    // or a value textContent never shows; the blocked tags bind the root too.
+    it("refuses a prohibited-tag root beside the proven draft", async () => {
+      for (const tagName of ["CANVAS", "INPUT", "TEXTAREA", "IFRAME", "SVG", "IMG", "TEMPLATE"]) {
+        const error = await assertPreflightDraftSafe(
+          fixture({ tokenTree: [chip, { tagName, attributes: [CE] }], text: composed() }).page, proof,
+        ).catch(caught => caught);
+        expect(error, tagName).toBeInstanceOf(PreflightDraftProtectedError);
+        expect(error.reason, tagName).toBe("connector_token_text");
+      }
+    });
+
+    // P-035 review F3 2026-10-08: a comment is invisible to textContent and
+    // `children`, but it carries text and sits in outerHTML.
+    it("refuses a node holding a comment, at the root or below, and never reports the comment", async () => {
+      const SECRET = "PRIVATE-COMMENT-SENTINEL";
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        for (const node of [
+          { tagName: "DIV", attributes: [CE], comments: [SECRET] },
+          { tagName: "DIV", attributes: [CE], children: [{ tagName: "SPAN", comments: [SECRET] }] },
+        ] as TokenNode[]) {
+          const error = await assertPreflightDraftSafe(
+            fixture({ tokenTree: [chip, node], text: composed() }).page, proof,
+          ).catch(caught => caught);
+          expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+          expect(error.reason).toBe("connector_token_text");
+          expect(JSON.stringify(error)).not.toContain(SECRET);
+          expect(String(error.message)).not.toContain(SECRET);
+        }
+        expect(JSON.stringify(log.mock.calls)).not.toContain(SECRET);
+      } finally {
+        log.mockRestore();
       }
     });
 

@@ -21,6 +21,8 @@ function fakeLocator() {
     getAttribute: async () => null,
     innerText: async () => composed,
     evaluate: async () => true,
+    // The composer's form holds no remove-labelled control (no attachment card).
+    locator: () => ({ locator: () => ({ count: async () => 0 }) }),
   };
 }
 

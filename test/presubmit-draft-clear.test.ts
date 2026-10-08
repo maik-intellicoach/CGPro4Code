@@ -39,6 +39,8 @@ interface ComposerState {
   cards?: number;
   /** The cards' X does nothing. */
   cardsStuck?: boolean;
+  /** The first this many reads of the cards' count throw. */
+  countFailures?: number;
 }
 
 let selectedAll = false;
@@ -55,7 +57,13 @@ function fakeLocator(state: ComposerState) {
     // composer -> its form -> the form's remove-labelled controls (the cards' X).
     locator: () => ({
       locator: () => ({
-        count: async () => state.cards ?? 0,
+        count: async () => {
+          if ((state.countFailures ?? 0) > 0) {
+            state.countFailures = (state.countFailures ?? 0) - 1;
+            throw new Error("synthetic unreadable remove-control count");
+          }
+          return state.cards ?? 0;
+        },
         first: () => ({
           click: vi.fn(async () => {
             cardClicks += 1;
@@ -390,6 +398,52 @@ describe("sendPrompt never submits its own pasted-text card", () => {
     expect(cardClicks).toBe(1);
     expect(log.mock.calls.map(args => String(args[0])))
       .toContain("[cgpro:composer] removed own pasted-text card before send cards=1");
+  });
+
+  // P-035 review V1 2026-10-08: an unreadable count before the insert proves no
+  // card ours, so a card present afterwards is refused, never sent beside it.
+  it("refuses the send when the count before the insert was unreadable and a card appeared", async () => {
+    const state: ComposerState = { text: "", unknown: false, readable: true, url: "https://chatgpt.com/", countFailures: 1 };
+    const sendClick = vi.fn(async () => {});
+    requireSelector.mockImplementation(async () => fakeLocator(state));
+    firstResolved.mockResolvedValue({ ...fakeLocator(state), click: sendClick });
+
+    const page = fakePage(state);
+    const error = await sendPrompt(page, "hello world", false, undefined, async () => { state.cards = 1; })
+      .catch(caught => caught);
+
+    expect(error).toBeInstanceOf(PreSubmitInteractionError);
+    expect(error.code).toBe("prompt_delivery_incomplete");
+    expect(sendClick).not.toHaveBeenCalled();
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+    expect(cardClicks).toBe(0); // not proven ours: untouched
+    expect(state.cards).toBe(1);
+    expect(presubmitLines(log)).toEqual(["[cgpro:presubmit] owned draft cleared=no reason=clear_failed"]);
+  });
+
+  it("refuses the send when the form already held a card and this call added another", async () => {
+    const state: ComposerState = { text: "", unknown: false, readable: true, url: "https://chatgpt.com/", cards: 1 };
+    const sendClick = vi.fn(async () => {});
+    requireSelector.mockImplementation(async () => fakeLocator(state));
+    firstResolved.mockResolvedValue({ ...fakeLocator(state), click: sendClick });
+
+    const page = fakePage(state);
+    const error = await sendPrompt(page, "hello world", false, undefined, async () => { state.cards = 2; })
+      .catch(caught => caught);
+
+    expect(error).toBeInstanceOf(PreSubmitInteractionError);
+    expect(sendClick).not.toHaveBeenCalled();
+    expect(cardClicks).toBe(0);
+  });
+
+  it("sends when the count before the insert was unreadable but no card is present", async () => {
+    const state: ComposerState = { text: "", unknown: false, readable: true, url: "https://chatgpt.com/", countFailures: 1 };
+    const sendClick = vi.fn(async () => {});
+    requireSelector.mockImplementation(async () => fakeLocator(state));
+    firstResolved.mockResolvedValue({ ...fakeLocator(state), click: sendClick });
+
+    await sendPrompt(fakePage(state), "hello world", false, undefined, async () => {});
+    expect(sendClick).toHaveBeenCalled();
   });
 
   it("refuses the send, and clears its own draft, when the card survives its X", async () => {

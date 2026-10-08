@@ -1595,11 +1595,12 @@ export async function handleRequest(
       await waitForComposerHydrated(page);
       try {
         // P-035 2026-10-08. Once per discard: the inert empty node the
-        // provenance proof ignored, as its capped outerHTML (no text by rule).
+        // provenance proof ignored, as a generated tag outline, never its own
+        // markup (review F3: a comment inside it would carry text).
         const admission = await assertPreflightDraftSafe(page, owned);
         if (admission) {
           console.error(
-            `[cgpro:discard] mode=${mode} ignored_inert=${admission.inertTokenHtml} `
+            `[cgpro:discard] mode=${mode} ignored_inert=1 `
             + `child_count=${admission.childCount} outline=${admission.outline}`,
           );
         }
