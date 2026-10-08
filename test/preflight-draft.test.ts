@@ -150,6 +150,12 @@ function fixture(initial: Partial<State> = {}) {
           matches: selector => answers(node, selector),
           querySelector: selector => tokens.find(token => token !== element && element.contains(token)
             && token.matches(selector)) ?? null,
+          get children() { return tokens.filter(token => token.parentElement === element); },
+          get outerHTML() {
+            const tag = node.tagName.toLowerCase();
+            const attrs = (node.attributes ?? []).map(attribute => ` ${attribute.name}="${attribute.value ?? ""}"`).join("");
+            return `<${tag}${attrs}>${node.textContent ?? ""}</${tag}>`;
+          },
         };
         tokens.push(element);
         if (node.icon) chipIcons.push({ tagName: "IMG", parentElement: element });
@@ -390,6 +396,9 @@ interface FixtureToken {
   remove: () => void;
   matches: (selector: string) => boolean;
   querySelector: (selector: string) => FixtureToken | null;
+  /** Element children (the token nodes built below this one). */
+  readonly children: FixtureToken[];
+  readonly outerHTML: string;
 }
 /** One synthetic ancestor of the foreign text node, nearest first. */
 interface ForeignAncestor {
@@ -2095,6 +2104,52 @@ describe("composed-draft provenance proof (r26)", () => {
     ).catch(caught => caught);
     expect(mixed).toBeInstanceOf(PreflightDraftProtectedError);
     expect(mixed.reason).toBe("connector_token_text");
+  });
+
+  // P-035 2026-10-08. Live personal and strengths: the restored draft held an
+  // empty `<div contenteditable="false">` beside the lane's own chip. Under the
+  // provenance proof only, exactly that inert node is ignored and reported.
+  describe("an inert empty contenteditable=false node (P-035 2026-10-08)", () => {
+    const CE = { name: "contenteditable", value: "false" };
+    const chip: TokenNode = { tagName: "SPAN", textContent: "fixture" };
+    const proof = { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } };
+
+    it("is ignored beside the owned chip under the provenance proof, and its outerHTML returned", async () => {
+      const test = fixture({ tokenTree: [chip, { tagName: "DIV", attributes: [CE] }], text: composed() });
+      await expect(assertPreflightDraftSafe(test.page, proof))
+        .resolves.toEqual({ inertTokenHtml: '<div contenteditable="false"></div>' });
+      expect(test.removedTokens.map(token => token.tagName)).toEqual(["DIV", "SPAN"]);
+    });
+
+    it("still refuses when the node carries text", async () => {
+      const error = await assertPreflightDraftSafe(
+        fixture({ tokenTree: [chip, { tagName: "DIV", attributes: [CE], textContent: "x" }], text: composed() }).page,
+        proof,
+      ).catch(caught => caught);
+      expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+      expect(error.reason).toBe("connector_token_text");
+    });
+
+    it("still refuses when the node carries another attribute or a child element", async () => {
+      const extraAttribute = await assertPreflightDraftSafe(
+        fixture({ tokenTree: [chip, { tagName: "DIV", attributes: [CE, { name: "class", value: "c" }] }], text: composed() }).page,
+        proof,
+      ).catch(caught => caught);
+      expect(extraAttribute.reason).toBe("connector_token_text");
+
+      const withChild = await assertPreflightDraftSafe(
+        fixture({ tokenTree: [chip, { tagName: "DIV", attributes: [CE], children: [{ tagName: "SPAN" }] }], text: composed() }).page,
+        proof,
+      ).catch(caught => caught);
+      expect(withChild.reason).toBe("connector_token_text");
+    });
+
+    it("is never ignored without the provenance proof", async () => {
+      const error = await assertPreflightDraftSafe(
+        fixture({ tokenTree: [chip, { tagName: "DIV", attributes: [CE] }] }).page, { connector: "fixture" },
+      ).catch(caught => caught);
+      expect(error.reason).toBe("connector_token_count:2");
+    });
   });
 
   it("still refuses a differently named chip as connector_token_text", async () => {

@@ -1594,7 +1594,10 @@ export async function handleRequest(
       await goHome(page);
       await waitForComposerHydrated(page);
       try {
-        await assertPreflightDraftSafe(page, owned);
+        // P-035 2026-10-08. Once per discard: the inert empty node the
+        // provenance proof ignored, as its capped outerHTML (no text by rule).
+        const admission = await assertPreflightDraftSafe(page, owned);
+        if (admission) console.error(`[cgpro:discard] mode=${mode} ignored_inert=${admission.inertTokenHtml}`);
       } catch (error) {
         const reason = guardReason(error);
         console.error(`[cgpro:discard] mode=${mode} outcome=not_owned reason=${reason}`);

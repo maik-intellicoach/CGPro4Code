@@ -2800,6 +2800,12 @@ interface EmbedShape {
   }>;
 }
 
+/** An admission that ignored an inert empty node under the provenance proof (P-035 2026-10-08). */
+type PreflightInertAdmission = { admitted: true; inertTokenHtml: string };
+
+/** What an admission reports back: the ignored inert node's capped outerHTML, if any. */
+export type PreflightAdmission = { inertTokenHtml: string };
+
 /** The content-free diagnostics a single refusal may carry beside its reason. */
 type PreflightDiagnostic =
   | {
@@ -2859,13 +2865,14 @@ export async function assertPreflightDraftSafe(
     /** r26: prove a composed draft by its planning header, marker and invocation id, never by its text. */
     provenance?: { prefix: string; marker: string };
   } = {},
-): Promise<void> {
+): Promise<PreflightAdmission | undefined> {
   let safe = false;
   let reason: string | null = null;
+  let admission: PreflightAdmission | undefined;
   try {
     const outcome = await page.evaluate(({
       selector, chromeSelectors, owned, tokenShapeValues,
-    }): true | string | PreflightDiagnostic => {
+    }): true | string | PreflightDiagnostic | PreflightInertAdmission => {
       // P-035 2026-09-27. The guard still answers a single bit: `true` admits,
       // a string is the FIRST check that refused, named by a closed, content-free
       // reason code. The branch order and every condition are exactly as before,
@@ -3259,9 +3266,33 @@ export async function assertPreflightDraftSafe(
       // that chip, not a second token. Each refusal below now names its own
       // condition, content-free.
       const allTokens = Array.from(copy.querySelectorAll<HTMLElement>('[contenteditable="false"]'));
-      const tokens = allTokens.filter(
+      const outermostTokens = allTokens.filter(
         token => !token.parentElement?.closest('[contenteditable="false"]'),
       );
+      // P-035 2026-10-08. Live personal and strengths: beside the lane's own
+      // chip the restored draft held an empty `<div contenteditable="false">`
+      // (`tag=DIV attrs=contenteditable text_len=0`), and the discard refused
+      // `connector_token_text`. Under the provenance proof ONLY (which must
+      // still hold in full below) such an inert node is not a token: exactly
+      // `contenteditable="false"`, no other attribute, no text after trim, no
+      // element children. It is dropped from the clone and its capped
+      // outerHTML is handed back for the caller to log. Any other node stays a
+      // token and refuses as before.
+      const inertToken = (token: HTMLElement): boolean => {
+        try {
+          return token.getAttribute("contenteditable") === "false"
+            && Array.from(token.attributes).every(attribute => attribute.name === "contenteditable")
+            && (token.textContent ?? "").trim() === ""
+            && token.children.length === 0;
+        } catch { return false; }
+      };
+      const inertTokens = owned.provenance !== undefined ? outermostTokens.filter(inertToken) : [];
+      let inertTokenHtml: string | null = null;
+      if (inertTokens.length > 0) {
+        try { inertTokenHtml = String(inertTokens[0].outerHTML ?? "").slice(0, 200); } catch { inertTokenHtml = ""; }
+        for (const token of inertTokens) token.remove();
+      }
+      const tokens = outermostTokens.filter(token => !inertTokens.includes(token));
       // P-035 2026-10-03 G3-B (fifth run). Content-free shape of the FIRST
       // outermost token for the three token refusals. Read on the ORIGINAL
       // composer (own chip atoms excluded, as in the clone) so the ancestor
@@ -3858,13 +3889,17 @@ export async function assertPreflightDraftSafe(
         }
         return { reason: "foreign_text", foreignShape: foreignShape(node) };
       }
-      return true;
+      return inertTokenHtml === null ? true : { admitted: true as const, inertTokenHtml };
     }, {
       selector: joinSelectors(SELECTORS.composer), chromeSelectors: PREFLIGHT_CHROME, owned,
       tokenShapeValues: TOKEN_SHAPE_VALUES,
     });
     if (outcome === true) safe = true;
     else if (typeof outcome === "string") reason = outcome;
+    else if (typeof outcome === "object" && "admitted" in outcome) {
+      safe = true;
+      admission = { inertTokenHtml: outcome.inertTokenHtml };
+    }
     else if (typeof outcome === "object" && "reason" in outcome) {
       // P-035 2026-09-28 r16. The sole-owned-token text refusal carries the
       // content-free shape of the chip's remainder, so a live round names which
@@ -3984,9 +4019,10 @@ export async function assertPreflightDraftSafe(
     console.error(`[cgpro:preflight] draft guard refused: reason=${reason}`);
     throw new PreflightDraftProtectedError(reason);
   }
+  return admission;
 }
 
-export async function clearComposer(page: Page, guard?: () => Promise<void>): Promise<void> {
+export async function clearComposer(page: Page, guard?: () => Promise<unknown>): Promise<void> {
   await guard?.();
   const composer = await requireSelector(page, SELECTORS.composer, "composer");
   await focusComposer(page, composer);
@@ -5848,7 +5884,7 @@ async function clickFirstActionable(
   name: string,
   attempts = 3,
   settled?: () => boolean,
-  guard?: () => Promise<void>,
+  guard?: () => Promise<unknown>,
 ): Promise<void> {
   const selector = joinSelectors(candidates);
   let lastError: unknown;
