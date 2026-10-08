@@ -202,6 +202,14 @@ function resolveOffsetCitations(text: string, citations: unknown): string {
   return chars.join("");
 }
 
+function modelSlugOf(metadata: JsonObject | null): string | null {
+  for (const key of ["resolved_model_slug", "model_slug"]) {
+    const slug = metadata?.[key];
+    if (typeof slug === "string" && slug.trim()) return slug.trim();
+  }
+  return null;
+}
+
 /** Native research reports live in the app widget, not an assistant bubble. */
 export function extractLatestNativeResearchReport(body: unknown): NativeResearchReport | null {
   const root = asObject(body);
@@ -247,7 +255,11 @@ export function extractLatestNativeResearchReport(body: unknown): NativeResearch
           }
         }
       }
-      recovered = { text, model: typeof reportMetadata?.resolved_model_slug === "string" ? reportMetadata.resolved_model_slug : null };
+      // The engine is the report's own slug (P-035 D13 2026-10-08, run 144151b2:
+      // "deep-research-mini" under a GPT-6 Pro composer); the app tool node's
+      // slug only names the model that dispatched it, and stands in when the
+      // report carries none. Never the composer's model.
+      recovered = { text, model: modelSlugOf(reportMetadata) ?? modelSlugOf(metadata) };
     }
     nodeId = typeof node.parent === "string" ? node.parent : null;
   }

@@ -43,6 +43,22 @@ describe("native app report extraction", () => {
     const x=fixture();x.tool.metadata.chatgpt_sdk.widget_state="not json";expect(extractLatestNativeResearchReport(x.body)).toBeNull();
     x.body.mapping.tool.message={};x.body.mapping.tool.parent="hidden";expect(extractLatestNativeResearchReport(x.body)).toBeNull();
   });
+  // P-035 D13 2026-10-08, run 144151b2: GPT-6 Pro was selected, gpt-6-instant
+  // dispatched the app and deep-research-mini wrote the report.
+  it("names the report's own engine, never the dispatcher or the composer model", () => {
+    const x=fixture();(x.report.metadata as any).resolved_model_slug="deep-research-mini";
+    (x.tool.metadata as any).resolved_model_slug="gpt-6-instant";(x.tool.metadata as any).model_slug="gpt-6-instant";
+    (x.tool.metadata as any).default_model_slug="gpt-6-pro";x.tool.metadata.chatgpt_sdk.widget_state=JSON.stringify(x.state);
+    expect(extractLatestNativeResearchReport(x.body)?.model).toBe("deep-research-mini");
+  });
+  it("falls back to the app tool node's slug when the report names none", () => {
+    const x=fixture();delete (x.report.metadata as any).resolved_model_slug;
+    (x.tool.metadata as any).model_slug="gpt-6-instant";(x.tool.metadata as any).default_model_slug="gpt-6-pro";
+    x.tool.metadata.chatgpt_sdk.widget_state=JSON.stringify(x.state);
+    expect(extractLatestNativeResearchReport(x.body)?.model).toBe("gpt-6-instant");
+    delete (x.tool.metadata as any).model_slug;
+    expect(extractLatestNativeResearchReport(x.body)?.model).toBeNull();
+  });
   it("ignores another app even when it has report-shaped metadata", () => {
     const x=fixture();x.tool.metadata.invoked_resource.resource_uri="/another_app/start";expect(extractLatestNativeResearchReport(x.body)).toBeNull();
   });
@@ -55,7 +71,7 @@ describe("native app report extraction", () => {
       { title: "Take ScreenCaptureKit to the next level - WWDC22 - Videos - Apple Developer", url: "https://developer.apple.com/la/videos/play/wwdc2022/10155/#:~:text=let%20attachments%20%3D%20attachmentsArray,return" },
     ];
     x.report.content.parts = [text];
-    (x.report.metadata as any) = { resolved_model_slug: "gpt-6-pro", content_references: [], citations: offsets.map(([start_ix, end_ix], i) => ({
+    (x.report.metadata as any) = { resolved_model_slug: "deep-research-mini", content_references: [], citations: offsets.map(([start_ix, end_ix], i) => ({
       start_ix, end_ix, citation_format_type: "tether_v4",
       metadata: { type: "webpage", ...sources[i], text: "", pub_date: null, extra: { cited_message_idx: 31, start_line_num: 381, end_line_num: 390 }, og_tags: null },
     })) };
