@@ -443,6 +443,41 @@ describe("6 Pro maximum thinking admission", () => {
     await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/where the newest model is "GPT-5\.7 Pro"/);
   });
 
+  // P-035 2026-10-08. The live picker on every lane now reads
+  // [GPT-6, GPT-5.6 Sol, GPT-5.5 Leaving on October 14] with no `Latest` entry,
+  // while the account catalogue lists GPT-6 Pro. Maik's ruling (option a):
+  // a first, checked entry naming the catalogue's own Pro model is the newest.
+  it.each([
+    { slug: "gpt-6-pro", title: "GPT-6 Pro" },
+    { slug: "gpt-6-pro", title: "6 Pro" },
+  ])("accepts the renamed newest entry when it names the catalogue Pro model: %j", async (pro) => {
+    fetchModels.mockResolvedValue([pro]);
+    const s = setup({
+      effortLabel: "Pro",
+      pickerEntries: ["GPT-6", "GPT-5.6 Sol", "GPT-5.5Leaving on October 14"],
+      pickerCheckedIndex: 0,
+    });
+    await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "GPT-6", power: 4 });
+  });
+
+  it("refuses the renamed entry when the catalogue Pro model is a different one", async () => {
+    fetchModels.mockResolvedValue([{ slug: "gpt-5-5-pro", title: "GPT-5.5 Pro" }]);
+    const s = setup({ pickerEntries: ["GPT-6", "GPT-5.6 Sol"], pickerCheckedIndex: 0 });
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(
+      /has "GPT-6" selected, where the newest model is "GPT-6"/,
+    );
+  });
+
+  it.each([
+    { pickerEntries: ["GPT-5.6 Sol", "GPT-6"], pickerCheckedIndex: 1 },
+    { pickerEntries: ["GPT-6", "GPT-5.6 Sol"], pickerCheckedIndex: 1 },
+    { pickerEntries: ["GPT-6.1", "GPT-6"], pickerCheckedIndex: 0 },
+  ])("refuses a catalogue-named entry that is not first, or a newer unlisted one: %j", async (options) => {
+    fetchModels.mockResolvedValue([{ slug: "gpt-6-pro", title: "GPT-6 Pro" }]);
+    const s = setup(options);
+    await expect(ensureProSixMaximum(s.page)).rejects.toThrow(/where the newest model is/);
+  });
+
   // P-035 2026-09-22. The API catalogue lags the composer -- it still lists
   // GPT-5.5 Pro while the picker offers a newer list -- which is exactly why the
   // catalogue stopped being the anchor. It is read for the account's entitlement

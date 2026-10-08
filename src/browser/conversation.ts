@@ -3,7 +3,7 @@ import { PREFLIGHT_CHROME, SELECTORS, joinSelectors } from "./selectors.js";
 import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
 import { deepResearchQuota, parseDeepResearchExhausted, parseDeepResearchRemaining, recordDeepResearchExhausted, recordDeepResearchRow, recordDeepResearchTooltip, type DeepResearchQuota } from "./deep-research-quota.js";
 import { listProjects } from "../api/projects.js";
-import { fetchModelsWithReason, findProModel, type ChatgptModel } from "../api/models.js";
+import { fetchModelsWithReason, findProModel, normaliseModelLabel, type ChatgptModel } from "../api/models.js";
 import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, type ReplyStalledDetails, ReplyStalledError, SelectorBrokenError, type SubmittedTurnNotRenderedDetails, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation, streamBreakCount } from "../core/stream.js";
 
@@ -383,6 +383,24 @@ const LOWER_EFFORT_LABELS = new Set(["high", "medium", "low", "instant", "minima
  * costs one turn.
  */
 const NEWEST_MODEL_SENTINELS = new Set(["latest"]);
+
+/**
+ * P-035 2026-10-08. The app renamed its `Latest` entry to the model's own name
+ * (`GPT-6`) on every lane, and the sentinel above refused every paid turn. Maik
+ * ruled (08:26, option a) to accept a second, independent signal rather than a
+ * new hardcoded name: the checked entry names the Pro model the ACCOUNT'S OWN
+ * catalogue offers (`GPT-6` for `GPT-6 Pro` / `gpt-6-pro`). A lagging catalogue
+ * (still `GPT-5.5 Pro`) does not match a newer picker, so the gate stays closed
+ * and loud instead of certifying an older model.
+ */
+function pickerNamesCatalogueProModel(checked: string, proModel: ChatgptModel | null): boolean {
+  const picked = normaliseModelLabel(checked);
+  if (!proModel || picked === "") return false;
+  return [proModel.title, proModel.slug].some((label) => {
+    const catalogue = normaliseModelLabel(label);
+    return catalogue !== "" && (catalogue === picked || catalogue === `${picked}pro`);
+  });
+}
 
 async function readCatalogueForModelCheck(
   page: Page,
@@ -1425,9 +1443,9 @@ export async function ensureProSixMaximum(
     // NEWEST_MODEL_SENTINELS): the checked entry must be the picker's own
     // newest-model affordance, and it must be the entry the picker puts first.
     // Either one failing refuses, with the whole list on the record.
-    const checkedIsNewest = NEWEST_MODEL_SENTINELS.has(
-      picked.checked.toLowerCase().replace(/\s+/g, ""),
-    );
+    const checkedIsNewest =
+      NEWEST_MODEL_SENTINELS.has(picked.checked.toLowerCase().replace(/\s+/g, "")) ||
+      pickerNamesCatalogueProModel(picked.checked, proModel);
     if (!checkedIsNewest || picked.checkedIndex !== 0) {
       const detail = await describeModelMenu(page);
       console.error(
