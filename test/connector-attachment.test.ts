@@ -699,6 +699,38 @@ describe("failed connector click clears its typed @ (r33)", () => {
   });
 });
 
+// P-035 2026-10-08. Live personal and strengths under heavy host load: the first
+// click timed out but landed late, the refreshed lookup returned the still-open
+// picker row, and the retry click added a second chip that no ownership proof
+// admits. The composer is asked before any retry click.
+describe("a late-landing connector click is never clicked twice (P-035 2026-10-08)", () => {
+  it("returns without a retry click when the composer already holds the chip", async () => {
+    const scenario = makePage();
+    const chip = { label: "connector", visible: true, attrs: {}, inComposer: true, id: "chip" };
+    const picker: FakeRow = {
+      label: "connector",
+      visible: true,
+      attrs: {},
+      id: "picker",
+      onSelected: () => {
+        scenario.setRows([picker, chip]); // the chip mounts, the picker is still open
+        throw new Error("locator.click: Timeout 5000ms exceeded.");
+      },
+    };
+    scenario.setRows([picker]);
+    const { page } = scenario;
+    // The composer read: the chip is there; the picker then closes.
+    page.evaluate = vi.fn(async () => {
+      scenario.setRows([chip]);
+      return true;
+    }) as typeof page.evaluate;
+
+    await expect(setConnector(page, "connector")).resolves.toBeUndefined();
+
+    expect(page.clickedLabels).toEqual(["picker"]);
+  });
+});
+
 // P-035 2026-10-05. In ChatGPT's Plugins UI the connector chip in the composer
 // and the left rail's Customize > Plugins entry are links to `/plugins/<id>`:
 // clicking either navigates away from the Project (ms1980 `visible picker

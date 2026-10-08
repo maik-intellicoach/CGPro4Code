@@ -2070,6 +2070,33 @@ describe("composed-draft provenance proof (r26)", () => {
     }
   });
 
+  // P-035 2026-10-08. Live personal and strengths: a late-landing connector
+  // click plus its retry left two copies of the lane's own chip. Repeated
+  // copies admit ONLY under this proof, and only when every copy is ours.
+  it("admits repeated copies of the owned chip under the provenance proof and removes them all", async () => {
+    const twice = fixture({ mentions: ["fixture", "fixture"], text: composed() });
+    await expect(assertPreflightDraftSafe(
+      twice.page, { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } },
+    )).resolves.toBeUndefined();
+    expect(twice.removedTokens).toHaveLength(2);
+  });
+
+  it("refuses repeated owned chips when the marker is missing, or when one copy is another chip", async () => {
+    const noMarker = await assertPreflightDraftSafe(
+      fixture({ mentions: ["fixture", "fixture"], text: composed().replace(MARKER, "") }).page,
+      { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } },
+    ).catch(caught => caught);
+    expect(noMarker).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(noMarker.reason).toBe("provenance_mismatch");
+
+    const mixed = await assertPreflightDraftSafe(
+      fixture({ mentions: ["fixture", "some-other-connector"], text: composed() }).page,
+      { connector: "fixture", provenance: { prefix: HEADER, marker: MARKER } },
+    ).catch(caught => caught);
+    expect(mixed).toBeInstanceOf(PreflightDraftProtectedError);
+    expect(mixed.reason).toBe("connector_token_text");
+  });
+
   it("still refuses a differently named chip as connector_token_text", async () => {
     const error = await assertPreflightDraftSafe(
       fixture({ mention: "some-other-connector", text: composed() }).page,

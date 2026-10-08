@@ -2382,12 +2382,22 @@ async function clickConnector(page: Page, row: Locator, name: string): Promise<v
       );
     }
     if (await isComposerMountedTool(refreshed) || await attachedState(refreshed)) return;
+    // P-035 2026-10-08. Live personal and strengths under heavy host load: the
+    // timed-out first click landed late, the refreshed lookup returned the
+    // still-open picker row rather than the new chip, and the retry click
+    // added a SECOND chip that no ownership proof admits. Ask the composer
+    // itself, giving a late click a moment to land, before clicking again.
+    if (await composerHoldsToolChip(page, name, LATE_CLICK_SETTLE_MS)) {
+      mark("late-click-landed");
+      return;
+    }
     const retryRow = await pickerRowToClick(page, name);
     try {
       await retryRow.click({ timeout: 5_000 });
     } catch (retryError) {
       if (!(retryError instanceof Error) || !retryError.message.includes("Timeout")) throw retryError;
       console.error(`[cgpro:connector] click-timeout attempt=2 reason=${clickStallReason(retryError)}`);
+      if (await composerHoldsToolChip(page, name, LATE_CLICK_SETTLE_MS)) return;
       const finalRow = await waitForComposerTool(page, name, 8_000, "include");
       if (finalRow && (await isComposerMountedTool(finalRow) || await attachedState(finalRow))) return;
       throw new PreSubmitInteractionError(
@@ -2397,6 +2407,39 @@ async function clickConnector(page: Page, row: Locator, name: string): Promise<v
         { cause: retryError },
       );
     }
+  }
+}
+
+/** How long a timed-out connector click may take to land before it is retried. */
+const LATE_CLICK_SETTLE_MS = Math.max(0, Number(process.env.CGPRO_CONNECTOR_LATE_CLICK_MS ?? 2_000));
+
+/**
+ * Whether the composer already holds this connector's chip: an outermost
+ * `[contenteditable="false"]` token inside the composer whose collapsed text is
+ * exactly `name` (case-insensitive), the same token the draft guard counts.
+ * Polls until `waitMs` has passed. An unreadable page is "no", which keeps the
+ * existing retry path.
+ */
+async function composerHoldsToolChip(page: Page, name: string, waitMs: number): Promise<boolean> {
+  const label = name.replace(/\s+/g, " ").trim().toLocaleLowerCase();
+  const read = async (): Promise<boolean> => {
+    try {
+      return await page.evaluate(([selector, expected]) => {
+        const composer = document.querySelector(selector);
+        if (!composer) return false;
+        return Array.from(composer.querySelectorAll('[contenteditable="false"]')).some(token =>
+          !token.parentElement?.closest('[contenteditable="false"]')
+          && (token.textContent ?? "").replace(/\s+/g, " ").trim().toLocaleLowerCase() === expected);
+      }, [joinSelectors(SELECTORS.composer), label] as const) === true;
+    } catch {
+      return false;
+    }
+  };
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    if (await read()) return true;
+    if (Date.now() >= deadline) return false;
+    await page.waitForTimeout(250);
   }
 }
 
@@ -3266,14 +3309,25 @@ export async function assertPreflightDraftSafe(
         try { return { reason, tokenShape: tokenShape(tokens[0]) }; } catch { return reason; }
       };
       let ownedToken: HTMLElement | undefined;
+      // P-035 2026-10-08. Live personal and strengths: a connector click that
+      // timed out but landed late, plus the retry's own click, left TWO copies
+      // of this lane's own chip, and the discard refused
+      // `connector_token_count:2`. Repeated copies are admitted ONLY under the
+      // provenance proof (planning header, hidden marker, invocation id), and
+      // only when every copy carries the owned connector's exact text. Every
+      // other caller still needs exactly one token.
       if (tokens.length) {
         if (!owned.connector) return withTokenShape("connector_unowned");
-        if (tokens.length !== 1) return withTokenShape(`connector_token_count:${tokens.length}`);
-        if (tokens[0].textContent?.trim() !== owned.connector) return withTokenShape("connector_token_text");
+        if (tokens.length !== 1 && owned.provenance === undefined) {
+          return withTokenShape(`connector_token_count:${tokens.length}`);
+        }
+        if (tokens.some(token => token.textContent?.trim() !== owned.connector)) {
+          return withTokenShape("connector_token_text");
+        }
         ownedToken = tokens[0];
-        // Remove exactly the outermost element, with its nested content, so the
-        // rich-node and text checks below judge only what remains.
-        ownedToken.remove();
+        // Remove exactly the outermost elements, with their nested content, so
+        // the rich-node and text checks below judge only what remains.
+        for (const token of tokens) token.remove();
       }
       // Only familiar text formatting is admissible. Unrecognised rich nodes
       // (including empty mentions) fail closed even when their text is empty.
@@ -3383,7 +3437,8 @@ export async function assertPreflightDraftSafe(
         const label = composer.contains(chip) ? ownChipText(chip) : null;
         if (label) text = text.replace(label, "");
       }
-      // The token branch above already proved exactly one outermost token
+      // The token branch above already proved one outermost token (repeated
+      // copies only under a provenance proof)
       // carrying the owned connector's own trimmed text; what remains decides
       // admission.
       let textAdmitted = false;
@@ -3408,7 +3463,12 @@ export async function assertPreflightDraftSafe(
           // only reachable with an owned token: without one, text refuses
           // exactly as before.
           const tokenName = ownedToken.textContent?.trim() ?? "";
-          const remainder = norm(text.replace(tokenName, ""));
+          // One rendered name per admitted copy of the owned chip, no more.
+          let withoutTokens = text;
+          for (let copyIndex = 0; copyIndex < tokens.length; copyIndex++) {
+            withoutTokens = withoutTokens.replace(tokenName, "");
+          }
+          const remainder = norm(withoutTokens);
           const prefixOk = remainder.startsWith(norm(owned.provenance.prefix));
           const markerOk = remainder.includes(owned.provenance.marker);
           const invocationOk = /invocation_id="[0-9a-f-]{36}"/.test(remainder);
