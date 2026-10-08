@@ -2780,6 +2780,9 @@ interface TokenShape {
   parent: TokenNodeShape | null;
   grandparent: TokenNodeShape | null;
   pillAncestor: boolean;
+  /** P-035 2026-10-08. Element children, and a tags-only outline up to 3 levels (`div>[br]`). */
+  childCount: number;
+  outline: string;
 }
 
 /**
@@ -2801,10 +2804,10 @@ interface EmbedShape {
 }
 
 /** An admission that ignored an inert empty node under the provenance proof (P-035 2026-10-08). */
-type PreflightInertAdmission = { admitted: true; inertTokenHtml: string };
+type PreflightInertAdmission = { admitted: true; inertTokenHtml: string; childCount: number; outline: string };
 
-/** What an admission reports back: the ignored inert node's capped outerHTML, if any. */
-export type PreflightAdmission = { inertTokenHtml: string };
+/** What an admission reports back about the ignored inert node: capped outerHTML, child count, tag outline. */
+export type PreflightAdmission = { inertTokenHtml: string; childCount: number; outline: string };
 
 /** The content-free diagnostics a single refusal may carry beside its reason. */
 type PreflightDiagnostic =
@@ -3278,18 +3281,51 @@ export async function assertPreflightDraftSafe(
       // element children. It is dropped from the clone and its capped
       // outerHTML is handed back for the caller to log. Any other node stays a
       // token and refuses as before.
+      //
+      // Widened the same day to a content-free SUBTREE (the first live round
+      // still refused: the node had children). Descendants may only be bare
+      // elements: no attribute at all, no text, and none of the media/input
+      // tags below. So `<br>`, empty spans and nested empty divs pass; anything
+      // that could carry content still refuses.
+      const inertBlockedTags = [
+        "img", "video", "audio", "iframe", "input", "textarea", "canvas", "svg", "object", "embed",
+      ];
+      const inertDescendants = (element: Element, budget = { left: 50 }): boolean =>
+        Array.from(element.children ?? []).every(child => {
+          budget.left -= 1;
+          return budget.left >= 0
+            && !inertBlockedTags.includes((child.tagName ?? "").toLowerCase())
+            && Array.from(child.attributes ?? []).length === 0
+            && (child.textContent ?? "").trim() === ""
+            && inertDescendants(child, budget);
+        });
       const inertToken = (token: HTMLElement): boolean => {
         try {
           return token.getAttribute("contenteditable") === "false"
             && Array.from(token.attributes).every(attribute => attribute.name === "contenteditable")
             && (token.textContent ?? "").trim() === ""
-            && token.children.length === 0;
+            && inertDescendants(token);
         } catch { return false; }
+      };
+      /** Tags only, up to 3 levels and 5 children per level: `div>[br,span>[br]]`. */
+      const tagOutline = (element: Element, depth = 3): string => {
+        const tag = chrome((element.tagName ?? "").toLowerCase()) || "unknown";
+        const children = Array.from(element.children ?? []);
+        if (depth <= 1 || children.length === 0) return children.length && depth <= 1 ? `${tag}>[...]` : tag;
+        const shown = children.slice(0, 5).map(child => tagOutline(child, depth - 1));
+        if (children.length > 5) shown.push("...");
+        return `${tag}>[${shown.join(",")}]`;
       };
       const inertTokens = owned.provenance !== undefined ? outermostTokens.filter(inertToken) : [];
       let inertTokenHtml: string | null = null;
+      let inertChildCount = 0;
+      let inertOutline = "";
       if (inertTokens.length > 0) {
         try { inertTokenHtml = String(inertTokens[0].outerHTML ?? "").slice(0, 200); } catch { inertTokenHtml = ""; }
+        try {
+          inertChildCount = (inertTokens[0].children ?? []).length;
+          inertOutline = tagOutline(inertTokens[0]).slice(0, 200);
+        } catch { inertOutline = "unknown"; }
         for (const token of inertTokens) token.remove();
       }
       const tokens = outermostTokens.filter(token => !inertTokens.includes(token));
@@ -3333,6 +3369,8 @@ export async function assertPreflightDraftSafe(
           parent: parent ? tokenNode(parent) : null,
           grandparent: grandparent ? tokenNode(grandparent) : null,
           pillAncestor,
+          childCount: Array.from(token.children ?? []).length,
+          outline: tagOutline(token).slice(0, 200),
         };
       };
       // The diagnostic never changes the refusal: an unreadable shape returns the bare reason.
@@ -3889,7 +3927,8 @@ export async function assertPreflightDraftSafe(
         }
         return { reason: "foreign_text", foreignShape: foreignShape(node) };
       }
-      return inertTokenHtml === null ? true : { admitted: true as const, inertTokenHtml };
+      return inertTokenHtml === null ? true
+        : { admitted: true as const, inertTokenHtml, childCount: inertChildCount, outline: inertOutline };
     }, {
       selector: joinSelectors(SELECTORS.composer), chromeSelectors: PREFLIGHT_CHROME, owned,
       tokenShapeValues: TOKEN_SHAPE_VALUES,
@@ -3898,7 +3937,7 @@ export async function assertPreflightDraftSafe(
     else if (typeof outcome === "string") reason = outcome;
     else if (typeof outcome === "object" && "admitted" in outcome) {
       safe = true;
-      admission = { inertTokenHtml: outcome.inertTokenHtml };
+      admission = { inertTokenHtml: outcome.inertTokenHtml, childCount: outcome.childCount, outline: outcome.outline };
     }
     else if (typeof outcome === "object" && "reason" in outcome) {
       // P-035 2026-09-28 r16. The sole-owned-token text refusal carries the
@@ -3923,11 +3962,11 @@ export async function assertPreflightDraftSafe(
       // `connector_token_count:*`): where the pill attributes sit on or above
       // the first outermost token. Never the token's text.
       if (outcome.tokenShape) {
-        const { node, textLen, slug, parent, grandparent, pillAncestor } = outcome.tokenShape;
+        const { node, textLen, slug, parent, grandparent, pillAncestor, childCount, outline } = outcome.tokenShape;
         console.error(
           `[cgpro:preflight] token shape: ${formatTokenNode(node)} text_len=${textLen} slug=${slug ? "yes" : "no"} `
           + `parent=[${formatTokenNode(parent)}] grandparent=[${formatTokenNode(grandparent)}] `
-          + `pill_ancestor=${pillAncestor ? "yes" : "no"}`,
+          + `pill_ancestor=${pillAncestor ? "yes" : "no"} child_count=${childCount} outline=${outline}`,
         );
       }
       // P-035 2026-10-03 G3-B (fifth run). One content-free line per matching

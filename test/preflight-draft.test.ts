@@ -2117,7 +2117,7 @@ describe("composed-draft provenance proof (r26)", () => {
     it("is ignored beside the owned chip under the provenance proof, and its outerHTML returned", async () => {
       const test = fixture({ tokenTree: [chip, { tagName: "DIV", attributes: [CE] }], text: composed() });
       await expect(assertPreflightDraftSafe(test.page, proof))
-        .resolves.toEqual({ inertTokenHtml: '<div contenteditable="false"></div>' });
+        .resolves.toEqual({ inertTokenHtml: '<div contenteditable="false"></div>', childCount: 0, outline: "div" });
       expect(test.removedTokens.map(token => token.tagName)).toEqual(["DIV", "SPAN"]);
     });
 
@@ -2130,18 +2130,39 @@ describe("composed-draft provenance proof (r26)", () => {
       expect(error.reason).toBe("connector_token_text");
     });
 
-    it("still refuses when the node carries another attribute or a child element", async () => {
+    it("still refuses when the root carries another attribute", async () => {
       const extraAttribute = await assertPreflightDraftSafe(
         fixture({ tokenTree: [chip, { tagName: "DIV", attributes: [CE, { name: "class", value: "c" }] }], text: composed() }).page,
         proof,
       ).catch(caught => caught);
       expect(extraAttribute.reason).toBe("connector_token_text");
+    });
 
-      const withChild = await assertPreflightDraftSafe(
-        fixture({ tokenTree: [chip, { tagName: "DIV", attributes: [CE], children: [{ tagName: "SPAN" }] }], text: composed() }).page,
-        proof,
-      ).catch(caught => caught);
-      expect(withChild.reason).toBe("connector_token_text");
+    // Widened the same day: a content-free SUBTREE, so `<br>` and empty spans pass.
+    it("ignores a <br> child and nested empty spans, reporting child count and tag outline", async () => {
+      const br = fixture({ tokenTree: [chip, { tagName: "DIV", attributes: [CE], children: [{ tagName: "BR" }] }], text: composed() });
+      await expect(assertPreflightDraftSafe(br.page, proof)).resolves.toMatchObject({ childCount: 1, outline: "div>[br]" });
+
+      const nested = fixture({ tokenTree: [chip, {
+        tagName: "DIV", attributes: [CE], children: [{ tagName: "SPAN", children: [{ tagName: "SPAN" }] }],
+      }], text: composed() });
+      await expect(assertPreflightDraftSafe(nested.page, proof))
+        .resolves.toMatchObject({ childCount: 1, outline: "div>[span>[span]]" });
+    });
+
+    it("refuses a child holding text, a child with an attribute, and an <img> child", async () => {
+      const cases: TokenNode[][] = [
+        [{ tagName: "SPAN", textContent: "x" }],
+        [{ tagName: "SPAN", attributes: [{ name: "class", value: "c" }] }],
+        [{ tagName: "IMG" }],
+      ];
+      for (const children of cases) {
+        const error = await assertPreflightDraftSafe(
+          fixture({ tokenTree: [chip, { tagName: "DIV", attributes: [CE], children }], text: composed() }).page, proof,
+        ).catch(caught => caught);
+        expect(error).toBeInstanceOf(PreflightDraftProtectedError);
+        expect(error.reason).toBe("connector_token_text");
+      }
     });
 
     it("is never ignored without the provenance proof", async () => {
@@ -3218,7 +3239,8 @@ describe("own Deep Research pill on an ancestor, and the token shape line", () =
       + "text_len=20 slug=no "
       + "parent=[tag=SPAN attrs=data-inline-selection-pill,data-type,role data-id=- data-type=\"mention\" "
       + "role=\"button\" aria-label=- class=- app-mention-name=- app-mention-path=- data-prompt-link-label=-] "
-      + "grandparent=[tag=P attrs=data-empty data-id=- data-type=- role=- aria-label=- class=- app-mention-name=- app-mention-path=- data-prompt-link-label=-] pill_ancestor=yes",
+      + "grandparent=[tag=P attrs=data-empty data-id=- data-type=- role=- aria-label=- class=- app-mention-name=- app-mention-path=- data-prompt-link-label=-] pill_ancestor=yes "
+      + "child_count=0 outline=span",
     ]);
     for (const line of lines) {
       expect(line).not.toContain("zorble");
@@ -3234,7 +3256,7 @@ describe("own Deep Research pill on an ancestor, and the token shape line", () =
     expect(error.reason).toBe("connector_token_text");
     expect(lines.filter(line => line.includes("token shape"))).toEqual([
       "[cgpro:preflight] token shape: tag=SPAN attrs=- data-id=- data-type=- role=- aria-label=- class=- app-mention-name=- app-mention-path=- data-prompt-link-label=- "
-      + "text_len=15 slug=yes parent=[-] grandparent=[-] pill_ancestor=no",
+      + "text_len=15 slug=yes parent=[-] grandparent=[-] pill_ancestor=no child_count=0 outline=span",
     ]);
   });
 
@@ -3243,7 +3265,7 @@ describe("own Deep Research pill on an ancestor, and the token shape line", () =
     expect(unowned.error.reason).toBe("connector_unowned");
     expect(unowned.lines.filter(line => line.includes("token shape"))).toEqual([
       "[cgpro:preflight] token shape: tag=A attrs=- data-id=- data-type=- role=- aria-label=- class=- app-mention-name=- app-mention-path=- data-prompt-link-label=- "
-      + "text_len=6 slug=yes parent=[-] grandparent=[-] pill_ancestor=no",
+      + "text_len=6 slug=yes parent=[-] grandparent=[-] pill_ancestor=no child_count=0 outline=a",
     ]);
     const count = await linesOf(fixture({
       tokenTree: [{ tagName: "B", textContent: "Private Name" }, { tagName: "A", textContent: "lane-x" }],
@@ -3251,7 +3273,7 @@ describe("own Deep Research pill on an ancestor, and the token shape line", () =
     expect(count.error.reason).toBe("connector_token_count:2");
     expect(count.lines.filter(line => line.includes("token shape"))).toEqual([
       "[cgpro:preflight] token shape: tag=B attrs=- data-id=- data-type=- role=- aria-label=- class=- app-mention-name=- app-mention-path=- data-prompt-link-label=- "
-      + "text_len=12 slug=no parent=[-] grandparent=[-] pill_ancestor=no",
+      + "text_len=12 slug=no parent=[-] grandparent=[-] pill_ancestor=no child_count=0 outline=b",
     ]);
     expect(count.lines.join("\n")).not.toContain("Private");
   });
