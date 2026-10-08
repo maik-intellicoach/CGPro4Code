@@ -256,10 +256,12 @@ export function extractLatestNativeResearchReport(body: unknown): NativeResearch
         }
       }
       // The engine is the report's own slug (P-035 D13 2026-10-08, run 144151b2:
-      // "deep-research-mini" under a GPT-6 Pro composer); the app tool node's
-      // slug only names the model that dispatched it, and stands in when the
-      // report carries none. Never the composer's model.
-      recovered = { text, model: modelSlugOf(reportMetadata) ?? modelSlugOf(metadata) };
+      // "deep-research-mini" under a GPT-6 Pro composer). The app tool node's
+      // slug only names the model that dispatched it, so a report without its
+      // own slug has an unknown engine: the dispatcher would read as a full
+      // engine and clear a reduced-engine hold (P-035 review F1 2026-10-08).
+      // Never the composer's model either.
+      recovered = { text, model: modelSlugOf(reportMetadata) };
     }
     nodeId = typeof node.parent === "string" ? node.parent : null;
   }

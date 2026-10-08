@@ -51,13 +51,15 @@ describe("native app report extraction", () => {
     (x.tool.metadata as any).default_model_slug="gpt-6-pro";x.tool.metadata.chatgpt_sdk.widget_state=JSON.stringify(x.state);
     expect(extractLatestNativeResearchReport(x.body)?.model).toBe("deep-research-mini");
   });
-  it("falls back to the app tool node's slug when the report names none", () => {
-    const x=fixture();delete (x.report.metadata as any).resolved_model_slug;
-    (x.tool.metadata as any).model_slug="gpt-6-instant";(x.tool.metadata as any).default_model_slug="gpt-6-pro";
-    x.tool.metadata.chatgpt_sdk.widget_state=JSON.stringify(x.state);
-    expect(extractLatestNativeResearchReport(x.body)?.model).toBe("gpt-6-instant");
-    delete (x.tool.metadata as any).model_slug;
-    expect(extractLatestNativeResearchReport(x.body)?.model).toBeNull();
+  // P-035 review F1 2026-10-08: the dispatcher's slug read as a full engine and
+  // cleared a deep-research-mini hold. A report without its own slug is unknown.
+  it("leaves the engine unknown when the report names none, never the dispatcher's slug", () => {
+    const x=fixture();delete (x.report.metadata as any).resolved_model_slug;delete (x.report.metadata as any).model_slug;
+    (x.tool.metadata as any).resolved_model_slug="gpt-6-instant";(x.tool.metadata as any).model_slug="gpt-6-instant";
+    (x.tool.metadata as any).default_model_slug="gpt-6-pro";x.tool.metadata.chatgpt_sdk.widget_state=JSON.stringify(x.state);
+    const report=extractLatestNativeResearchReport(x.body);
+    expect(report?.text).toBeTruthy();
+    expect(report?.model).toBeNull();
   });
   it("ignores another app even when it has report-shaped metadata", () => {
     const x=fixture();x.tool.metadata.invoked_resource.resource_uri="/another_app/start";expect(extractLatestNativeResearchReport(x.body)).toBeNull();
