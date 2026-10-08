@@ -3281,9 +3281,9 @@ export async function assertPreflightDraftSafe(
         } catch { attrs = []; }
         return { tag: chrome(element.tagName ?? "") || "unknown", attrs, values };
       };
-      const tokenShape = (fallback: HTMLElement): TokenShape => {
+      const tokenShape = (fallback: HTMLElement, index = 0): TokenShape => {
         const originalFirst = Array.from(composer.querySelectorAll<HTMLElement>('[contenteditable="false"]'))
-          .filter(token => !token.parentElement?.closest('[contenteditable="false"]') && !ownChips.includes(token))[0];
+          .filter(token => !token.parentElement?.closest('[contenteditable="false"]') && !ownChips.includes(token))[index];
         const token = originalFirst ?? fallback;
         const root = originalFirst ? composer : copy;
         const text = token.textContent ?? "";
@@ -3305,8 +3305,10 @@ export async function assertPreflightDraftSafe(
         };
       };
       // The diagnostic never changes the refusal: an unreadable shape returns the bare reason.
-      const withTokenShape = (reason: string): string | PreflightDiagnostic => {
-        try { return { reason, tokenShape: tokenShape(tokens[0]) }; } catch { return reason; }
+      // P-035 2026-10-08: `index` names the token the refusal is about (the
+      // first copy that is not the owned chip), defaulting to the first.
+      const withTokenShape = (reason: string, index = 0): string | PreflightDiagnostic => {
+        try { return { reason, tokenShape: tokenShape(tokens[index], index) }; } catch { return reason; }
       };
       let ownedToken: HTMLElement | undefined;
       // P-035 2026-10-08. Live personal and strengths: a connector click that
@@ -3321,9 +3323,8 @@ export async function assertPreflightDraftSafe(
         if (tokens.length !== 1 && owned.provenance === undefined) {
           return withTokenShape(`connector_token_count:${tokens.length}`);
         }
-        if (tokens.some(token => token.textContent?.trim() !== owned.connector)) {
-          return withTokenShape("connector_token_text");
-        }
+        const stranger = tokens.findIndex(token => token.textContent?.trim() !== owned.connector);
+        if (stranger >= 0) return withTokenShape("connector_token_text", stranger);
         ownedToken = tokens[0];
         // Remove exactly the outermost elements, with their nested content, so
         // the rich-node and text checks below judge only what remains.
