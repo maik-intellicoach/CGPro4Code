@@ -1054,6 +1054,10 @@ describe("Pro usage limit in the model picker", () => {
 
   it("fills the pre-submit reset instant from the usage panel when the notice names none", async () => {
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // The panel names "Oct 4" without a year; pin the clock before it so the
+    // year resolves to 2026 on any run date.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(PANEL_RESET_MS - 24 * 3600 * 1000);
     try {
       const s = setup({
         pickerEntries: ["Latest", "Pro"],
@@ -1080,6 +1084,7 @@ describe("Pro usage limit in the model picker", () => {
       expect(used[0]).not.toContain("Oct 4");
     } finally {
       spy.mockRestore();
+      vi.useRealTimers();
     }
   });
 
