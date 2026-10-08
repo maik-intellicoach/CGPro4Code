@@ -148,6 +148,7 @@ async function runHumanMode(askOpts: AskOptions, opts: AskCliOptions): Promise<n
 
   let firstDelta = true;
   let buffer = "";
+  let modelMismatch: { wanted?: string; got?: string | null } | undefined;
 
   const writeStream = !opts.noStream && !opts.render;
 
@@ -166,7 +167,9 @@ async function runHumanMode(askOpts: AskOptions, opts: AskCliOptions): Promise<n
           process.stdout.write(ev.text);
         }
       } else if (ev.type === "tool") {
-        // future: render tool calls
+        if (ev.name === "model-mismatch") {
+          modelMismatch = (ev.meta ?? {}) as { wanted?: string; got?: string | null };
+        }
       } else if (ev.type === "error") {
         if (!firstDelta) process.stdout.write("\n");
         spinner.fail(ev.message);
@@ -206,6 +209,11 @@ async function runHumanMode(askOpts: AskOptions, opts: AskCliOptions): Promise<n
     if (opts.save && summary.conversationId) {
       await saveThread(opts.save, summary.conversationId, askOpts.model);
       console.log(chalk.dim(`\nSaved conversation as "${opts.save}".`));
+    }
+    if (modelMismatch) {
+      const { wanted, got } = modelMismatch;
+      spinner.fail(`Model mismatch: asked for "${wanted ?? "unknown"}", ChatGPT served "${got ?? "unknown"}"`);
+      return 1;
     }
     return 0;
   } catch (err) {
