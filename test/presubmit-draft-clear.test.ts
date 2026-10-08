@@ -446,6 +446,35 @@ describe("sendPrompt never submits its own pasted-text card", () => {
     expect(sendClick).toHaveBeenCalled();
   });
 
+  // P-035 review E 2026-10-08: with files attached, a card appearing after a
+  // zero count may be the caller's own late file card; its X is never clicked.
+  it("never clicks a card when files were attached and their card mounted late", async () => {
+    const state: ComposerState = { text: "", unknown: false, readable: true, url: "https://chatgpt.com/" };
+    const sendClick = vi.fn(async () => {});
+    requireSelector.mockImplementation(async () => fakeLocator(state));
+    firstResolved.mockResolvedValue({ ...fakeLocator(state), click: sendClick });
+
+    const page = fakePage(state);
+    const error = await sendPrompt(page, "hello world", false, undefined, async () => { state.cards = 1; },
+      undefined, undefined, true).catch(caught => caught);
+
+    expect(error).toBeInstanceOf(PreSubmitInteractionError);
+    expect(sendClick).not.toHaveBeenCalled();
+    expect(cardClicks).toBe(0);
+    expect(state.cards).toBe(1);
+  });
+
+  it("sends with files attached when their card was already there and nothing new appeared", async () => {
+    const state: ComposerState = { text: "", unknown: false, readable: true, url: "https://chatgpt.com/", cards: 1 };
+    const sendClick = vi.fn(async () => {});
+    requireSelector.mockImplementation(async () => fakeLocator(state));
+    firstResolved.mockResolvedValue({ ...fakeLocator(state), click: sendClick });
+
+    await sendPrompt(fakePage(state), "hello world", false, undefined, async () => {}, undefined, undefined, true);
+    expect(sendClick).toHaveBeenCalled();
+    expect(cardClicks).toBe(0);
+  });
+
   it("refuses the send, and clears its own draft, when the card survives its X", async () => {
     const state: ComposerState = { text: "", unknown: false, readable: true, url: "https://chatgpt.com/", cardsStuck: true };
     requireSelector.mockImplementation(async () => fakeLocator(state));

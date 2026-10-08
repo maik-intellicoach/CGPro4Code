@@ -438,6 +438,7 @@ function runAskInner(
           },
           ownedConnector,
           submitCounts,
+          (opts.images?.length ?? 0) > 0,
         );
         nativeChipPreSubmit = false;
       } catch (error) {

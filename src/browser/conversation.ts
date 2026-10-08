@@ -2410,8 +2410,15 @@ async function clickConnector(page: Page, row: Locator, name: string): Promise<v
   }
 }
 
-/** How long a timed-out connector click may take to land before it is retried. */
-const LATE_CLICK_SETTLE_MS = Math.max(0, Number(process.env.CGPRO_CONNECTOR_LATE_CLICK_MS ?? 2_000));
+/**
+ * How long a timed-out connector click may take to land before it is retried.
+ * A non-numeric override falls back to the default: a NaN deadline never
+ * passes, so composerHoldsToolChip would poll forever (P-035 review D 2026-10-08).
+ */
+const LATE_CLICK_SETTLE_MS = (() => {
+  const configured = Number(process.env.CGPRO_CONNECTOR_LATE_CLICK_MS ?? 2_000);
+  return Number.isFinite(configured) ? Math.max(0, configured) : 2_000;
+})();
 
 /**
  * Whether the composer already holds this connector's chip: an outermost
@@ -4108,6 +4115,12 @@ export async function sendPrompt(
    * and its own unknown-prior path (the rule stays off).
    */
   submitCounts?: { priorAnyMessages?: number },
+  /**
+   * P-035 review E (2026-10-08). This turn attached files before the send.
+   * Their card may mount after the count below (attachImages only waits a
+   * fixed settle), so a zero count then proves nothing about later cards.
+   */
+  attachedFiles = false,
 ): Promise<number> {
   const assistantCount = async (): Promise<number> => page
     .locator(SELECTORS.assistantMessages.join(", "))
@@ -4130,7 +4143,11 @@ export async function sendPrompt(
   // P-035 2026-10-08. Counted before this call inserts anything: a remove
   // control that is in the form after the insert but not before is the
   // attachment card this call's own paste produced. See the cleanup below.
-  const removeControlsBefore = await countFormRemoveControls(composer);
+  // With files attached, a zero count may only mean their card has not mounted
+  // yet: it is unknown, so no card is clicked and any card refuses the send
+  // (P-035 review E 2026-10-08: the X could remove the caller's own file).
+  const counted = await countFormRemoveControls(composer);
+  const removeControlsBefore = attachedFiles && counted === 0 ? -1 : counted;
   // Put the caret in the composer's text flow before inserting anything. This
   // replaces a "Meta+End" that could not do the job: see focusComposerEnd.
   // Fail OPEN here and let the delivery check decide -- it is the thing that
