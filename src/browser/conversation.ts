@@ -3979,6 +3979,10 @@ export async function sendPrompt(
   if (!preserveExisting) {
     await clearComposer(page);
   }
+  // P-035 2026-10-08. Counted before this call inserts anything: a remove
+  // control that is in the form after the insert but not before is the
+  // attachment card this call's own paste produced. See the cleanup below.
+  const removeControlsBefore = await countFormRemoveControls(composer);
   // Put the caret in the composer's text flow before inserting anything. This
   // replaces a "Meta+End" that could not do the job: see focusComposerEnd.
   // Fail OPEN here and let the delivery check decide -- it is the thing that
@@ -4027,7 +4031,7 @@ export async function sendPrompt(
     await verifySubmission?.();
   } catch (error) {
     if (error instanceof PreSubmitInteractionError) {
-      await discardOwnedPresubmitDraft(page, composer, prompt, preserveExisting, ownedConnector);
+      await discardOwnedPresubmitDraft(page, composer, prompt, preserveExisting, ownedConnector, removeControlsBefore);
     }
     throw error;
   }
@@ -4079,11 +4083,24 @@ export async function sendPrompt(
  * untouched. The refusal is the caller's to re-throw; nothing here may replace
  * or mask it.
  *
+ * P-035 2026-10-08. Live personal and strengths (C-239 planning turns): a large
+ * prompt's paste became a "pasted text" attachment card above the composer,
+ * the typed fallback then inserted the prompt itself, and the guard refused the
+ * card's X as `form_media:remove` before it ever compared the text, so every
+ * large prompt's draft was `not_owned`. The card is provably this call's when
+ * the form held NO remove control right before this call inserted anything
+ * (`removeControlsBefore === 0`, counted by the caller) and holds some now: the
+ * lane's page lease admits no other writer in between. Only then are those
+ * cards removed through their own X, and the ownership proof above still
+ * decides the text. A form that already held one, or an unreadable count
+ * (`-1`), removes nothing.
+ *
  * Exactly one content-free line is logged, and it never carries page or
  * prompt text.
  */
 async function discardOwnedPresubmitDraft(
   page: Page, composer: Locator, prompt: string, preserveExisting: boolean, ownedConnector?: string,
+  removeControlsBefore = -1,
 ): Promise<void> {
   try {
     // A preserving turn with no owned connector cannot prove ownership from
@@ -4093,6 +4110,21 @@ async function discardOwnedPresubmitDraft(
       console.error("[cgpro:presubmit] owned draft cleared=no reason=preserve_existing");
       return;
     }
+    let pastedCards = 0;
+    if (removeControlsBefore === 0) {
+      const controls = formRemoveControls(composer);
+      pastedCards = await controls.count();
+      // Bounded: one paste makes one card. Each click removes one, so the
+      // first match is always the next card still present.
+      for (let index = 0; index < Math.min(pastedCards, 3); index++) {
+        await controls.first().click({ timeout: 5_000 });
+      }
+      if (pastedCards > 0 && await controls.count() !== 0) {
+        console.error("[cgpro:presubmit] owned draft cleared=no reason=clear_failed");
+        return;
+      }
+    }
+    const cardsNote = pastedCards > 0 ? ` pasted_cards=${pastedCards}` : "";
     let owned = false;
     try {
       // Admissible only as exactly what this call inserted: the prompt alone,
@@ -4107,7 +4139,7 @@ async function discardOwnedPresubmitDraft(
       owned = false;
     }
     if (!owned) {
-      console.error("[cgpro:presubmit] owned draft cleared=no reason=not_owned");
+      console.error(`[cgpro:presubmit] owned draft cleared=no reason=not_owned${cardsNote}`);
       return;
     }
     // Playwright's own keyboard, scoped to the composer this call focused:
@@ -4117,14 +4149,28 @@ async function discardOwnedPresubmitDraft(
     await page.keyboard.press("Delete");
     const remaining = await readComposer(page, composer);
     if (remaining === null || remaining.length > 0) {
-      console.error("[cgpro:presubmit] owned draft cleared=no reason=clear_failed");
+      console.error(`[cgpro:presubmit] owned draft cleared=no reason=clear_failed${cardsNote}`);
       return;
     }
-    console.error("[cgpro:presubmit] owned draft cleared=yes reason=owned");
+    console.error(`[cgpro:presubmit] owned draft cleared=yes reason=owned${cardsNote}`);
   } catch {
     // Cleanup must never mask the refusal it is repairing. No composer state
     // is read or reported beyond the content-free outcome.
     console.error("[cgpro:presubmit] owned draft cleared=no reason=clear_failed");
+  }
+}
+
+/** The remove-labelled controls in the composer's form (the guard's `form_media:remove`). */
+function formRemoveControls(composer: Locator): Locator {
+  return composer.locator("xpath=ancestor::form[1]").locator(PREFLIGHT_CHROME.formRemoveControl);
+}
+
+/** Their count, or -1 when it cannot be read: unknown is never "none". */
+async function countFormRemoveControls(composer: Locator): Promise<number> {
+  try {
+    return await formRemoveControls(composer).count();
+  } catch {
+    return -1;
   }
 }
 

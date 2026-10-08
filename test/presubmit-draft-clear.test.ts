@@ -35,10 +35,15 @@ interface ComposerState {
   unknown: boolean;
   readable: boolean;
   url: string;
+  /** "Pasted text" attachment cards above the composer, each with a remove-labelled X. */
+  cards?: number;
+  /** The cards' X does nothing. */
+  cardsStuck?: boolean;
 }
 
 let selectedAll = false;
 let caretInComposer = true;
+let cardClicks = 0;
 
 function fakeLocator(state: ComposerState) {
   return {
@@ -47,6 +52,18 @@ function fakeLocator(state: ComposerState) {
     innerText: async () => state.text,
     // focusComposerEnd seats the caret in the contenteditable host.
     evaluate: async () => { caretInComposer = true; return true; },
+    // composer -> its form -> the form's remove-labelled controls (the cards' X).
+    locator: () => ({
+      locator: () => ({
+        count: async () => state.cards ?? 0,
+        first: () => ({
+          click: vi.fn(async () => {
+            cardClicks += 1;
+            if (!state.cardsStuck && (state.cards ?? 0) > 0) state.cards = (state.cards ?? 0) - 1;
+          }),
+        }),
+      }),
+    }),
   };
 }
 
@@ -94,9 +111,12 @@ function fakePage(state: ComposerState, options: { ignoreClear?: boolean } = {})
         contains: () => false,
         tagName: "DIV",
       };
+      const card = { tagName: "BUTTON", getAttribute: () => "Remove file" };
+      const cardsFor = (selector: string) =>
+        selector === '[aria-label*="remove" i]' ? Array.from({ length: state.cards ?? 0 }, () => card) : [];
       const form = {
-        querySelector: () => null,
-        querySelectorAll: () => [],
+        querySelector: (selector: string) => cardsFor(selector)[0] ?? null,
+        querySelectorAll: (selector: string) => cardsFor(selector),
       };
       const document = {
         body: { childNodes: [composer] },
@@ -136,6 +156,7 @@ let log: ReturnType<typeof vi.spyOn>;
 beforeEach(() => {
   selectedAll = false;
   caretInComposer = true;
+  cardClicks = 0;
   requireSelector.mockReset();
   firstResolved.mockReset();
   log = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -287,6 +308,69 @@ describe("sendPrompt removes the draft it inserted when a pre-submit check refus
 
     expect(state.text).toBe("hello world"); // the insert landed; the read could not prove it
     expect(presubmitLines(log)).toEqual(["[cgpro:presubmit] owned draft cleared=no reason=not_owned"]);
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Delete");
+  });
+});
+
+// P-035 2026-10-08. Live personal and strengths: a large prompt's paste became a
+// "pasted text" attachment card above the composer, the typed fallback inserted
+// the prompt too, and the guard refused the card's X as `form_media:remove`, so
+// the connector-turn draft was `not_owned` and wedged both lanes.
+describe("sendPrompt removes the pasted-text card its own insert produced", () => {
+  const connector = "p035-low-risk-workstation";
+
+  it("removes a card that appeared during this call, then clears the owned connector draft", async () => {
+    const state: ComposerState = { text: "", mention: connector, unknown: false, readable: true, url: "https://chatgpt.com/" };
+    requireSelector.mockImplementation(async () => fakeLocator(state));
+    firstResolved.mockResolvedValue(fakeLocator(state));
+    const error = proLimitRefusal();
+
+    const page = fakePage(state);
+    await expect(sendPrompt(page, "hello world", true, undefined, async () => {
+      state.cards = 1; // the paste's card, absent before this call inserted anything
+      throw error;
+    }, connector)).rejects.toBe(error);
+
+    expect(state.cards).toBe(0);
+    expect(cardClicks).toBe(1);
+    expect(state.text).toBe("");
+    expect(presubmitLines(log)).toEqual(["[cgpro:presubmit] owned draft cleared=yes reason=owned pasted_cards=1"]);
+  });
+
+  it("removes nothing when the form already held a card before this call inserted", async () => {
+    const state: ComposerState = {
+      text: "", mention: connector, unknown: false, readable: true, url: "https://chatgpt.com/", cards: 1,
+    };
+    requireSelector.mockImplementation(async () => fakeLocator(state));
+    firstResolved.mockResolvedValue(fakeLocator(state));
+
+    const page = fakePage(state);
+    await expect(sendPrompt(page, "hello world", true, undefined, async () => { throw proLimitRefusal(); }, connector))
+      .rejects.toBeInstanceOf(PreSubmitInteractionError);
+
+    expect(state.cards).toBe(1); // not proven ours: untouched
+    expect(cardClicks).toBe(0);
+    expect(state.text).toBe("hello world");
+    expect(presubmitLines(log)).toEqual(["[cgpro:presubmit] owned draft cleared=no reason=not_owned"]);
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Delete");
+  });
+
+  it("reports clear_failed and leaves the text when the card survives its own X", async () => {
+    const state: ComposerState = {
+      text: "", mention: connector, unknown: false, readable: true, url: "https://chatgpt.com/", cardsStuck: true,
+    };
+    requireSelector.mockImplementation(async () => fakeLocator(state));
+    firstResolved.mockResolvedValue(fakeLocator(state));
+
+    const page = fakePage(state);
+    await expect(sendPrompt(page, "hello world", true, undefined, async () => {
+      state.cards = 1;
+      throw proLimitRefusal();
+    }, connector)).rejects.toBeInstanceOf(PreSubmitInteractionError);
+
+    expect(state.cards).toBe(1);
+    expect(state.text).toBe("hello world");
+    expect(presubmitLines(log)).toEqual(["[cgpro:presubmit] owned draft cleared=no reason=clear_failed"]);
     expect(page.keyboard.press).not.toHaveBeenCalledWith("Delete");
   });
 });

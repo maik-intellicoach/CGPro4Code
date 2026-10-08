@@ -313,6 +313,13 @@ export const PREFLIGHT_CHROME = {
    * inside it) is never the tooltip.
    */
   deepResearchTooltip: ['[role="tooltip"]', "[data-radix-popper-content-wrapper]"],
+  /**
+   * P-035 2026-10-08. The guard's `form_media:remove` selector, as the
+   * pre-submit cleanup scopes it to the composer's form. ChatGPT turns a large
+   * paste into a "pasted text" attachment card above the composer whose X
+   * carries a remove label; nothing else in an empty form does.
+   */
+  formRemoveControl: '[aria-label*="remove" i]',
 } as const;
 
 /**
