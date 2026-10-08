@@ -46,4 +46,34 @@ describe("native app report extraction", () => {
   it("ignores another app even when it has report-shaped metadata", () => {
     const x=fixture();x.tool.metadata.invoked_resource.resource_uri="/another_app/start";expect(extractLatestNativeResearchReport(x.body)).toBeNull();
   });
+  // Trimmed from the GPT-6 Deep Research report of invocation 144151b2 (P-035 2026-10-08):
+  // content_references is empty and the sources sit in metadata.citations with code-point offsets.
+  function gpt6Report(text: string, offsets: Array<[number, number]>) {
+    const x = fixture();
+    const sources = [
+      { title: "Meet ScreenCaptureKit - WWDC22 - Videos - Apple Developer", url: "https://developer.apple.com/videos/play/wwdc2022/10156/#:~:text=On%20the%20video%20side%2C%20the,to%20the%20CMSampleBuffer%20in%20SCStreamFrameInfo" },
+      { title: "Take ScreenCaptureKit to the next level - WWDC22 - Videos - Apple Developer", url: "https://developer.apple.com/la/videos/play/wwdc2022/10155/#:~:text=let%20attachments%20%3D%20attachmentsArray,return" },
+    ];
+    x.report.content.parts = [text];
+    (x.report.metadata as any) = { resolved_model_slug: "gpt-6-pro", content_references: [], citations: offsets.map(([start_ix, end_ix], i) => ({
+      start_ix, end_ix, citation_format_type: "tether_v4",
+      metadata: { type: "webpage", ...sources[i], text: "", pub_date: null, extra: { cited_message_idx: 31, start_line_num: 381, end_line_num: 390 }, og_tags: null },
+    })) };
+    x.tool.metadata.chatgpt_sdk.widget_state = JSON.stringify(x.state);
+    return x.body;
+  }
+  const meet = "([Meet ScreenCaptureKit - WWDC22 - Videos - Apple Developer](https://developer.apple.com/videos/play/wwdc2022/10156/#:~:text=On%20the%20video%20side%2C%20the,to%20the%20CMSampleBuffer%20in%20SCStreamFrameInfo))";
+  const next = "([Take ScreenCaptureKit to the next level - WWDC22 - Videos - Apple Developer](https://developer.apple.com/la/videos/play/wwdc2022/10155/#:~:text=let%20attachments%20%3D%20attachmentsArray,return))";
+  it("resolves GPT-6 tether_v4 citations by offset when content_references is empty", () => {
+    const body = gpt6Report("to avoid re-saving static content【31†L381-L390】【5†L218-L224】. Com", [[33, 47], [47, 60]]);
+    expect(extractLatestNativeResearchReport(body)?.text).toBe(`to avoid re-saving static content${meet}${next}. Com`);
+  });
+  it("indexes citation offsets in code points, before trimming", () => {
+    const body = gpt6Report("\n\u{1F4F7} content【31†L381-L390】", [[10, 24]]);
+    expect(extractLatestNativeResearchReport(body)?.text).toBe(`\u{1F4F7} content${meet}`);
+  });
+  it("leaves a marker visible when its citation offsets do not land on it", () => {
+    const body = gpt6Report("content【31†L381-L390】", [[6, 20]]);
+    expect(extractLatestNativeResearchReport(body)?.text).toBe("content【31†L381-L390】");
+  });
 });

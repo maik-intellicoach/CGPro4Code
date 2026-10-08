@@ -167,6 +167,41 @@ export interface NativeResearchReport {
   userNodeId: string;
 }
 
+/**
+ * GPT-6 Deep Research (P-035 2026-10-08, invocation 144151b2): the report keeps
+ * `【31†L381-L390】` markers in its text, leaves `content_references` empty and
+ * puts the sources in `metadata.citations` as
+ * `{ start_ix, end_ix, citation_format_type: "tether_v4", metadata: { type: "webpage", title, url } }`.
+ * The offsets are code points (Python-side), not UTF-16 units. A citation is
+ * replaced only when its span is exactly one marker; anything else stays
+ * visible so the caller still counts it as unresolved.
+ */
+function resolveOffsetCitations(text: string, citations: unknown): string {
+  if (!Array.isArray(citations) || citations.length === 0) return text;
+  const chars = Array.from(text);
+  const spans: Array<{ start: number; end: number; link: string }> = [];
+  for (const value of citations) {
+    const citation = asObject(value);
+    const source = asObject(citation?.metadata);
+    const start = citation?.start_ix;
+    const end = citation?.end_ix;
+    const url = typeof source?.url === "string" ? source.url : "";
+    if (typeof start !== "number" || typeof end !== "number" || !/^https?:\/\//.test(url)) continue;
+    if (!/^【[^】]*】$/.test(chars.slice(start, end).join(""))) continue;
+    const label = (typeof source?.title === "string" && source.title.trim()) || url.split("/")[2];
+    const href = url.replace(/\(/g, "%28").replace(/\)/g, "%29").replace(/\s/g, "%20");
+    spans.push({ start, end, link: `([${label.replace(/[[\]]/g, "\\$&")}](${href}))` });
+  }
+  spans.sort((a, b) => b.start - a.start);
+  let floor = chars.length;
+  for (const span of spans) {
+    if (span.end > floor) continue; // overlapping spans: keep the later one only
+    chars.splice(span.start, span.end - span.start, span.link);
+    floor = span.start;
+  }
+  return chars.join("");
+}
+
 /** Native research reports live in the app widget, not an assistant bubble. */
 export function extractLatestNativeResearchReport(body: unknown): NativeResearchReport | null {
   const root = asObject(body);
@@ -194,9 +229,13 @@ export function extractLatestNativeResearchReport(body: unknown): NativeResearch
       if (state?.status !== "completed" || asObject(report?.author)?.role !== "assistant" ||
           report?.status !== "finished_successfully" || report?.end_turn !== true ||
           content?.content_type !== "text" || !Array.isArray(content.parts)) return null;
-      let text = content.parts.filter((part): part is string => typeof part === "string").join("\n").trim();
-      if (!text) return null;
       const reportMetadata = asObject(report.metadata);
+      // Offsets index the untrimmed text, so citations resolve before trim.
+      let text = resolveOffsetCitations(
+        content.parts.filter((part): part is string => typeof part === "string").join("\n"),
+        reportMetadata?.citations,
+      ).trim();
+      if (!text) return null;
       const references = reportMetadata?.content_references;
       if (Array.isArray(references)) {
         for (const value of references) {
