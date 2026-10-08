@@ -19,6 +19,7 @@ import {
   setDeepResearch,
   setWebSearch,
   stopCurrentTurn,
+  turnFailureNoticeVisible,
   waitForComposerHydrated,
   waitTurnComplete,
 } from "../browser/conversation.js";
@@ -503,6 +504,21 @@ function runAskInner(
           if (!force && status === 404) {
             connectorNotFoundSince ??= now;
             connectorNotFoundError = err as Error;
+            // P-035 2026-10-08. Live ms1980 (c77d2db2): the record answered 404
+            // from 4 s to 126 s after Send while ChatGPT showed its own "something
+            // seems to have gone wrong" notice; the grace then reported a bare 404
+            // and hid the cause. A read lag clears within one poll; a 404 that
+            // outlives one poll interval WITH that notice is a turn ChatGPT itself
+            // failed, so say so now instead of waiting out the grace.
+            if (now - connectorNotFoundSince >= CONNECTOR_EVIDENCE_POLL_MS && await turnFailureNoticeVisible(page)) {
+              throw Object.assign(
+                new Error(
+                  "ChatGPT reported the turn failed (its own something-went-wrong notice) and the conversation record "
+                    + `stayed unreadable: connector state fetch failed with HTTP 404 for ${Math.round((now - connectorNotFoundSince) / 1_000)}s`,
+                ),
+                { cause: err },
+              );
+            }
             if (now - connectorNotFoundSince < CONNECTOR_NOT_FOUND_GRACE_MS) return;
           }
           // Other denials cannot recover through progress polling; surface them

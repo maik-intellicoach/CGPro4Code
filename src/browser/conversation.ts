@@ -4173,6 +4173,24 @@ export async function sendPrompt(
   }
   if (cancelled?.()) return priorAssistantCount;
 
+  // P-035 2026-10-08 (D8). A paste too large to land as text becomes a "pasted
+  // text" attachment card, and the typed fallback then inserts the prompt as
+  // well, so the turn went out TWICE: live ms1980 c77d2db2 listed
+  // `Pasted text(10).txt` under Sources and the model answered "I'll review
+  // the attached brief". Remove our own card before the send; a card that
+  // survives its X refuses the send rather than double it.
+  const pastedCards = await removeOwnPastedCards(composer, removeControlsBefore).catch(() => null);
+  if (pastedCards === null) {
+    const refusal = new PreSubmitInteractionError(
+      "prompt_delivery_incomplete",
+      "prompt_delivery",
+      "the pasted-text attachment this call's own paste created could not be removed before submission",
+    );
+    await discardOwnedPresubmitDraft(page, composer, prompt, preserveExisting, ownedConnector, removeControlsBefore);
+    throw refusal;
+  }
+  if (pastedCards > 0) console.error(`[cgpro:composer] removed own pasted-text card before send cards=${pastedCards}`);
+
   // Last thing before the send click: does the composer hold the prompt? This
   // sits AFTER verifySubmission deliberately -- that step opens and closes the
   // thinking-power menu, so anything it does to the draft has already happened.
@@ -4246,19 +4264,10 @@ async function discardOwnedPresubmitDraft(
       console.error("[cgpro:presubmit] owned draft cleared=no reason=preserve_existing");
       return;
     }
-    let pastedCards = 0;
-    if (removeControlsBefore === 0) {
-      const controls = formRemoveControls(composer);
-      pastedCards = await controls.count();
-      // Bounded: one paste makes one card. Each click removes one, so the
-      // first match is always the next card still present.
-      for (let index = 0; index < Math.min(pastedCards, 3); index++) {
-        await controls.first().click({ timeout: 5_000 });
-      }
-      if (pastedCards > 0 && await controls.count() !== 0) {
-        console.error("[cgpro:presubmit] owned draft cleared=no reason=clear_failed");
-        return;
-      }
+    const pastedCards = await removeOwnPastedCards(composer, removeControlsBefore);
+    if (pastedCards === null) {
+      console.error("[cgpro:presubmit] owned draft cleared=no reason=clear_failed");
+      return;
     }
     const cardsNote = pastedCards > 0 ? ` pasted_cards=${pastedCards}` : "";
     let owned = false;
@@ -4299,6 +4308,26 @@ async function discardOwnedPresubmitDraft(
 /** The remove-labelled controls in the composer's form (the guard's `form_media:remove`). */
 function formRemoveControls(composer: Locator): Locator {
   return composer.locator("xpath=ancestor::form[1]").locator(PREFLIGHT_CHROME.formRemoveControl);
+}
+
+/**
+ * Remove the pasted-text cards this call's own paste produced, through their
+ * own X. Only when the form held no remove control before this call inserted
+ * anything (`before === 0`): then every one present now is ours. Returns how
+ * many were removed (0 when none, or when `before` is not 0), or null when a
+ * card survived its X.
+ */
+async function removeOwnPastedCards(composer: Locator, before: number): Promise<number | null> {
+  if (before !== 0) return 0;
+  const controls = formRemoveControls(composer);
+  const cards = await controls.count();
+  // Bounded: one paste makes one card. Each click removes one, so the first
+  // match is always the next card still present.
+  for (let index = 0; index < Math.min(cards, 3); index++) {
+    await controls.first().click({ timeout: 5_000 });
+  }
+  if (cards > 0 && await controls.count() !== 0) return null;
+  return cards;
 }
 
 /** Their count, or -1 when it cannot be read: unknown is never "none". */
@@ -5180,7 +5209,23 @@ export function currentConversationId(page: Page): string | null {
  */
 const TURN_HEARTBEAT_INTERVAL_MS = 60_000;
 const TURN_ALERT_SELECTOR = '[role="alert"], [role="status"], [data-testid*="toast"]';
-const TURN_ERROR_HINT_RE = /something went wrong|error|network|try again|regenerate/i;
+const TURN_ERROR_HINT_RE = /something went wrong|gone wrong|error|network|try again|regenerate/i;
+/**
+ * P-035 2026-10-08. ChatGPT's own in-thread notice that a turn failed
+ * ("Hmm...something seems to have gone wrong." beside a Retry button), and the
+ * older wording. Live ms1980 (invocation c77d2db2): the notice showed and the
+ * conversation record answered 404 for the rest of the turn.
+ */
+const TURN_FAILED_NOTICE_RE = /something (?:seems to have )?gone wrong|something went wrong/i;
+
+/** Whether a visible alert carries ChatGPT's turn-failed notice. Unreadable is "no". */
+export async function turnFailureNoticeVisible(page: Page): Promise<boolean> {
+  try {
+    return (await readTurnAlerts(page)).texts.some(text => TURN_FAILED_NOTICE_RE.test(text));
+  } catch {
+    return false;
+  }
+}
 const TURN_LIMIT_HINT_RE = /limit|usage|reached|upgrade|try again after/i;
 /**
  * P-035 G3 r37 (2026-09-28). The limit spells itself in its own words, and the

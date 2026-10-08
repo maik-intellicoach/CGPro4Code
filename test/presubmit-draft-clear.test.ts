@@ -374,3 +374,36 @@ describe("sendPrompt removes the pasted-text card its own insert produced", () =
     expect(page.keyboard.press).not.toHaveBeenCalledWith("Delete");
   });
 });
+
+// P-035 2026-10-08 (D8). The card is not only a cleanup problem: on a turn that
+// passes its checks, the card and the typed prompt were submitted together.
+describe("sendPrompt never submits its own pasted-text card", () => {
+  it("removes the card before the send, so the prompt goes out once", async () => {
+    const state: ComposerState = { text: "", unknown: false, readable: true, url: "https://chatgpt.com/" };
+    requireSelector.mockImplementation(async () => fakeLocator(state));
+    firstResolved.mockResolvedValue(fakeLocator(state));
+
+    const page = fakePage(state);
+    await sendPrompt(page, "hello world", false, undefined, async () => { state.cards = 1; });
+
+    expect(state.cards).toBe(0);
+    expect(cardClicks).toBe(1);
+    expect(log.mock.calls.map(args => String(args[0])))
+      .toContain("[cgpro:composer] removed own pasted-text card before send cards=1");
+  });
+
+  it("refuses the send, and clears its own draft, when the card survives its X", async () => {
+    const state: ComposerState = { text: "", unknown: false, readable: true, url: "https://chatgpt.com/", cardsStuck: true };
+    requireSelector.mockImplementation(async () => fakeLocator(state));
+    firstResolved.mockResolvedValue(fakeLocator(state));
+
+    const page = fakePage(state);
+    const error = await sendPrompt(page, "hello world", false, undefined, async () => { state.cards = 1; })
+      .catch(caught => caught);
+
+    expect(error).toBeInstanceOf(PreSubmitInteractionError);
+    expect(error.code).toBe("prompt_delivery_incomplete");
+    expect(page.keyboard.press).not.toHaveBeenCalledWith("Enter");
+    expect(presubmitLines(log)).toEqual(["[cgpro:presubmit] owned draft cleared=no reason=clear_failed"]);
+  });
+});

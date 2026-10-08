@@ -27,6 +27,7 @@ const setWebSearch = vi.fn();
 const stopCurrentTurn = vi.fn();
 const waitForComposerHydrated = vi.fn();
 const waitTurnComplete = vi.fn();
+const turnFailureNoticeVisible = vi.fn(async () => false);
 const fetchLatestTurnConnectorState = vi.fn();
 const fetchLatestNativeResearchReport = vi.fn();
 const fetchNativeResearchUserNodes = vi.fn();
@@ -58,6 +59,7 @@ vi.mock("../src/browser/conversation.js", () => ({
   // preflight still calls it, so the mock factory must name it.
   waitForComposerHydrated: (...args: unknown[]) => waitForComposerHydrated(...args),
   waitTurnComplete: (...args: unknown[]) => waitTurnComplete(...args),
+  turnFailureNoticeVisible: (...args: unknown[]) => turnFailureNoticeVisible(...args),
 }));
 vi.mock("../src/api/conversations.js", () => ({
   fetchNativeResearchUserNodes: (...args: unknown[]) => fetchNativeResearchUserNodes(...args),
@@ -755,6 +757,26 @@ describe("runAskOnSession connector contract", () => {
     const runner = runAskOnSession({ prompt: "test", connector: "connector", timeoutSec: 1200, headless: false }, session());
     await expect(runner.result).rejects.toThrow("HTTP 404");
     expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(3);
+    clock.mockRestore();
+  });
+
+  // P-035 2026-10-08. Live ms1980 (c77d2db2): ChatGPT showed its own "something
+  // seems to have gone wrong" notice and the record 404'd for the rest of the turn.
+  it("names a failed ChatGPT turn once a 404 outlives one poll with the turn-failed notice showing", async () => {
+    currentConversationId.mockReturnValue("conversation");
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+    fetchLatestTurnConnectorState.mockRejectedValue(new Error("conversation connector state fetch failed with HTTP 404"));
+    turnFailureNoticeVisible.mockResolvedValue(true);
+    waitTurnComplete.mockImplementationOnce(async (_p, _t, _n, _s, control) => {
+      expect(await control.confirmComplete()).toBe(false); // first 404: a read lag is still possible
+      clock.mockReturnValue(1_031_000);
+      await control.confirmComplete();
+      throw new Error("the failed turn was not named");
+    });
+    const runner = runAskOnSession({ prompt: "test", connector: "connector", timeoutSec: 1200, headless: false }, session());
+    await expect(runner.result).rejects.toThrow(/ChatGPT reported the turn failed.*HTTP 404 for 31s/);
+    expect(fetchLatestTurnConnectorState).toHaveBeenCalledTimes(2);
+    turnFailureNoticeVisible.mockResolvedValue(false);
     clock.mockRestore();
   });
 
