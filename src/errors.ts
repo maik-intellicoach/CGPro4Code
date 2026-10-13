@@ -91,12 +91,14 @@ export type PreSubmitInteractionCode =
   | "connector_control_activation_timeout"
   | "prompt_delivery_incomplete"
   | "pro_usage_limit_reached"
-  | "preflight_draft_protected";
+  | "preflight_draft_protected"
+  | "project_navigation_failed";
 
 export type PreSubmitInteractionPhase =
   | "model_verification"
   | "connector_selection"
-  | "prompt_delivery";
+  | "prompt_delivery"
+  | "project_navigation";
 
 /**
  * Optional extra evidence a pre-submit refusal may carry. Only set on the codes

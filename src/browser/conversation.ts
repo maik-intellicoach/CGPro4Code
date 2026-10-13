@@ -218,24 +218,48 @@ export async function openConversation(
     // P-035 2026-09-26: clicking the name now only expands the row; the row's
     // "Start new chat in project" button is what opens /g/<id>/project (read
     // live on ms1980). Older rows have no such button and navigate on the name.
-    const startChat = row.getByRole("button", { name: "Start new chat in project", exact: true }).first();
-    const label = await startChat.count() > 0 ? startChat : row.getByText(project.name, { exact: true }).first();
-    onPhase?.("project-label-wait");
-    await label.waitFor({ state: "visible", timeout: 20_000 });
-    onPhase?.("project-label-click");
-    // The row's label lives on the Projects directory, the one composer-free
-    // surface in this flow. Admit it only as that known phase, and only after
-    // both the home source and this directory page were proven free of drafts.
-    if (protectDraft) {
-      await assertPreflightDraftSafe(page, { directory: true, sourceProvenEmpty });
-      sourceProvenEmpty = true;
-    }
-    await label.click({ timeout: 10_000 });
-    onPhase?.("project-destination-wait");
-    await page.waitForURL((url) => url.origin === "https://chatgpt.com" &&
+    const isProjectDestination = (url: URL) => url.origin === "https://chatgpt.com" &&
       (url.pathname === `/g/${project.id}/project` ||
-       (project.shortUrl !== undefined && url.pathname === `/g/${project.shortUrl}/project`)),
-    { timeout: 20_000 });
+       (project.shortUrl !== undefined && url.pathname === `/g/${project.shortUrl}/project`));
+    const onProjectDestination = () => {
+      try {
+        return isProjectDestination(new URL(page.url()));
+      } catch {
+        return false;
+      }
+    };
+    // P-035 2026-10-14, invocations 40cfb339 and c29af4df. The row click judged
+    // its own promise once: one timed out on a stalled renderer, the other had
+    // already reached /g/<id>/project while click() still waited for scheduled
+    // navigations. Judge the destination instead, the same way the sidebar step
+    // does, and retry a click that did not land.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (onProjectDestination()) break;
+      try {
+        row = rowLocator();
+        const startChat = row.getByRole("button", { name: "Start new chat in project", exact: true }).first();
+        const label = await startChat.count() > 0 ? startChat : row.getByText(project.name, { exact: true }).first();
+        onPhase?.("project-label-wait");
+        await label.waitFor({ state: "visible", timeout: 20_000 });
+        onPhase?.("project-label-click");
+        // The row's label lives on the Projects directory, the one composer-free
+        // surface in this flow. Admit it only as that known phase, and only after
+        // both the home source and this directory page were proven free of drafts.
+        if (protectDraft) {
+          await assertPreflightDraftSafe(page, { directory: true, sourceProvenEmpty });
+          sourceProvenEmpty = true;
+        }
+        await label.click({ timeout: 10_000 });
+        break;
+      } catch (error) {
+        if (onProjectDestination()) break;
+        if (attempt === 2 || page.isClosed()) throw error;
+        await dismissPointerBlockers(page);
+        await page.waitForTimeout(3_000);
+      }
+    }
+    onPhase?.("project-destination-wait");
+    await page.waitForURL(isProjectDestination, { timeout: 20_000 });
   } else {
     const url = new URL("https://chatgpt.com/");
     if (opts.model) url.searchParams.set("model", opts.model);

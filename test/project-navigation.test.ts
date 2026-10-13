@@ -248,6 +248,35 @@ describe("Project directory sidebar click", () => {
     expect(sidebarMatch.click).toHaveBeenCalledOnce();
   });
 
+  // P-035 2026-10-14, invocations 40cfb339 and c29af4df. The row click had the
+  // same defect the sidebar click above once had: one click, judged by its
+  // promise. c29af4df reached /g/<id>/project while click() still waited for
+  // scheduled navigations; 40cfb339 timed out once on a stalled renderer.
+  it("treats a row click that reached the Project as done even when its promise rejected", async () => {
+    const { page, rowClick } = pageFor();
+    rowClick.mockImplementation(async () => {
+      (page.url as ReturnType<typeof vi.fn>).mockReturnValue(`https://chatgpt.com/g/${target.id}/project`);
+      throw new Error("locator.click: Timeout 10000ms exceeded.");
+    });
+    await openConversation(page, { gizmoId: target.id });
+    expect(rowClick).toHaveBeenCalledOnce();
+  });
+
+  it("retries a row click that did not navigate", async () => {
+    const { page, rowClick } = pageFor();
+    rowClick.mockImplementationOnce(async () => { throw new Error("locator.click: Timeout 10000ms exceeded."); });
+    await openConversation(page, { gizmoId: target.id });
+    expect(rowClick).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails with the original row click error after 3 attempts that never navigate", async () => {
+    const { page, rowClick } = pageFor();
+    const original = new Error("locator.click: Timeout 10000ms exceeded.");
+    rowClick.mockRejectedValue(original);
+    await expect(openConversation(page, { gizmoId: target.id })).rejects.toBe(original);
+    expect(rowClick).toHaveBeenCalledTimes(3);
+  });
+
   it("does not click the sidebar at all when the page is already on the directory", async () => {
     const { page, sidebarMatch, rowClick } = pageFor(undefined, {
       matches: 1, startUrl: "https://chatgpt.com/projects",
@@ -267,7 +296,7 @@ describe("Project directory sidebar click", () => {
   it("identifies the actual failing Project step without exposing its error text", async () => {
     const { page, labelWait } = pageFor();
     const original = new Error("private project name and URL");
-    labelWait.mockRejectedValueOnce(original);
+    labelWait.mockRejectedValue(original);
     const onPhase = vi.fn();
     await expect(openConversation(page, { gizmoId: target.id }, onPhase)).rejects.toBe(original);
     expect(onPhase).toHaveBeenLastCalledWith("project-label-wait");

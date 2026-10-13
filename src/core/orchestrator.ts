@@ -355,12 +355,23 @@ function runAskInner(
       log(
         `openConversation model=${modelSlug ?? "(account default)"} resume=${opts.conversationId ?? "no"} gizmo=${opts.gizmoId ?? "none"}…`,
       );
-      await openConversation(page, {
-        model: modelSlug,
-        conversationId: opts.conversationId,
-        gizmoId: opts.gizmoId,
-        gizmoShortUrl: opts.gizmoShortUrl,
-      });
+      // P-035 2026-10-14. Nothing is typed into the composer before sendPrompt,
+      // so any failure here is provably pre-submit; type it so the facade can
+      // retry it. The message stays byte-identical for its marker attribution.
+      try {
+        await openConversation(page, {
+          model: modelSlug,
+          conversationId: opts.conversationId,
+          gizmoId: opts.gizmoId,
+          gizmoShortUrl: opts.gizmoShortUrl,
+        });
+      } catch (err) {
+        if (err instanceof PreSubmitInteractionError) throw err;
+        throw new PreSubmitInteractionError(
+          "project_navigation_failed", "project_navigation",
+          (err as Error)?.message ?? String(err), { cause: err },
+        );
+      }
       log(`openConversation done, url=${page.url()}`);
       if (opts.gizmoId && opts.expectedAccountEmail) {
         // New Project navigation is checked by openConversation. A resumed chat

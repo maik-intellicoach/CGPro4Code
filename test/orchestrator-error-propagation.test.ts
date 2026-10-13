@@ -221,6 +221,23 @@ describe("runAskOnSession native Deep Research contract", () => {
     });
   });
 
+  // P-035 2026-10-14. Nothing reaches the composer before sendPrompt, so a
+  // navigation failure is pre-submit and must say so on the streamed event.
+  it("types a plain navigation failure as a pre-submit error with the original message", async () => {
+    openConversation.mockRejectedValueOnce(new Error("locator.click: Timeout 10000ms exceeded."));
+    const runner = runAskOnSession({ prompt: "hi", model: "gpt-6-pro", timeoutSec: 1200, headless: false }, session());
+    const events = await collect(runner.events);
+    await expect(runner.result).rejects.toBeInstanceOf(PreSubmitInteractionError);
+    expect(events).toContainEqual({
+      type: "error",
+      message: "locator.click: Timeout 10000ms exceeded.",
+      code: "project_navigation_failed",
+      phase: "project_navigation",
+      promptSubmitted: false,
+    });
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
   // P-035 2026-09-27. A live ask reaches the facade through the daemon relaying
   // THESE emitter events, so the reset date has to ride the streamed error event
   // itself -- the daemon's later catch emits a second event the facade does not
