@@ -92,7 +92,8 @@ export type PreSubmitInteractionCode =
   | "prompt_delivery_incomplete"
   | "pro_usage_limit_reached"
   | "preflight_draft_protected"
-  | "project_navigation_failed";
+  | "project_navigation_failed"
+  | "attachment_upload_failed";
 
 export type PreSubmitInteractionPhase =
   | "model_verification"

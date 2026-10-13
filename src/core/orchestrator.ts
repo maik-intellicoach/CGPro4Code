@@ -4,6 +4,7 @@ import { goHome, isLoggedIn, requireSelector } from "../browser/chatgpt.js";
 import {
   assertPreflightDraftSafe,
   clearComposer,
+  countFormRemoveControls,
   currentConversationId,
   latestAssistantModelSlug,
   openConversation,
@@ -880,14 +881,40 @@ function runAskInner(
 
 async function attachImages(page: Page, paths: string[]): Promise<void> {
   if (paths.length === 0) return;
+  // P-035 2026-10-14. Planning invocation 55d78364 sent 10 files and ChatGPT
+  // answered "No spec or PNGs are attached": this step returned on a missing
+  // input, swallowed the setInputFiles error and only slept. A turn the caller
+  // sent with files is now never submitted without them: each way the files can
+  // fail to reach the composer is a pre-submit refusal.
+  const refuse = (detail: string, cause?: unknown): PreSubmitInteractionError => new PreSubmitInteractionError(
+    "attachment_upload_failed", "prompt_delivery", detail, cause === undefined ? undefined : { cause },
+  );
   // Through the table, not a repeated literal: selectors.ts is the single place
   // a ChatGPT UI change is absorbed (P-035 2026-09-16).
   const inputs = page.locator(joinSelectors(SELECTORS_DUMP.fileUpload));
   const count = await inputs.count();
-  if (count === 0) return;
-  await inputs.first().setInputFiles(paths).catch(() => {
-    /* ignore: composer may not accept this batch */
-  });
+  if (count === 0) throw refuse(`no file input accepted the ${paths.length} attachment(s) before submission`);
+  // Each file card carries a remove-labelled X in the composer's form, the
+  // same count sendPrompt's own card cleanup reads.
+  const composer = await requireSelector(page, SELECTORS_DUMP.composer, "composer");
+  const before = Math.max(0, await countFormRemoveControls(composer));
+  try {
+    await inputs.first().setInputFiles(paths);
+  } catch (error) {
+    throw refuse(`attachments could not be set: ${(error as Error).message}`, error);
+  }
+  const envTimeout = Number(process.env.CGPRO_UPLOAD_ATTACH_TIMEOUT_MS);
+  const timeoutMs = Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 90_000;
+  const deadline = Date.now() + timeoutMs;
+  let cards = await countFormRemoveControls(composer);
+  while (cards < before + paths.length) {
+    if (Date.now() >= deadline) {
+      throw refuse(`only ${Math.max(0, cards - before)} of ${paths.length} attachment(s) appeared in the composer before submission`);
+    }
+    await page.waitForTimeout(500);
+    cards = await countFormRemoveControls(composer);
+  }
+  // The cards can mount before their uploads finish processing.
   const settleMs = Number(process.env.CGPRO_UPLOAD_SETTLE_MS ?? 5_000);
   await page.waitForTimeout(settleMs);
 }

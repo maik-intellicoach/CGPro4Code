@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BrowserContext, Page } from "patchright";
 import type { Session } from "../src/browser/session.js";
 import type { StreamEvent } from "../src/core/stream.js";
@@ -16,6 +16,7 @@ const currentConversationId = vi.fn();
 const latestAssistantModelSlug = vi.fn();
 const openConversation = vi.fn();
 const clearComposer = vi.fn();
+const countFormRemoveControls = vi.fn();
 const assertPreflightDraftSafe = vi.fn();
 const readLatestAssistantText = vi.fn();
 const sendPrompt = vi.fn();
@@ -40,6 +41,7 @@ vi.mock("../src/browser/chatgpt.js", () => ({
 vi.mock("../src/browser/conversation.js", () => ({
   ensureProSixMaximum: (...args: unknown[]) => ensureProSixMaximum(...args),
   clearComposer: (...args: unknown[]) => clearComposer(...args),
+  countFormRemoveControls: (...args: unknown[]) => countFormRemoveControls(...args),
   assertPreflightDraftSafe: (...args: unknown[]) => assertPreflightDraftSafe(...args),
   currentConversationId: (...args: unknown[]) => currentConversationId(...args),
   latestAssistantModelSlug: (...args: unknown[]) => latestAssistantModelSlug(...args),
@@ -989,6 +991,83 @@ describe("runAskOnSession connector contract", () => {
     expect(line).toBe(`[cgpro:final] source=backend len=${BACKEND_REPLY.length} model=gpt-6-pro`);
     expect(line).not.toContain("quote");
     expect(line).not.toContain("/tmp/path.md");
+  });
+});
+
+// P-035 2026-10-14. Invocation 55d78364 sent 10 files and ChatGPT answered
+// "No spec or PNGs are attached": files the caller sent are verified in the
+// composer, or the turn refuses before submission.
+describe("runAskOnSession attachment contract", () => {
+  const files = ["/tmp/spec.md", "/tmp/shot.png"];
+  function attachSession(inputs: number, setInputFiles: () => Promise<void>): Session {
+    return {
+      ...session(),
+      page: {
+        url: () => "https://chatgpt.com/",
+        locator: () => ({ count: async () => inputs, first: () => ({ setInputFiles }) }),
+        waitForTimeout: async () => {},
+      } as unknown as Page,
+    } as Session;
+  }
+  async function refusal(page: Session): Promise<StreamEvent[]> {
+    const runner = runAskOnSession({ prompt: "plan", images: files, model: "gpt-6-pro", timeoutSec: 1200, headless: false }, page);
+    const events = await collect(runner.events);
+    await expect(runner.result).rejects.toBeInstanceOf(PreSubmitInteractionError);
+    expect(sendPrompt).not.toHaveBeenCalled();
+    return events;
+  }
+
+  beforeEach(() => {
+    delete process.env.CGPRO_UPLOAD_ATTACH_TIMEOUT_MS;
+    process.env.CGPRO_UPLOAD_SETTLE_MS = "0";
+    countFormRemoveControls.mockReset().mockResolvedValue(0);
+  });
+  afterEach(() => {
+    delete process.env.CGPRO_UPLOAD_ATTACH_TIMEOUT_MS;
+    delete process.env.CGPRO_UPLOAD_SETTLE_MS;
+  });
+
+  it("refuses before submission when no file input exists", async () => {
+    const events = await refusal(attachSession(0, vi.fn(async () => {})));
+    expect(events).toContainEqual({
+      type: "error",
+      message: "no file input accepted the 2 attachment(s) before submission",
+      code: "attachment_upload_failed",
+      phase: "prompt_delivery",
+      promptSubmitted: false,
+    });
+  });
+
+  it("refuses with the original message when the files cannot be set", async () => {
+    const events = await refusal(attachSession(1, async () => { throw new Error("ENOENT: /tmp/shot.png"); }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "error",
+      code: "attachment_upload_failed",
+      message: "attachments could not be set: ENOENT: /tmp/shot.png",
+      promptSubmitted: false,
+    }));
+  });
+
+  it("refuses when the file cards never reach the sent count", async () => {
+    process.env.CGPRO_UPLOAD_ATTACH_TIMEOUT_MS = "5";
+    countFormRemoveControls.mockResolvedValueOnce(0).mockResolvedValue(1);
+    const events = await refusal(attachSession(1, vi.fn(async () => {})));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "error",
+      code: "attachment_upload_failed",
+      message: "only 1 of 2 attachment(s) appeared in the composer before submission",
+    }));
+  });
+
+  it("sends once every file card is in the composer", async () => {
+    const setInputFiles = vi.fn(async () => {});
+    countFormRemoveControls.mockResolvedValueOnce(0).mockResolvedValueOnce(1).mockResolvedValue(2);
+    const runner = runAskOnSession({ prompt: "plan", images: files, model: "gpt-6-pro", timeoutSec: 1200, headless: false }, attachSession(1, setInputFiles));
+    await collect(runner.events);
+    await runner.result.catch(() => undefined);
+    expect(setInputFiles).toHaveBeenCalledWith(files);
+    expect(countFormRemoveControls).toHaveBeenCalledTimes(3);
+    expect(sendPrompt).toHaveBeenCalledTimes(1);
   });
 });
 

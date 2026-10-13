@@ -4392,7 +4392,7 @@ async function removeOwnPastedCards(composer: Locator, before: number): Promise<
 }
 
 /** Their count, or -1 when it cannot be read: unknown is never "none". */
-async function countFormRemoveControls(composer: Locator): Promise<number> {
+export async function countFormRemoveControls(composer: Locator): Promise<number> {
   try {
     return await formRemoveControls(composer).count();
   } catch {
