@@ -24,6 +24,10 @@ describe("selectors", () => {
     expect(SELECTORS.sendButton[0]).toContain('data-testid="send-button"');
   });
 
+  it("never targets the camera capture input for attachments (P-035 2026-10-14)", () => {
+    expect(SELECTORS.fileUpload[0]).toBe('input[type="file"]:not([capture])');
+  });
+
   it("recognizes the square native Deep Research stop control", () => {
     expect(SELECTORS.stopButton.some((selector) => selector.includes("svg rect"))).toBe(true);
   });

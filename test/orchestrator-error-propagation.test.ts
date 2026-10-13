@@ -999,12 +999,20 @@ describe("runAskOnSession connector contract", () => {
 // composer, or the turn refuses before submission.
 describe("runAskOnSession attachment contract", () => {
   const files = ["/tmp/spec.md", "/tmp/shot.png"];
-  function attachSession(inputs: number, setInputFiles: () => Promise<void>): Session {
+  // `multi` is how many of the inputs carry [multiple] (default: all of them);
+  // `multiSetInputFiles` is the multi locator's own setInputFiles.
+  function attachSession(
+    inputs: number,
+    setInputFiles: () => Promise<void>,
+    multi = inputs,
+    multiSetInputFiles = setInputFiles,
+  ): Session {
+    const multiLocator = { count: async () => multi, first: () => ({ setInputFiles: multiSetInputFiles }) };
     return {
       ...session(),
       page: {
         url: () => "https://chatgpt.com/",
-        locator: () => ({ count: async () => inputs, first: () => ({ setInputFiles }) }),
+        locator: () => ({ count: async () => inputs, first: () => ({ setInputFiles }), and: () => multiLocator }),
         waitForTimeout: async () => {},
       } as unknown as Page,
     } as Session;
@@ -1067,6 +1075,43 @@ describe("runAskOnSession attachment contract", () => {
     await runner.result.catch(() => undefined);
     expect(setInputFiles).toHaveBeenCalledWith(files);
     expect(countFormRemoveControls).toHaveBeenCalledTimes(3);
+    expect(sendPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  // P-035 2026-10-14. Invocation db07156e: .first() over the selector union hit
+  // the single-file "Take a photo" camera input.
+  it("sets the files on the multi-file input, not the first input", async () => {
+    const firstSet = vi.fn(async () => {});
+    const multiSet = vi.fn(async () => {});
+    countFormRemoveControls.mockResolvedValueOnce(0).mockResolvedValue(2);
+    const runner = runAskOnSession({ prompt: "plan", images: files, model: "gpt-6-pro", timeoutSec: 1200, headless: false }, attachSession(2, firstSet, 1, multiSet));
+    await collect(runner.events);
+    await runner.result.catch(() => undefined);
+    expect(multiSet).toHaveBeenCalledWith(files);
+    expect(firstSet).not.toHaveBeenCalled();
+    expect(sendPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses several files before submission when no multi-file input exists", async () => {
+    const setInputFiles = vi.fn(async () => {});
+    const events = await refusal(attachSession(1, setInputFiles, 0));
+    expect(events).toContainEqual({
+      type: "error",
+      message: "no multi-file input for the 2 attachment(s) before submission",
+      code: "attachment_upload_failed",
+      phase: "prompt_delivery",
+      promptSubmitted: false,
+    });
+    expect(setInputFiles).not.toHaveBeenCalled();
+  });
+
+  it("sends one file through the first input when no multi-file input exists", async () => {
+    const setInputFiles = vi.fn(async () => {});
+    countFormRemoveControls.mockResolvedValueOnce(0).mockResolvedValue(1);
+    const runner = runAskOnSession({ prompt: "plan", images: ["/tmp/shot.png"], model: "gpt-6-pro", timeoutSec: 1200, headless: false }, attachSession(1, setInputFiles, 0));
+    await collect(runner.events);
+    await runner.result.catch(() => undefined);
+    expect(setInputFiles).toHaveBeenCalledWith(["/tmp/shot.png"]);
     expect(sendPrompt).toHaveBeenCalledTimes(1);
   });
 });

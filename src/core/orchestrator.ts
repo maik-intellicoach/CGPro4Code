@@ -894,12 +894,20 @@ async function attachImages(page: Page, paths: string[]): Promise<void> {
   const inputs = page.locator(joinSelectors(SELECTORS_DUMP.fileUpload));
   const count = await inputs.count();
   if (count === 0) throw refuse(`no file input accepted the ${paths.length} attachment(s) before submission`);
+  // joinSelectors builds a CSS union, so .first() is DOM order, not table
+  // priority: prefer an input that takes several files (P-035 2026-10-14).
+  const multi = inputs.and(page.locator("[multiple]"));
+  const hasMulti = (await multi.count()) > 0;
+  if (paths.length > 1 && !hasMulti) {
+    throw refuse(`no multi-file input for the ${paths.length} attachment(s) before submission`);
+  }
+  const target = hasMulti ? multi.first() : inputs.first();
   // Each file card carries a remove-labelled X in the composer's form, the
   // same count sendPrompt's own card cleanup reads.
   const composer = await requireSelector(page, SELECTORS_DUMP.composer, "composer");
   const before = Math.max(0, await countFormRemoveControls(composer));
   try {
-    await inputs.first().setInputFiles(paths);
+    await target.setInputFiles(paths);
   } catch (error) {
     throw refuse(`attachments could not be set: ${(error as Error).message}`, error);
   }
