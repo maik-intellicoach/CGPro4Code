@@ -29,7 +29,7 @@ import {
   StreamEmitter,
   type StreamEvent,
 } from "./stream.js";
-import { classifyInteractionFailure, ConnectorEvidenceRateLimitError, type InteractionFailure, NotLoggedInError, PreflightDraftProtectedError, PreSubmitInteractionError, TurnTimeoutError } from "../errors.js";
+import { asPreSubmitStepFailure, classifyInteractionFailure, ConnectorEvidenceRateLimitError, type InteractionFailure, NotLoggedInError, PreflightDraftProtectedError, PreSubmitInteractionError, TurnTimeoutError } from "../errors.js";
 import { requireAccount, verifyFiling, type FilingProof } from "../api/conversation-filing.js";
 import { joinSelectors, SELECTORS as SELECTORS_DUMP } from "../browser/selectors.js";
 import { fetchLatestTurnConnectorState, type LatestTurnConnectorState, fetchLatestNativeResearchReport, fetchNativeResearchUserNodes, type NativeResearchReport } from "../api/conversations.js";
@@ -376,51 +376,64 @@ function runAskInner(
         );
       }
       log(`openConversation done, url=${page.url()}`);
-      if (opts.gizmoId && opts.expectedAccountEmail) {
-        // New Project navigation is checked by openConversation. A resumed chat
-        // must also prove actual membership before it receives another prompt.
-        await requireAccount(page, opts.expectedAccountEmail);
-        if (opts.conversationId) {
-          const prior = await verifyFiling(page, opts.conversationId, opts.gizmoId, opts.expectedAccountEmail);
-          if (prior.status !== "verified") throw new Error("ChatGPT Project membership not verified before submission");
+      // P-035 2026-10-14, 4a18feed: at load ~400 on 20 cores a 5 s UI step timed
+      // out before the send click and was not retried because it was untyped;
+      // the send click is the pre-submit boundary. Nothing is typed before
+      // sendPrompt, so every step from here to it is provably pre-submit: a
+      // failure that is not already a pre-submit refusal, and not a
+      // cancellation, becomes `pre_submit_step_failed` with its original
+      // message. sendPrompt types its own steps up to the click itself.
+      let priorNativeUsers: Set<string>;
+      try {
+        if (opts.gizmoId && opts.expectedAccountEmail) {
+          // New Project navigation is checked by openConversation. A resumed chat
+          // must also prove actual membership before it receives another prompt.
+          await requireAccount(page, opts.expectedAccountEmail);
+          if (opts.conversationId) {
+            const prior = await verifyFiling(page, opts.conversationId, opts.gizmoId, opts.expectedAccountEmail);
+            if (prior.status !== "verified") throw new Error("ChatGPT Project membership not verified before submission");
+          }
+          emitter.push({ type: "tool", name: "filing-context-verified", meta: { projectId: opts.gizmoId, accountVerified: true } });
         }
-        emitter.push({ type: "tool", name: "filing-context-verified", meta: { projectId: opts.gizmoId, accountVerified: true } });
-      }
 
 
-      if (opts.deepResearch) {
-        await clearComposer(page);
-        log("setDeepResearch true…");
-        nativeChipPreSubmit = true;
-        await setDeepResearch(page, true);
-        emitter.push({ type: "tool", name: "deep-research-selected" });
-      } else {
-        // P-035 2026-10-03 G3-B. Live intelli: ChatGPT keeps a native Deep
-        // Research chip in the home composer across restarts. An ordinary turn
-        // removes an inherited chip before any tool setup, and fails before
-        // submit if it cannot: it is never sent with the chip on.
-        log("setDeepResearch false…");
-        await setDeepResearch(page, false);
-        if (opts.web !== undefined) {
-          log(`setWebSearch ${opts.web}…`);
-          await setWebSearch(page, opts.web);
+        if (opts.deepResearch) {
+          await clearComposer(page);
+          log("setDeepResearch true…");
+          nativeChipPreSubmit = true;
+          await setDeepResearch(page, true);
+          emitter.push({ type: "tool", name: "deep-research-selected" });
+        } else {
+          // P-035 2026-10-03 G3-B. Live intelli: ChatGPT keeps a native Deep
+          // Research chip in the home composer across restarts. An ordinary turn
+          // removes an inherited chip before any tool setup, and fails before
+          // submit if it cannot: it is never sent with the chip on.
+          log("setDeepResearch false…");
+          await setDeepResearch(page, false);
+          if (opts.web !== undefined) {
+            log(`setWebSearch ${opts.web}…`);
+            await setWebSearch(page, opts.web);
+          }
         }
+
+        if (opts.connector !== undefined) {
+          log(`setConnector ${opts.connector}…`);
+          await setConnector(page, opts.connector);
+          ownedConnector = opts.connector.trim();
+          emitter.push({ type: "tool", name: "connector-selected", meta: { connector: opts.connector } });
+        }
+
+        await attachImages(page, opts.images ?? []);
+
+        // A stale GET after Send must never satisfy this run with an old report,
+        // or (connector-off turns) with an old message's model identity.
+        const existingNativeConversation = currentConversationId(page) ?? opts.conversationId ?? null;
+        priorNativeUsers = existingNativeConversation
+          ? await fetchNativeResearchUserNodes(page, existingNativeConversation) : new Set<string>();
+      } catch (err) {
+        if (err instanceof PreSubmitInteractionError || cancelled) throw err;
+        throw asPreSubmitStepFailure(err);
       }
-
-      if (opts.connector !== undefined) {
-        log(`setConnector ${opts.connector}…`);
-        await setConnector(page, opts.connector);
-        ownedConnector = opts.connector.trim();
-        emitter.push({ type: "tool", name: "connector-selected", meta: { connector: opts.connector } });
-      }
-
-      await attachImages(page, opts.images ?? []);
-
-      // A stale GET after Send must never satisfy this run with an old report,
-      // or (connector-off turns) with an old message's model identity.
-      const existingNativeConversation = currentConversationId(page) ?? opts.conversationId ?? null;
-      const priorNativeUsers = existingNativeConversation
-        ? await fetchNativeResearchUserNodes(page, existingNativeConversation) : new Set<string>();
 
       log("sendPrompt…");
       // P-035 G3 r38. The pre-submit `anyMessages` count travels out of

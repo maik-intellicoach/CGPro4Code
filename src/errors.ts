@@ -93,13 +93,15 @@ export type PreSubmitInteractionCode =
   | "pro_usage_limit_reached"
   | "preflight_draft_protected"
   | "project_navigation_failed"
-  | "attachment_upload_failed";
+  | "attachment_upload_failed"
+  | "pre_submit_step_failed";
 
 export type PreSubmitInteractionPhase =
   | "model_verification"
   | "connector_selection"
   | "prompt_delivery"
-  | "project_navigation";
+  | "project_navigation"
+  | "pre_submit";
 
 /**
  * Optional extra evidence a pre-submit refusal may carry. Only set on the codes
@@ -133,6 +135,20 @@ export class PreSubmitInteractionError extends Error {
   }
 }
 
+
+/**
+ * P-035 2026-10-14, 4a18feed: at load ~400 on 20 cores a 5 s UI step timed out
+ * before the send click and was not retried because it was untyped; the send
+ * click is the pre-submit boundary. Any failure raised before it that is not
+ * already a pre-submit refusal becomes `pre_submit_step_failed`, keeping the
+ * original message and the original error as `cause`. A typed refusal is
+ * returned unchanged. Callers leave cancellations alone.
+ */
+export function asPreSubmitStepFailure(error: unknown): PreSubmitInteractionError {
+  if (error instanceof PreSubmitInteractionError) return error;
+  const message = error instanceof Error ? error.message : String(error);
+  return new PreSubmitInteractionError("pre_submit_step_failed", "pre_submit", message, { cause: error });
+}
 
 /**
  * P-035 G3 r37 (2026-09-28). The Pro usage limit ChatGPT reveals only AFTER

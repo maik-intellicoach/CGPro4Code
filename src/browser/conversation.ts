@@ -4,7 +4,7 @@ import { firstResolved, requireSelector, requireSelectorPatient, goHome, NAV_TIM
 import { deepResearchQuota, parseDeepResearchExhausted, parseDeepResearchRemaining, recordDeepResearchExhausted, recordDeepResearchRow, recordDeepResearchTooltip, type DeepResearchQuota } from "./deep-research-quota.js";
 import { listProjects } from "../api/projects.js";
 import { fetchModelsWithReason, findProModel, normaliseModelLabel, type ChatgptModel } from "../api/models.js";
-import { classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, type ReplyStalledDetails, ReplyStalledError, SelectorBrokenError, type SubmittedTurnNotRenderedDetails, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../errors.js";
+import { asPreSubmitStepFailure, classifyInteractionFailure, type InteractionFailure, PreSubmitInteractionError, PreflightDraftProtectedError, ProUsageLimitAfterSubmitError, type ReplyStalledDetails, ReplyStalledError, SelectorBrokenError, type SubmittedTurnNotRenderedDetails, SubmittedTurnNotRenderedError, TurnTimeoutError } from "../errors.js";
 import { setExpectedReloadNavigation, streamBreakCount } from "../core/stream.js";
 
 /**
@@ -4157,100 +4157,121 @@ export async function sendPrompt(
     .count()
     .catch(() => 0);
   if (cancelled?.()) return assistantCount();
-  const composer = await requireSelector(page, SELECTORS.composer, "composer");
-  await focusComposer(page, composer);
-  await page.waitForTimeout(120);
-  // Connector/plugin menus can route keyboard search text into the composer
-  // on some ChatGPT builds. Always replace the composer contents so a failed
-  // or stale picker query cannot contaminate the actual prompt.
-  if (!preserveExisting) {
-    await clearComposer(page);
-  }
-  // P-035 2026-10-08. Counted before this call inserts anything: a remove
-  // control that is in the form after the insert but not before is the
-  // attachment card this call's own paste produced. See the cleanup below.
-  // With files attached, a zero count may only mean their card has not mounted
-  // yet: it is unknown, so no card is clicked and any card refuses the send
-  // (P-035 review E 2026-10-08: the X could remove the caller's own file).
-  const counted = await countFormRemoveControls(composer);
-  const removeControlsBefore = attachedFiles && counted === 0 ? -1 : counted;
-  // Put the caret in the composer's text flow before inserting anything. This
-  // replaces a "Meta+End" that could not do the job: see focusComposerEnd.
-  // Fail OPEN here and let the delivery check decide -- it is the thing that
-  // actually knows whether the prompt arrived.
-  if (!(await focusComposerEnd(page, composer))) {
-    console.error("[cgpro:composer] could not seat the caret in the composer text flow; inserting anyway");
-  }
-  // Composer is a contenteditable div on modern chatgpt.com. Insert the whole
-  // prompt in one CDP `Input.insertText` instead of typing it character by
-  // character: at 4ms/char a planning prompt spent MINUTES streaming synthetic
-  // keystrokes into a live React composer (invocation a9f3717e on 2026-08-27
-  // sat 4m46s between connector_selected and prompt_submitted). Every one of
-  // those keystrokes is a chance for an inline `@`/`/` menu to swallow the
-  // input and activate something — including the composer's file upload, which
-  // is how a native Finder dialog ended up on Maik's screen mid-run.
-  // insertText fires the same beforeinput/input events React listens for, but
-  // atomically and without triggering keyboard-driven menus.
-  // Escape hatch: CGPRO_TYPE_KEYSTROKES=1 restores the old per-character path.
-  if (process.env.CGPRO_TYPE_KEYSTROKES === "1") {
-    const lines = prompt.split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      if (i > 0) await page.keyboard.press("Shift+Enter");
-      await page.keyboard.type(lines[i], { delay: 4 });
-    }
-  } else {
-    await insertComposerText(page, prompt);
-  }
-  const priorAssistantCount = await assistantCount();
-  // P-035 G3 r38. Captured next to the assistant count, before the send: the
-  // not-rendered rule compares the live anyMessages count against this to prove
-  // the submitted turn (the user's own message included) never rendered.
-  if (submitCounts) submitCounts.priorAnyMessages = await anyMessageCount();
-  if (cancelled?.()) return priorAssistantCount;
-
-  // Typing may change inline modes. Verify the composed request, not just
-  // the empty composer, and let failures stop both click and Enter submission.
-  //
-  // A pre-submit refusal here (the Pro usage limit is the live one) fires
-  // AFTER the prompt is already in the composer. ChatGPT persists that draft
-  // across a lane restart, and the next preflight then refuses it as an
-  // unowned draft and wedges the lane until a human clears it. So this call
-  // removes what it itself inserted, and only while ownership is still
-  // provable here in the same call. The refusal itself is re-thrown
-  // unchanged: this is cleanup, not a different outcome.
+  // P-035 2026-10-14, 4a18feed: at load ~400 on 20 cores a 5 s UI step timed
+  // out before the send click and was not retried because it was untyped; the
+  // send click is the pre-submit boundary. Everything up to it runs inside this
+  // try: a failure here that is not already a pre-submit refusal, and not a
+  // cancellation, becomes `pre_submit_step_failed`, and once this call may have
+  // inserted the prompt its owned draft is discarded first, exactly as for a
+  // typed refusal. Everything from the send click on stays untyped (uncertain).
+  let composer: Locator | undefined;
+  let removeControlsBefore = -1;
+  let promptInserted = false;
+  let priorAssistantCount: number;
   try {
-    await verifySubmission?.();
+    composer = await requireSelector(page, SELECTORS.composer, "composer");
+    await focusComposer(page, composer);
+    await page.waitForTimeout(120);
+    // Connector/plugin menus can route keyboard search text into the composer
+    // on some ChatGPT builds. Always replace the composer contents so a failed
+    // or stale picker query cannot contaminate the actual prompt.
+    if (!preserveExisting) {
+      await clearComposer(page);
+    }
+    // P-035 2026-10-08. Counted before this call inserts anything: a remove
+    // control that is in the form after the insert but not before is the
+    // attachment card this call's own paste produced. See the cleanup below.
+    // With files attached, a zero count may only mean their card has not mounted
+    // yet: it is unknown, so no card is clicked and any card refuses the send
+    // (P-035 review E 2026-10-08: the X could remove the caller's own file).
+    const counted = await countFormRemoveControls(composer);
+    removeControlsBefore = attachedFiles && counted === 0 ? -1 : counted;
+    // Put the caret in the composer's text flow before inserting anything. This
+    // replaces a "Meta+End" that could not do the job: see focusComposerEnd.
+    // Fail OPEN here and let the delivery check decide -- it is the thing that
+    // actually knows whether the prompt arrived.
+    if (!(await focusComposerEnd(page, composer))) {
+      console.error("[cgpro:composer] could not seat the caret in the composer text flow; inserting anyway");
+    }
+    // Composer is a contenteditable div on modern chatgpt.com. Insert the whole
+    // prompt in one CDP `Input.insertText` instead of typing it character by
+    // character: at 4ms/char a planning prompt spent MINUTES streaming synthetic
+    // keystrokes into a live React composer (invocation a9f3717e on 2026-08-27
+    // sat 4m46s between connector_selected and prompt_submitted). Every one of
+    // those keystrokes is a chance for an inline `@`/`/` menu to swallow the
+    // input and activate something — including the composer's file upload, which
+    // is how a native Finder dialog ended up on Maik's screen mid-run.
+    // insertText fires the same beforeinput/input events React listens for, but
+    // atomically and without triggering keyboard-driven menus.
+    // Escape hatch: CGPRO_TYPE_KEYSTROKES=1 restores the old per-character path.
+    // From here on the composer may hold this call's prompt.
+    promptInserted = true;
+    if (process.env.CGPRO_TYPE_KEYSTROKES === "1") {
+      const lines = prompt.split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        if (i > 0) await page.keyboard.press("Shift+Enter");
+        await page.keyboard.type(lines[i], { delay: 4 });
+      }
+    } else {
+      await insertComposerText(page, prompt);
+    }
+    priorAssistantCount = await assistantCount();
+    // P-035 G3 r38. Captured next to the assistant count, before the send: the
+    // not-rendered rule compares the live anyMessages count against this to prove
+    // the submitted turn (the user's own message included) never rendered.
+    if (submitCounts) submitCounts.priorAnyMessages = await anyMessageCount();
+    if (cancelled?.()) return priorAssistantCount;
+
+    // Typing may change inline modes. Verify the composed request, not just
+    // the empty composer, and let failures stop both click and Enter submission.
+    //
+    // A pre-submit refusal here (the Pro usage limit is the live one) fires
+    // AFTER the prompt is already in the composer. ChatGPT persists that draft
+    // across a lane restart, and the next preflight then refuses it as an
+    // unowned draft and wedges the lane until a human clears it. So this call
+    // removes what it itself inserted, and only while ownership is still
+    // provable here in the same call. The refusal itself is re-thrown
+    // unchanged: this is cleanup, not a different outcome.
+    try {
+      await verifySubmission?.();
+    } catch (error) {
+      if (error instanceof PreSubmitInteractionError) {
+        await discardOwnedPresubmitDraft(page, composer, prompt, preserveExisting, ownedConnector, removeControlsBefore);
+      }
+      throw error;
+    }
+    if (cancelled?.()) return priorAssistantCount;
+
+    // P-035 2026-10-08 (D8). A paste too large to land as text becomes a "pasted
+    // text" attachment card, and the typed fallback then inserts the prompt as
+    // well, so the turn went out TWICE: live ms1980 c77d2db2 listed
+    // `Pasted text(10).txt` under Sources and the model answered "I'll review
+    // the attached brief". Remove our own card before the send; a card that
+    // survives its X refuses the send rather than double it.
+    const pastedCards = await removeOwnPastedCards(composer, removeControlsBefore).catch(() => null);
+    if (pastedCards === null) {
+      const refusal = new PreSubmitInteractionError(
+        "prompt_delivery_incomplete",
+        "prompt_delivery",
+        "the pasted-text attachment this call's own paste created could not be removed before submission",
+      );
+      await discardOwnedPresubmitDraft(page, composer, prompt, preserveExisting, ownedConnector, removeControlsBefore);
+      throw refusal;
+    }
+    if (pastedCards > 0) console.error(`[cgpro:composer] removed own pasted-text card before send cards=${pastedCards}`);
+
+    // Last thing before the send click: does the composer hold the prompt? This
+    // sits AFTER verifySubmission deliberately -- that step opens and closes the
+    // thinking-power menu, so anything it does to the draft has already happened.
+    await verifyComposerHoldsPrompt(page, composer, prompt, preserveExisting);
+    if (cancelled?.()) return priorAssistantCount;
   } catch (error) {
-    if (error instanceof PreSubmitInteractionError) {
+    if (error instanceof PreSubmitInteractionError || cancelled?.()) throw error;
+    if (promptInserted && composer) {
       await discardOwnedPresubmitDraft(page, composer, prompt, preserveExisting, ownedConnector, removeControlsBefore);
     }
-    throw error;
+    throw asPreSubmitStepFailure(error);
   }
-  if (cancelled?.()) return priorAssistantCount;
-
-  // P-035 2026-10-08 (D8). A paste too large to land as text becomes a "pasted
-  // text" attachment card, and the typed fallback then inserts the prompt as
-  // well, so the turn went out TWICE: live ms1980 c77d2db2 listed
-  // `Pasted text(10).txt` under Sources and the model answered "I'll review
-  // the attached brief". Remove our own card before the send; a card that
-  // survives its X refuses the send rather than double it.
-  const pastedCards = await removeOwnPastedCards(composer, removeControlsBefore).catch(() => null);
-  if (pastedCards === null) {
-    const refusal = new PreSubmitInteractionError(
-      "prompt_delivery_incomplete",
-      "prompt_delivery",
-      "the pasted-text attachment this call's own paste created could not be removed before submission",
-    );
-    await discardOwnedPresubmitDraft(page, composer, prompt, preserveExisting, ownedConnector, removeControlsBefore);
-    throw refusal;
-  }
-  if (pastedCards > 0) console.error(`[cgpro:composer] removed own pasted-text card before send cards=${pastedCards}`);
-
-  // Last thing before the send click: does the composer hold the prompt? This
-  // sits AFTER verifySubmission deliberately -- that step opens and closes the
-  // thinking-power menu, so anything it does to the draft has already happened.
-  await verifyComposerHoldsPrompt(page, composer, prompt, preserveExisting);
-  if (cancelled?.()) return priorAssistantCount;
 
   const clicked = await clickSendButtonWithRetries(page, cancelled);
   if (!clicked && !cancelled?.()) {

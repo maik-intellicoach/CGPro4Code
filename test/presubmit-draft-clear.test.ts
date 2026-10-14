@@ -276,19 +276,60 @@ describe("sendPrompt removes the draft it inserted when a pre-submit check refus
     expect(page.keyboard.press).not.toHaveBeenCalledWith("Delete");
   });
 
-  it("attempts no clearing when the failure is not a PreSubmitInteractionError", async () => {
+  // P-035 2026-10-14, 4a18feed (test a). A plain verify-callback timeout is
+  // before the send click: it is typed `pre_submit_step_failed` and the owned
+  // draft is discarded exactly as for a typed refusal.
+  it("types a plain verify-callback failure as pre_submit_step_failed and clears the owned draft", async () => {
     const state: ComposerState = { text: "", unknown: false, readable: true, url: "https://chatgpt.com/" };
     requireSelector.mockImplementation(async () => fakeLocator(state));
     firstResolved.mockResolvedValue(fakeLocator(state));
-    const error = new Error("native mode missing");
+    const original = new Error("locator.focus: Timeout 5000ms exceeded");
 
     const page = fakePage(state);
-    await expect(sendPrompt(page, "hello world", false, undefined, async () => { throw error; }))
-      .rejects.toBe(error);
+    const error = await sendPrompt(page, "hello world", false, undefined, async () => { throw original; })
+      .catch((caught: unknown) => caught);
 
-    expect(state.text).toBe("hello world"); // untouched, exactly as before this change
+    expect(error).toBeInstanceOf(PreSubmitInteractionError);
+    expect(error).toMatchObject({
+      code: "pre_submit_step_failed",
+      phase: "pre_submit",
+      promptSubmitted: false,
+      message: "locator.focus: Timeout 5000ms exceeded",
+      cause: original,
+    });
+    expect(state.text).toBe(""); // the draft this call typed is gone
+    expect(presubmitLines(log)).toEqual(["[cgpro:presubmit] owned draft cleared=yes reason=owned"]);
+    expect(firstResolved).not.toHaveBeenCalled(); // the send button was never looked up
+  });
+
+  // Test e: a cancelled call keeps today's behaviour, untyped and uncleared.
+  it("leaves a plain failure untyped and the draft alone when the call was cancelled", async () => {
+    const state: ComposerState = { text: "", unknown: false, readable: true, url: "https://chatgpt.com/" };
+    requireSelector.mockImplementation(async () => fakeLocator(state));
+    firstResolved.mockResolvedValue(fakeLocator(state));
+    const original = new Error("locator.focus: Timeout 5000ms exceeded");
+    let cancelled = false;
+
+    const page = fakePage(state);
+    await expect(sendPrompt(page, "hello world", false, () => cancelled, async () => {
+      cancelled = true;
+      throw original;
+    })).rejects.toBe(original);
+
+    expect(state.text).toBe("hello world");
     expect(presubmitLines(log)).toEqual([]);
-    expect(page.keyboard.press).not.toHaveBeenCalledWith("Delete");
+  });
+
+  // Test a, earlier in the region: nothing inserted yet, so nothing is cleared.
+  it("types a failure before the insert without touching the composer", async () => {
+    const original = new Error("locator.click: Timeout 5000ms exceeded");
+    requireSelector.mockRejectedValue(original);
+
+    const page = fakePage({ text: "", unknown: false, readable: true, url: "https://chatgpt.com/" });
+    const error = await sendPrompt(page, "hello world").catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({ code: "pre_submit_step_failed", phase: "pre_submit", cause: original });
+    expect(presubmitLines(log)).toEqual([]);
   });
 
   it("reports clear_failed and re-throws when the owned prompt survives the clear", async () => {

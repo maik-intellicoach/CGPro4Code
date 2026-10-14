@@ -448,7 +448,7 @@ describe("runAskOnSession native Deep Research chip hygiene", () => {
     const activeSession = session();
     const runner = runAskOnSession({ prompt: "research", deepResearch: true, timeoutSec: 1_200, headless: false }, activeSession);
     await collect(runner.events);
-    await expect(runner.result).rejects.toBe(original);
+    await expect(runner.result).rejects.toMatchObject({ code: "pre_submit_step_failed", cause: original });
     expect(setDeepResearch.mock.calls.map(call => call[1])).toEqual([true, false]);
     expect(composer.mention).toBe(false);
     expect(sendPrompt).not.toHaveBeenCalled();
@@ -461,7 +461,7 @@ describe("runAskOnSession native Deep Research chip hygiene", () => {
     const activeSession = session();
     const runner = runAskOnSession({ prompt: "research", deepResearch: true, timeoutSec: 1_200, headless: false }, activeSession);
     await collect(runner.events);
-    await expect(runner.result).rejects.toBe(original);
+    await expect(runner.result).rejects.toMatchObject({ code: "pre_submit_step_failed", cause: original });
     expect(setDeepResearch.mock.calls.map(call => call[1])).toEqual([true, false]);
     expect(setDeepResearch).toHaveBeenLastCalledWith(activeSession.page, false);
     expect(sendPrompt).not.toHaveBeenCalled();
@@ -498,7 +498,7 @@ describe("runAskOnSession native Deep Research chip hygiene", () => {
     setDeepResearch.mockResolvedValueOnce(true).mockRejectedValueOnce(new Error("could not be turned off"));
     const runner = runAskOnSession({ prompt: "research", deepResearch: true, timeoutSec: 1_200, headless: false }, session());
     await collect(runner.events);
-    await expect(runner.result).rejects.toBe(original);
+    await expect(runner.result).rejects.toMatchObject({ code: "pre_submit_step_failed", cause: original });
   });
 
   it("leaves the chip alone once the prompt may have been submitted", async () => {
@@ -513,6 +513,80 @@ describe("runAskOnSession native Deep Research chip hygiene", () => {
     await collect(afterSubmit.events);
     await expect(afterSubmit.result).rejects.toThrow("response failed");
     expect(offCalls()).toHaveLength(0);
+  });
+});
+
+describe("runAskOnSession pre-submit boundary (P-035 2026-10-14, 4a18feed)", () => {
+  // Test b: every orchestrator step between openConversation and sendPrompt.
+  it("types a plain setDeepResearch failure as pre_submit_step_failed", async () => {
+    const original = new Error("locator.click: Timeout 5000ms exceeded");
+    setDeepResearch.mockRejectedValueOnce(original);
+    const runner = runAskOnSession({ prompt: "plain", timeoutSec: 1_200, headless: false }, session());
+    const events = await collect(runner.events);
+    const error = await runner.result.catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PreSubmitInteractionError);
+    expect(error).toMatchObject({ code: "pre_submit_step_failed", phase: "pre_submit", promptSubmitted: false, cause: original });
+    expect(events).toContainEqual({
+      type: "error",
+      message: "locator.click: Timeout 5000ms exceeded",
+      code: "pre_submit_step_failed",
+      phase: "pre_submit",
+      promptSubmitted: false,
+    });
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
+  it("types a plain Project membership failure on a resumed chat", async () => {
+    verifyFiling.mockResolvedValueOnce({ status: "unverified", conversationId: "c", projectId: null, accountVerified: false });
+    const runner = runAskOnSession(
+      { prompt: "plain", conversationId: "c", gizmoId: "g-p-x", expectedAccountEmail: "a@b.c", timeoutSec: 1_200, headless: false },
+      session(),
+    );
+    await collect(runner.events);
+    await expect(runner.result).rejects.toMatchObject({
+      code: "pre_submit_step_failed",
+      message: "ChatGPT Project membership not verified before submission",
+    });
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
+  // Test d: an existing typed refusal keeps its own code and phase.
+  it("keeps an existing typed refusal from a pre-click step unchanged", async () => {
+    const refusal = new PreSubmitInteractionError("connector_control_activation_timeout", "connector_selection", "picker did not open");
+    setConnector.mockRejectedValueOnce(refusal);
+    const runner = runAskOnSession({ prompt: "plain", connector: "IntelliCoach Context", timeoutSec: 1_200, headless: false }, session());
+    await collect(runner.events);
+    await expect(runner.result).rejects.toBe(refusal);
+  });
+
+  // Test c: from the send click on, failures stay untyped (uncertain send).
+  it("leaves failures at or after the send click untyped", async () => {
+    const sendFailure = new Error("send button vanished");
+    sendPrompt.mockRejectedValueOnce(sendFailure);
+    const sent = runAskOnSession({ prompt: "plain", timeoutSec: 1_200, headless: false }, session());
+    await collect(sent.events);
+    await expect(sent.result).rejects.toBe(sendFailure);
+
+    // The post-return maximum check is after the click as well.
+    sendPrompt.mockImplementationOnce(async () => 0);
+    const unverified = runAskOnSession({ prompt: "research", deepResearch: true, timeoutSec: 1_200, headless: false }, session());
+    await collect(unverified.events);
+    const error = await unverified.result.catch((caught: unknown) => caught);
+    expect(error).not.toBeInstanceOf(PreSubmitInteractionError);
+    expect((error as Error).message).toBe("Native research maximum UI setting was not verified before submission");
+  });
+
+  // Test e: a step that fails after cancellation keeps its original error.
+  it("leaves a pre-click failure untyped once the turn was cancelled", async () => {
+    const original = new Error("connector picker closed");
+    let failConnector: (error: Error) => void = () => {};
+    setConnector.mockImplementationOnce(() => new Promise((_resolve, reject) => { failConnector = reject; }));
+    const runner = runAskOnSession({ prompt: "plain", connector: "IntelliCoach Context", timeoutSec: 1_200, headless: false }, session());
+    await vi.waitFor(() => expect(setConnector).toHaveBeenCalledTimes(1));
+    await runner.cancel();
+    failConnector(original);
+    await expect(runner.result).rejects.toBe(original);
+    await collect(runner.events);
   });
 });
 
@@ -830,7 +904,14 @@ describe("runAskOnSession connector contract", () => {
     );
 
     await expect(runner.result).rejects.toThrow("connector unavailable");
-    expect(await collect(runner.events)).toEqual([{ type: "error", message: "connector unavailable" }]);
+    // P-035 2026-10-14 (test b): a plain pre-click step failure is typed.
+    expect(await collect(runner.events)).toEqual([{
+      type: "error",
+      message: "connector unavailable",
+      code: "pre_submit_step_failed",
+      phase: "pre_submit",
+      promptSubmitted: false,
+    }]);
     expect(sendPrompt).not.toHaveBeenCalled();
   });
 
