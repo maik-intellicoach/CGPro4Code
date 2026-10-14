@@ -26,11 +26,13 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { appendFileSync, openSync, writeSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Page } from "patchright";
 import { describeWindow, openSession, parkWindow, showWindow, type Session } from "../browser/session.js";
+import { profileDir } from "../store/paths.js";
 import { fetchAuthSessionInPage, goHome, isLoggedIn } from "../browser/chatgpt.js";
 import {
   assertPreflightDraftSafe,
@@ -720,14 +722,97 @@ export async function fetchDaemonAccountCapabilities(
 export async function closeDaemonSessionBeforeExit(
   session: Session,
   exit: (code: number) => never = process.exit,
+  profile?: string,
 ): Promise<never> {
-  await closeDaemonSession(session);
+  await closeDaemonSession(session, profile);
   return exit(0);
 }
 
-export async function closeDaemonSession(session: Session): Promise<void> {
-  await session.close();
+/**
+ * Bound on a graceful browser close. P-035 2026-10-14, 8ebb7404: a wedged
+ * browser blocked the stop and the retry; load average ~130 on 20 cores. The
+ * stop endpoint awaited `session.close()` on a browser that never closed, so
+ * the caller's retry never ran and the old daemon lingered until the watchdog.
+ */
+export const SESSION_CLOSE_TIMEOUT_MS = 20_000;
+
+export async function closeDaemonSession(
+  session: Session,
+  profile?: string,
+  killBrowsers: (profilePath: string) => number[] = killProfileBrowsers,
+): Promise<void> {
+  const closing = session.close();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), SESSION_CLOSE_TIMEOUT_MS);
+  });
+  try {
+    const outcome = await Promise.race([closing.then(() => "closed" as const), bound]);
+    if (outcome === "timeout") {
+      // The abandoned close may still settle later; it must not surface as an
+      // unhandled rejection once the process has moved on.
+      closing.catch(() => {});
+      const dir = profileDir(profile);
+      log.warn(
+        `browser close exceeded ${SESSION_CLOSE_TIMEOUT_MS}ms; SIGKILL browser processes of profile=${dir}`,
+      );
+      const killed = killBrowsers(dir);
+      log.warn(`killed browser pids=[${killed.join(",")}] profile=${dir}`);
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   clearDaemonInfo(process.pid);
+}
+
+/**
+ * SIGKILL every browser process launched on this exact profile. A persistent
+ * patchright context exposes no browser process handle (`context.browser()`
+ * is null for launchPersistentContext), so the profile is matched on the
+ * exact `--user-data-dir=<path>` argument Playwright passes at launch. Only
+ * the browser process carries it; its helpers exit with it. Returns the pids
+ * signalled. Shared by the bounded session close and `cgpro daemon stop`.
+ */
+export function killProfileBrowsers(
+  profilePath: string,
+  deps: {
+    listProcesses?: () => string;
+    kill?: (pid: number, signal: NodeJS.Signals) => void;
+  } = {},
+): number[] {
+  const listProcesses =
+    deps.listProcesses ??
+    (() => execFileSync("ps", ["-axww", "-o", "pid=,args="], { encoding: "utf-8", timeout: 10_000 }));
+  const kill = deps.kill ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
+  const flag = `--user-data-dir=${profilePath}`;
+  let listing: string;
+  try {
+    listing = listProcesses();
+  } catch (error) {
+    log.warn(`browser process listing failed: ${(error as Error).message}`);
+    return [];
+  }
+  const killed: number[] = [];
+  for (const line of listing.split("\n")) {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const args = match[2];
+    if (pid === process.pid) continue;
+    const at = args.indexOf(flag);
+    if (at < 0) continue;
+    // Exact argument: the next character ends the argv token, so a sibling
+    // profile whose path merely starts with this one is never matched.
+    const next = args.charAt(at + flag.length);
+    if (next !== "" && next !== " ") continue;
+    try {
+      kill(pid, "SIGKILL");
+      killed.push(pid);
+    } catch {
+      /* already gone */
+    }
+  }
+  return killed;
 }
 
 export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<void> {
@@ -827,7 +912,7 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
       `received ${signal} file=${DAEMON_FILE} ppid=${process.ppid} in_flight=${inFlight} — shutting down`,
     );
     server.close();
-    return closeDaemonSessionBeforeExit(session);
+    return closeDaemonSessionBeforeExit(session, process.exit, opts.profile);
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
@@ -1196,7 +1281,7 @@ export async function handleRequest(
     // fire-and-exit path let the caller start a replacement against the same
     // profile while Chrome was still winding down, leaving crash markers and
     // the recurring "Restore pages?" bubble.
-    await closeDaemonSession(state.session);
+    await closeDaemonSession(state.session, state.profile);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
     setTimeout(() => {
@@ -2324,7 +2409,7 @@ async function describeChromeLabels(page: Page): Promise<string> {
     .catch(() => "unavailable");
 }
 
-function makeLogger(): { info: (m: string) => void; error: (m: string) => void } {
+function makeLogger(): { info: (m: string) => void; warn: (m: string) => void; error: (m: string) => void } {
   try {
     mkdirSync(dirname(DAEMON_LOG), { recursive: true });
   } catch {
@@ -2358,6 +2443,7 @@ function makeLogger(): { info: (m: string) => void; error: (m: string) => void }
   };
   return {
     info: (m) => write("info", m),
+    warn: (m) => write("warn", m),
     error: (m) => write("error", m),
   };
 }

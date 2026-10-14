@@ -18,6 +18,8 @@ const requireSelector = vi.fn();
 vi.mock("../src/browser/chatgpt.js", () => ({
   firstResolved: (...args: unknown[]) => firstResolved(...args),
   requireSelector: (...args: unknown[]) => requireSelector(...args),
+  // P-035 2026-10-14: the real bound; the navigation test pins it.
+  NAV_TIMEOUT_MS: 120_000,
 }));
 
 const { waitTurnComplete } = await import("../src/browser/conversation.js");

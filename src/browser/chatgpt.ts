@@ -4,12 +4,20 @@ import { SelectorBrokenError } from "../errors.js";
 
 export const CHATGPT_HOME = "https://chatgpt.com/";
 
+/**
+ * Bound for every top-level chatgpt.com navigation (goHome and the
+ * conversation/project gotos). P-035 2026-10-14, 8ebb7404: a wedged browser
+ * blocked the stop and the retry; load average ~130 on 20 cores. A freshly
+ * started lane on that host overran the old 60 s bound on its first goHome.
+ */
+export const NAV_TIMEOUT_MS = 120_000;
+
 export async function goHome(page: Page, opts: { model?: string } = {}): Promise<void> {
   const url = new URL(CHATGPT_HOME);
   if (opts.model) {
     url.searchParams.set("model", opts.model);
   }
-  await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
+  await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
   // Note: we don't probe for bot challenges here. The app loads
   // normally even when Cloudflare's beacon scripts are present in the
   // HTML, and any real interstitial usually self-resolves within a few

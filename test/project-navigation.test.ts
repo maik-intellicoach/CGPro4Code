@@ -13,6 +13,8 @@ vi.mock("../src/browser/chatgpt.js", () => ({
   firstResolved: vi.fn(async () => null),
   requireSelector: (...args: unknown[]) => requireSelector(...args),
   requireSelectorPatient: (...args: unknown[]) => requireSelector(...args),
+  // P-035 2026-10-14: the real bound; the navigation test pins it.
+  NAV_TIMEOUT_MS: 120_000,
 }));
 const { openConversation, assertPreflightDraftSafe } = await import("../src/browser/conversation.js");
 const target = { id: "g-p-target", shortUrl: "g-p-target-work", name: "Work" };
@@ -136,7 +138,7 @@ describe("Project directory navigation", () => {
     });
     const onPhase = vi.fn();
     await openConversation(page, { gizmoId: target.id }, onPhase);
-    expect(page.goto).toHaveBeenCalledWith("https://chatgpt.com/projects", expect.anything());
+    expect(page.goto).toHaveBeenCalledWith("https://chatgpt.com/projects", expect.objectContaining({ timeout: 120_000 }));
     expect(sidebarMatch.click).not.toHaveBeenCalled();
     expect(onPhase.mock.calls.map(([phase]) => phase)).toContain("project-navigation-direct");
     expect(onPhase.mock.calls.map(([phase]) => phase)).not.toContain("project-navigation-lookup");

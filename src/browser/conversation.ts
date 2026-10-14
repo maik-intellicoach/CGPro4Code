@@ -1,6 +1,6 @@
 import type { Page, Locator } from "patchright";
 import { PREFLIGHT_CHROME, SELECTORS, joinSelectors } from "./selectors.js";
-import { firstResolved, requireSelector, requireSelectorPatient, goHome } from "./chatgpt.js";
+import { firstResolved, requireSelector, requireSelectorPatient, goHome, NAV_TIMEOUT_MS } from "./chatgpt.js";
 import { deepResearchQuota, parseDeepResearchExhausted, parseDeepResearchRemaining, recordDeepResearchExhausted, recordDeepResearchRow, recordDeepResearchTooltip, type DeepResearchQuota } from "./deep-research-quota.js";
 import { listProjects } from "../api/projects.js";
 import { fetchModelsWithReason, findProModel, normaliseModelLabel, type ChatgptModel } from "../api/models.js";
@@ -113,7 +113,7 @@ export async function openConversation(
     if (protectDraft) await guard();
     await page.goto(`https://chatgpt.com/c/${opts.conversationId}`, {
       waitUntil: "domcontentloaded",
-      timeout: 60_000,
+      timeout: NAV_TIMEOUT_MS,
     });
   } else if (opts.gizmoId || opts.gizmoShortUrl) {
     const slug = opts.gizmoShortUrl ?? opts.gizmoId!;
@@ -169,7 +169,7 @@ export async function openConversation(
         await page.locator(joinSelectors(SELECTORS.projectsNavigation)).count() === 0) {
       onPhase?.("project-navigation-direct");
       if (protectDraft) await guard();
-      await page.goto("https://chatgpt.com/projects", { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await page.goto("https://chatgpt.com/projects", { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
     }
     if (!onProjectsDirectory()) {
       onPhase?.("project-navigation-lookup");
@@ -267,7 +267,7 @@ export async function openConversation(
     if (opts.model) url.searchParams.set("model", opts.model);
     onPhase?.("project-home");
     if (protectDraft) await guard();
-    await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
   }
 
   onPhase?.("project-composer");
@@ -5733,7 +5733,7 @@ export async function waitTurnComplete(
         try {
           await page.goto(`https://chatgpt.com/c/${conversationId}`, {
             waitUntil: "domcontentloaded",
-            timeout: 60_000,
+            timeout: NAV_TIMEOUT_MS,
           });
           if (control.cancelled?.()) return;
           // Native Deep Research replaces the composer with a progress view

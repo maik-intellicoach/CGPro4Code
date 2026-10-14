@@ -22,7 +22,7 @@ import {
   DAEMON_LOG,
   DAEMON_LOG_DIR,
 } from "../../daemon/protocol.js";
-import { runDaemonServer } from "../../daemon/server.js";
+import { killProfileBrowsers, runDaemonServer } from "../../daemon/server.js";
 
 export interface DaemonStartOptions {
   profile?: string;
@@ -144,6 +144,15 @@ export async function daemonStopCmd(opts: DaemonStopOptions = {}): Promise<numbe
       } catch {
         /* ignore */
       }
+    }
+  }
+  // A killed daemon leaves its browser holding the profile, so a replacement
+  // could not open it. Only when daemon.json names the profile: an unnamed
+  // one is never guessed (P-035 2026-10-14, 8ebb7404).
+  if (info.profile) {
+    const killed = killProfileBrowsers(info.profile);
+    if (killed.length > 0) {
+      console.log(chalk.dim(`  killed browser pids ${killed.join(", ")} of profile ${info.profile}`));
     }
   }
   clearDaemonInfo(info.pid);
