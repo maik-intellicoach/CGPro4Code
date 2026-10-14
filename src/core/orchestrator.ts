@@ -368,6 +368,8 @@ function runAskInner(
         });
       } catch (err) {
         if (err instanceof PreSubmitInteractionError) throw err;
+        // Only the project-row branch is wrapped; resume and home failures stay as they were.
+        if (opts.conversationId || !(opts.gizmoId || opts.gizmoShortUrl)) throw err;
         throw new PreSubmitInteractionError(
           "project_navigation_failed", "project_navigation",
           (err as Error)?.message ?? String(err), { cause: err },
@@ -905,7 +907,8 @@ async function attachImages(page: Page, paths: string[]): Promise<void> {
   // Each file card carries a remove-labelled X in the composer's form, the
   // same count sendPrompt's own card cleanup reads.
   const composer = await requireSelector(page, SELECTORS_DUMP.composer, "composer");
-  const before = Math.max(0, await countFormRemoveControls(composer));
+  const before = await countFormRemoveControls(composer);
+  if (before < 0) throw refuse("attachment card baseline unreadable before submission");
   try {
     await target.setInputFiles(paths);
   } catch (error) {

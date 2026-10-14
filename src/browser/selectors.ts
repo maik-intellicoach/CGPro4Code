@@ -253,10 +253,11 @@ export const SELECTORS: SelectorSet = {
   fileUpload: [
     // P-035 2026-10-14: invocation db07156e's 10 files hit the composer's
     // "Take a photo" input (accept="image/*" capture="environment"), a
-    // single-file camera input; capture inputs are never an attachment target.
+    // single-file camera input; capture inputs are never an attachment target,
+    // so every union member carries :not([capture]).
     'input[type="file"]:not([capture])',
-    'input[type="file"][data-testid="file-upload"]',
-    'input[type="file"][data-testid="file-upload-button"]',
+    'input[type="file"][data-testid="file-upload"]:not([capture])',
+    'input[type="file"][data-testid="file-upload-button"]:not([capture])',
   ],
   blockingOverlay: [
     '[data-testid="modal-beacon"] [data-state="open"]',

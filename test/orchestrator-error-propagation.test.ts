@@ -227,7 +227,7 @@ describe("runAskOnSession native Deep Research contract", () => {
   // navigation failure is pre-submit and must say so on the streamed event.
   it("types a plain navigation failure as a pre-submit error with the original message", async () => {
     openConversation.mockRejectedValueOnce(new Error("locator.click: Timeout 10000ms exceeded."));
-    const runner = runAskOnSession({ prompt: "hi", model: "gpt-6-pro", timeoutSec: 1200, headless: false }, session());
+    const runner = runAskOnSession({ prompt: "hi", gizmoId: "g-p-target", model: "gpt-6-pro", timeoutSec: 1200, headless: false }, session());
     const events = await collect(runner.events);
     await expect(runner.result).rejects.toBeInstanceOf(PreSubmitInteractionError);
     expect(events).toContainEqual({
@@ -237,6 +237,18 @@ describe("runAskOnSession native Deep Research contract", () => {
       phase: "project_navigation",
       promptSubmitted: false,
     });
+    expect(sendPrompt).not.toHaveBeenCalled();
+  });
+
+  // P-035 2026-10-14 review S3: only the project-row branch is typed; a resume
+  // navigation failure keeps its original error.
+  it("propagates a resume navigation failure unchanged, not as project_navigation_failed", async () => {
+    const original = new Error("page.goto: net::ERR_TIMED_OUT");
+    openConversation.mockRejectedValueOnce(original);
+    const runner = runAskOnSession({ prompt: "hi", conversationId: "c-resume", model: "gpt-6-pro", timeoutSec: 1200, headless: false }, session());
+    const events = await collect(runner.events);
+    await expect(runner.result).rejects.toBe(original);
+    expect(events.some(e => e.type === "error" && (e as { code?: string }).code === "project_navigation_failed")).toBe(false);
     expect(sendPrompt).not.toHaveBeenCalled();
   });
 
@@ -1054,6 +1066,22 @@ describe("runAskOnSession attachment contract", () => {
       message: "attachments could not be set: ENOENT: /tmp/shot.png",
       promptSubmitted: false,
     }));
+  });
+
+  // P-035 2026-10-14 review F1: an unreadable baseline (-1) must not become 0,
+  // or two cards already in the composer would pass for a delivered upload.
+  it("refuses before submission when the card baseline is unreadable", async () => {
+    const setInputFiles = vi.fn(async () => {});
+    countFormRemoveControls.mockResolvedValueOnce(-1).mockResolvedValue(2);
+    const events = await refusal(attachSession(1, setInputFiles));
+    expect(events).toContainEqual({
+      type: "error",
+      message: "attachment card baseline unreadable before submission",
+      code: "attachment_upload_failed",
+      phase: "prompt_delivery",
+      promptSubmitted: false,
+    });
+    expect(setInputFiles).not.toHaveBeenCalled();
   });
 
   it("refuses when the file cards never reach the sent count", async () => {

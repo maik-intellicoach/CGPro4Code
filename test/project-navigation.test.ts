@@ -2,6 +2,7 @@ import { runInNewContext } from "node:vm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "patchright";
 import { joinSelectors, SELECTORS } from "../src/browser/selectors.js";
+import { PreSubmitInteractionError } from "../src/errors.js";
 
 const projects = vi.fn();
 const goHome = vi.fn();
@@ -267,6 +268,44 @@ describe("Project directory sidebar click", () => {
     rowClick.mockImplementationOnce(async () => { throw new Error("locator.click: Timeout 10000ms exceeded."); });
     await openConversation(page, { gizmoId: target.id });
     expect(rowClick).toHaveBeenCalledTimes(2);
+  });
+
+  // P-035 2026-10-14 review F2/S2. Records each directory draft guard and each
+  // row click in order, on a clean synthetic directory.
+  function guardedRowPage(state: { draft?: boolean } = {}) {
+    const harness = pageFor();
+    installAdmissionDom(harness.page, state);
+    const order: string[] = [];
+    const admission = harness.page.evaluate;
+    harness.page.evaluate = vi.fn(async (fn: Function, arg: any) => {
+      if (arg?.owned?.directory) order.push("guard");
+      return (admission as any)(fn, arg);
+    }) as typeof harness.page.evaluate;
+    harness.page.waitForURL = vi.fn(async (predicate: (url: URL) => boolean) => {
+      if (!predicate(new URL(harness.page.url()))) throw new Error("page.waitForURL: Timeout 7000ms exceeded.");
+    }) as typeof harness.page.waitForURL;
+    return { ...harness, order };
+  }
+
+  it("retries a row click that resolved without navigating, guarding before each click", async () => {
+    const { page, rowClick, order } = guardedRowPage();
+    rowClick.mockImplementationOnce(async () => { order.push("click"); });
+    rowClick.mockImplementationOnce(async () => {
+      order.push("click");
+      (page.url as ReturnType<typeof vi.fn>).mockReturnValue(`https://chatgpt.com/g/${target.id}/project`);
+    });
+    await expect(openConversation(page, { gizmoId: target.id }, undefined, true)).resolves.toBeUndefined();
+    expect(rowClick).toHaveBeenCalledTimes(2);
+    expect(order).toEqual(["guard", "click", "guard", "click"]);
+  });
+
+  it("stops at once on a draft refusal before the row click, without Escape or retry", async () => {
+    const { page, rowClick, press, order } = guardedRowPage({ draft: true });
+    await expect(openConversation(page, { gizmoId: target.id }, undefined, true))
+      .rejects.toBeInstanceOf(PreSubmitInteractionError);
+    expect(order).toEqual(["guard"]);
+    expect(press).not.toHaveBeenCalled();
+    expect(rowClick).not.toHaveBeenCalled();
   });
 
   it("fails with the original row click error after 3 attempts that never navigate", async () => {

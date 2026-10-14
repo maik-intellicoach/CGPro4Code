@@ -28,6 +28,10 @@ describe("selectors", () => {
     expect(SELECTORS.fileUpload[0]).toBe('input[type="file"]:not([capture])');
   });
 
+  it("excludes capture inputs from every fileUpload union member (P-035 2026-10-14 review)", () => {
+    for (const selector of SELECTORS.fileUpload) expect(selector).toContain(":not([capture])");
+  });
+
   it("recognizes the square native Deep Research stop control", () => {
     expect(SELECTORS.stopButton.some((selector) => selector.includes("svg rect"))).toBe(true);
   });

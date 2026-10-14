@@ -250,8 +250,10 @@ export async function openConversation(
           sourceProvenEmpty = true;
         }
         await label.click({ timeout: 10_000 });
+        await page.waitForURL(isProjectDestination, { timeout: 7_000 });
         break;
       } catch (error) {
+        if (error instanceof PreSubmitInteractionError) throw error;
         if (onProjectDestination()) break;
         if (attempt === 2 || page.isClosed()) throw error;
         await dismissPointerBlockers(page);
