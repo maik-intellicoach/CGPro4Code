@@ -2105,6 +2105,13 @@ const PICKER_READ_TIMEOUT_MS = 1_000;
  */
 type ComposerChipScope = "exclude" | "include";
 
+/** P-045 G7. One-shot marker on the element a picker lookup matched; see visibleComposerTool. */
+export const PICK_MARK_ATTRIBUTE = "data-cgpro-pick";
+/** Open picker / popover surfaces a plain-text (span) match must sit inside. */
+export const OPEN_PICKER_SELECTOR =
+  '[role="listbox"], [role="menu"], [role="dialog"], [data-radix-popper-content-wrapper], [cmdk-root], [cmdk-list]';
+let pickNonce = 0;
+
 async function visibleComposerTool(page: Page, name: string, chips: ComposerChipScope = "exclude"): Promise<Locator | null> {
   // Let the browser narrow the DOM before crossing the automation boundary, then
   // decide visibility and the exact label in ONE in-page pass per selector.
@@ -2113,39 +2120,57 @@ async function visibleComposerTool(page: Page, name: string, chips: ComposerChip
   // Project's history: on 2026-09-26 picker-wait went from a 3 s median to 29 s
   // (max 147 s) and every lane preflight hit its 140 s budget.
   const expected = name.replace(/\s+/g, " ").trim().toLocaleLowerCase();
-  const matchingCandidate = async (selector: string): Promise<Locator | null> => {
+  // P-045 G7 (2026-10-28). The matched element is stamped with a one-shot
+  // marker IN the same pass and the caller gets a locator for that marker, not
+  // `candidates.nth(index)`. A positional locator re-resolves the substring
+  // filter on every use, so once the picker re-rendered or closed, or a
+  // project-chat preview containing the name came or went, position i named a
+  // different element or none (intelli/strengths/ms1980 2026-10-28:
+  // `waiting for locator('span').filter({ hasText }).nth(2)` on both attempts).
+  // A marked element that re-rendered resolves to nothing and fails fast; the
+  // refresh lookup stamps the new row.
+  const nonce = `${Date.now().toString(36)}-${(++pickNonce).toString(36)}`;
+  const matchingCandidate = async (selector: string, pickerOnly: boolean): Promise<Locator | null> => {
     const candidates = page.locator(selector).filter({ hasText: name });
     const [index, scanned] = await candidates
-      .evaluateAll((elements, [label, allowChip]) => [elements.findIndex((element) => {
-        const el = element as HTMLElement;
-        const box = el.getBoundingClientRect();
-        if (!(box.width > 0 && box.height > 0 &&
-          el.checkVisibility({ visibilityProperty: true }) &&
-          el.innerText.replace(/\s+/g, " ").trim().toLocaleLowerCase() === label)) return false;
-        // Same composer proof as `isComposerMountedTool`.
-        const inComposer = Boolean(el.closest("form")?.querySelector(
-          "#prompt-textarea, [data-testid=\"prompt-textarea\"], [data-composer-markdown]",
-        ));
-        if (inComposer) return allowChip;
-        return el.closest('nav, aside, [role="navigation"]') === null
-          && el.closest('a[href*="/plugins/"]') === null;
-      }), elements.length], [expected, chips === "include"] as const)
+      .evaluateAll((elements, [label, allowChip, inPickerOnly, attr, mark, pickerSelector]) => {
+        const doc = (globalThis as { document?: Document }).document;
+        doc?.querySelectorAll(`[${attr}]`).forEach((old) => old.removeAttribute(attr));
+        const found = elements.findIndex((element) => {
+          const el = element as HTMLElement;
+          const box = el.getBoundingClientRect();
+          if (!(box.width > 0 && box.height > 0 &&
+            el.checkVisibility({ visibilityProperty: true }) &&
+            el.innerText.replace(/\s+/g, " ").trim().toLocaleLowerCase() === label)) return false;
+          // Same composer proof as `isComposerMountedTool`.
+          const inComposer = Boolean(el.closest("form")?.querySelector(
+            "#prompt-textarea, [data-testid=\"prompt-textarea\"], [data-composer-markdown]",
+          ));
+          if (inComposer) return allowChip;
+          if (el.closest('nav, aside, [role="navigation"]') !== null
+            || el.closest('a[href*="/plugins/"]') !== null) return false;
+          // Plain text outside the composer counts only inside the open picker:
+          // project-chat previews also render the exact name in a span.
+          return !inPickerOnly || el.closest(pickerSelector) !== null;
+        });
+        if (found >= 0) (elements[found] as HTMLElement).setAttribute(attr, mark);
+        return [found, elements.length];
+      }, [expected, chips === "include", pickerOnly, PICK_MARK_ATTRIBUTE, nonce, OPEN_PICKER_SELECTOR] as const)
       .catch(() => [-1, 0]);
     // Diagnostic for the picker-click stall (P-035 2026-09-26): how many page
     // elements a locator that resolves by this filter must scan.
     if (scanned > 20) console.error(`[cgpro:connector] lookup selector=${selector.slice(0, 20)} candidates=${scanned} match=${index}`);
-    // ponytail: a re-render between this pass and the caller's use can shift
-    // nth(); callers re-verify the row (attached state, exact click) and retry.
-    return index >= 0 ? candidates.nth(index) : null;
+    return index >= 0 ? page.locator(`[${PICK_MARK_ATTRIBUTE}="${nonce}"]`) : null;
   };
 
   const interactive = await matchingCandidate(
     '[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"], button',
+    false,
   );
   if (interactive) return interactive;
   // The current @ plugin chooser renders the selectable app label as plain
   // spans inside a keyboard-command row with no ARIA option/menuitem role.
-  return matchingCandidate("span");
+  return matchingCandidate("span", true);
 }
 
 async function waitForComposerTool(

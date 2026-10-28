@@ -31,7 +31,7 @@ import { randomBytes } from "node:crypto";
 import { appendFileSync, openSync, writeSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Page } from "patchright";
-import { describeWindow, openSession, parkWindow, showWindow, type Session } from "../browser/session.js";
+import { describeWindow, isP045LaneProfile, openSession, parkWindow, showWindow, type Session } from "../browser/session.js";
 import { profileDir } from "../store/paths.js";
 import { fetchAuthSessionInPage, goHome, isLoggedIn } from "../browser/chatgpt.js";
 import {
@@ -534,7 +534,8 @@ export function openSlotPage(slots: SlotState[]): Page | null {
  * would hide the very window Maik asked to see.
  */
 function applyWorkPosture(state: ServerState, slot: SlotState, show: boolean): void {
-  if (!state.background) return;
+  // P-045 G7: a lane's windows belong to bcp; lane mode never moves one.
+  if (!state.background || state.session.lane) return;
   const page = slot.page;
   if (!page || page.isClosed()) return;
   let work: Promise<number | null>;
@@ -595,6 +596,8 @@ async function slotPage(
     return slot.page;
   }
   const page = await state.session.context.newPage();
+  // P-045 G7: a lane browser outlives the daemon, so its slot tabs close with the session.
+  state.session.adopt?.(page);
   // Publish ownership before navigation/authentication, which may themselves hang.
   slot.page = page;
   capture?.(page);
@@ -752,12 +755,18 @@ export async function closeDaemonSession(
       // The abandoned close may still settle later; it must not surface as an
       // unhandled rejection once the process has moved on.
       closing.catch(() => {});
-      const dir = profileDir(profile);
-      log.warn(
-        `browser close exceeded ${SESSION_CLOSE_TIMEOUT_MS}ms; SIGKILL browser processes of profile=${dir}`,
-      );
-      const killed = killBrowsers(dir);
-      log.warn(`killed browser pids=[${killed.join(",")}] profile=${dir}`);
+      if (session.lane) {
+        // P-045 G7: the lane browser belongs to bcp. Dropping our websocket is
+        // all a lane close does, so a slow one is abandoned, never killed.
+        log.warn(`lane session close exceeded ${SESSION_CLOSE_TIMEOUT_MS}ms; abandoned, lane browser left running (${session.lane})`);
+      } else {
+        const dir = profileDir(profile);
+        log.warn(
+          `browser close exceeded ${SESSION_CLOSE_TIMEOUT_MS}ms; SIGKILL browser processes of profile=${dir}`,
+        );
+        const killed = killBrowsers(dir);
+        log.warn(`killed browser pids=[${killed.join(",")}] profile=${dir}`);
+      }
     }
   } finally {
     if (timer) clearTimeout(timer);
@@ -784,6 +793,11 @@ export function killProfileBrowsers(
     deps.listProcesses ??
     (() => execFileSync("ps", ["-axww", "-o", "pid=,args="], { encoding: "utf-8", timeout: 10_000 }));
   const kill = deps.kill ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
+  // P-045 G7: never signal a bcp-owned lane browser, whatever profile was configured.
+  if (isP045LaneProfile(profilePath)) {
+    log.warn(`refusing to kill browsers of P-045 lane profile ${profilePath}; bcp owns that browser`);
+    return [];
+  }
   const flag = `--user-data-dir=${profilePath}`;
   let listing: string;
   try {
@@ -801,6 +815,7 @@ export function killProfileBrowsers(
     if (pid === process.pid) continue;
     const at = args.indexOf(flag);
     if (at < 0) continue;
+    if (isP045LaneProfile(args)) continue;
     // Exact argument: the next character ends the argv token, so a sibling
     // profile whose path merely starts with this one is never matched.
     const next = args.charAt(at + flag.length);
@@ -828,7 +843,10 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
     profilePath: opts.profile,
     background: opts.background ?? true,
   });
-  if (headless) log.info("launched HEADLESS (CGPRO_HEADLESS=1)");
+  if (session.lane) {
+    // P-045 G7 (D3): lanes run headed and bcp starts them; CGPRO_HEADLESS has no say.
+    log.info(`attached to P-045 lane browser ${session.lane}; window posture off${headless ? ", CGPRO_HEADLESS ignored" : ""}`);
+  } else if (headless) log.info("launched HEADLESS (CGPRO_HEADLESS=1)");
 
   let account: { email?: string; plan: string; proModelAvailable: boolean };
   try {
@@ -871,7 +889,8 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
 
   // A headless lane has no window to show or park, so the work posture stays off
   // (P-035 2026-10-05). Headed lanes get `opts` unchanged.
-  const state = createServerState(session, headless ? { ...opts, background: false } : opts, account);
+  // P-045 G7: a lane session never moves windows either (bcp owns them).
+  const state = createServerState(session, headless || session.lane ? { ...opts, background: false } : opts, account);
 
   const server = createServer((req, res) => {
     handleRequest(req, res, state).catch((err: unknown) => {
@@ -895,7 +914,7 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
       token: state.token,
       startedAt: state.startedAt.toISOString(),
       profile: opts.profile,
-      background: opts.background ?? true,
+      background: session.lane ? false : opts.background ?? true,
     };
     writeDaemonInfo(info);
     log.info(`listening on 127.0.0.1:${port} slots=${state.maxSlots}`);

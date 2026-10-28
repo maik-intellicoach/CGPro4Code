@@ -27,12 +27,85 @@ export interface SessionOptions {
    * Real headless mode gets challenged by Cloudflare.
    */
   background?: boolean;
+  /**
+   * P-045 G7 (2026-10-28). Attach to a running P-045 lane browser (Brave,
+   * started headed by `bcp browser start <lane>`) over its loopback CDP port
+   * instead of launching a private Chromium. bcp owns that browser's life,
+   * window, extensions and sign-in, so a lane session opens and closes only the
+   * tabs it made, never moves a window and never ends the browser.
+   * Defaults to CGPRO_CDP_ENDPOINT.
+   */
+  cdpEndpoint?: string;
 }
 
 export interface Session {
   context: BrowserContext;
   page: Page;
   close(): Promise<void>;
+  /** P-045 G7. Set when attached to a P-045 lane browser: the loopback endpoint. */
+  lane?: string;
+  /** P-045 G7. Lane sessions close the extra tabs they were handed (daemon slots) on close. */
+  adopt?(page: Page): void;
+}
+
+/** Only a literal loopback lane port is attachable (an open CDP port is unauthenticated). */
+export function laneCdpEndpoint(raw: string | undefined): string | null {
+  const value = raw?.trim();
+  if (!value) return null;
+  const match = /^http:\/\/127\.0\.0\.1:(\d{2,5})\/?$/.exec(value);
+  if (!match || Number(match[1]) > 65535) {
+    throw new Error(`CGPRO_CDP_ENDPOINT must be http://127.0.0.1:<port>, got ${JSON.stringify(value)}`);
+  }
+  return `http://127.0.0.1:${match[1]}`;
+}
+
+/** The lane endpoint this process is configured for, or null (validated). */
+export function configuredLaneEndpoint(opts: Pick<SessionOptions, "cdpEndpoint"> = {}): string | null {
+  return laneCdpEndpoint(opts.cdpEndpoint ?? process.env.CGPRO_CDP_ENDPOINT);
+}
+
+/**
+ * P-045 lane user-data dirs (`~/.p045-lane-<id>`). Those browsers belong to
+ * bcp; nothing in cgpro may signal them.
+ */
+export function isP045LaneProfile(path: string): boolean {
+  return /(^|\/)\.p045-lane-/.test(path);
+}
+
+async function attachLaneSession(endpoint: string): Promise<Session> {
+  const browser = await chromium.connectOverCDP(endpoint);
+  const context = browser.contexts()[0];
+  if (!context) {
+    await browser.close().catch(() => undefined);
+    throw new Error(`lane browser at ${endpoint} has no default context`);
+  }
+  const owned = new Set<Page>();
+  try {
+    await ensureInterceptorInstalled(context);
+    // Our own tab only: the lane's other tabs (and Maik's sign-in tab) stay untouched.
+    const page = await context.newPage();
+    owned.add(page);
+    installFileChooserGuard(context, page);
+    if (process.env.CGPRO_DIAG === "1") installDiagnostics(context, page);
+    // No parkWindow / showWindow here, ever: bcp owns the lane's windows.
+    return {
+      context,
+      page,
+      lane: endpoint,
+      adopt(extra: Page) {
+        owned.add(extra);
+      },
+      async close() {
+        for (const tab of owned) await tab.close().catch(() => undefined);
+        // connectOverCDP: close() drops the websocket only; the lane browser keeps running.
+        await browser.close();
+      },
+    };
+  } catch (error) {
+    for (const tab of owned) await tab.close().catch(() => undefined);
+    await browser.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 /**
@@ -46,6 +119,8 @@ export interface Session {
  *   per context BEFORE any navigation, so it catches the very first request.
  */
 export async function openSession(opts: SessionOptions = {}): Promise<Session> {
+  const lane = configuredLaneEndpoint(opts);
+  if (lane) return attachLaneSession(lane);
   ensureDirs();
   const dir = profileDir(opts.profilePath);
   const headless = !(opts.headed ?? false);

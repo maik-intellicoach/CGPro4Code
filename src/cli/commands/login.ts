@@ -1,6 +1,6 @@
 import chalk from "chalk";
 import ora from "ora";
-import { openSession } from "../../browser/session.js";
+import { configuredLaneEndpoint, openSession } from "../../browser/session.js";
 import { fetchAuthSessionInPage, goHome, type AuthSessionFull } from "../../browser/chatgpt.js";
 import { assertNoDaemon } from "../../daemon/client.js";
 
@@ -20,6 +20,15 @@ export interface LoginOptions {
  */
 export async function loginCommand(opts: LoginOptions): Promise<number> {
   await assertNoDaemon("login", opts.profile);
+  // P-045 G7: a lane is signed in by Maik inside its coded Brave window, never through cgpro.
+  const lane = configuredLaneEndpoint();
+  if (lane) {
+    console.error(
+      chalk.red(`cgpro login does not run in lane mode (CGPRO_CDP_ENDPOINT=${lane}). `) +
+        "Sign in to ChatGPT inside the lane's own coded Brave window, then start the daemon.",
+    );
+    return 2;
+  }
   const timeoutSec = opts.timeout ?? 300;
   const startedAt = Date.now();
 

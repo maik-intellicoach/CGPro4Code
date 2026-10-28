@@ -30,10 +30,20 @@ interface FakeRow {
   href?: string;
   /** Distinguishes same-label rows in `clickedLabels`. */
   id?: string;
+  /**
+   * P-045 G7. A plain-text span: only the `span` lookup sees it. Rows without a
+   * kind match every lookup selector (the shape the older tests rely on).
+   */
+  kind?: "span";
+  /** P-045 G7. Sits inside the open @-picker / popover surface. */
+  inPicker?: boolean;
 }
+
+const PICK_MARK = "data-cgpro-pick";
 
 /** DOM `closest` over a fake row, for the selectors the lookups use. */
 function fakeClosest(row: FakeRow, selector: string): unknown {
+  if (selector.includes('[role="listbox"]')) return row.inPicker ? {} : null;
   if (selector === "form") return row.inComposer ? { querySelector: () => ({}) } : null;
   if (selector.includes("nav")) return row.inNav ? {} : null;
   if (selector.includes("/plugins/")) return row.href?.includes("/plugins/") ? {} : null;
@@ -80,6 +90,7 @@ function makePage() {
   let devSelect: (() => void) | null = null;
   const innerTextReads: string[] = [];
   let roundTrips = 0;
+  let afterScan: (() => void) | null = null;
 
   const page = {
     keyboard: {
@@ -89,36 +100,45 @@ function makePage() {
     waitForTimeout: vi.fn(async () => {}),
     url: () => "https://chatgpt.com/g/g-p-test/project",
     clickedLabels: [] as string[],
-    locator: () => makeCandidates(),
+    locator: (selector: string) => {
+      // P-045 G7. The lookup returns a locator for its one-shot marker; it
+      // resolves against the rows mounted at USE time, like the real DOM.
+      const mark = new RegExp(`^\\[${PICK_MARK}="([^"]+)"\\]$`).exec(selector);
+      if (mark) return rowLoc(() => rows.find((row) => row.attrs?.[PICK_MARK] === mark[1]));
+      return makeCandidates(() => rows.filter((row) => row.kind !== "span" || selector === "span"));
+    },
   } as unknown as Page & { keyboard: { press: ReturnType<typeof vi.fn> } };
 
-  const rowLoc = (row: FakeRow | undefined) => ({
-    count: async () => (row ? 1 : 0),
+  const rowLoc = (resolve: () => FakeRow | undefined) => ({
+    count: async () => (resolve() ? 1 : 0),
     isVisible: async () => {
       roundTrips++;
-      return row?.visible ?? false;
+      return resolve()?.visible ?? false;
     },
     innerText: async () => {
       roundTrips++;
+      const row = resolve();
       if (row) innerTextReads.push(row.label);
       return row?.label ?? "";
     },
     getAttribute: async (attr: string) => {
       roundTrips++;
-      return row?.attrs?.[attr] ?? null;
+      return resolve()?.attrs?.[attr] ?? null;
     },
     // One in-page pass over a DOM-like stand-in, mirroring Playwright's evaluate.
     evaluate: async <R, A>(fn: (element: unknown, arg: A) => R, arg: A): Promise<R> => {
       roundTrips++;
+      const row = resolve();
       if (!row) throw new Error("locator.evaluate: Timeout exceeded");
       return fn(domRow(row), arg);
     },
-    locator: () => rowLoc(row?.parent),
+    locator: () => rowLoc(() => resolve()?.parent),
     click: async () => {
-      if (row) {
-        page.clickedLabels.push(row.id ?? row.label);
-        await row.onSelected?.();
-      }
+      const row = resolve();
+      // A marker whose element is gone resolves to nothing: Playwright times out.
+      if (!row) throw new Error("locator.click: Timeout 5000ms exceeded.");
+      page.clickedLabels.push(row.id ?? row.label);
+      await row.onSelected?.();
     },
   });
 
@@ -138,28 +158,38 @@ function makePage() {
     },
   });
 
-  const makeCandidates = (sourceRows = rows) => ({
-    count: async () => sourceRows.length,
+  // Candidates resolve against the rows mounted at USE time, like a Playwright
+  // locator: a positional nth() taken before a re-render names whatever sits
+  // at that position afterwards.
+  const makeCandidates = (source: () => FakeRow[] = () => rows) => ({
+    count: async () => source().length,
     // Failure diagnostics now read picker labels even without CGPRO_DEBUG.
-    allInnerTexts: async () => sourceRows.filter((row) => row.visible).map((row) => row.label),
-    nth: (i: number) => rowLoc(sourceRows[i]),
+    allInnerTexts: async () => source().filter((row) => row.visible).map((row) => row.label),
+    nth: (i: number) => rowLoc(() => source()[i]),
     // One in-page pass over DOM-like stand-ins, mirroring Playwright's evaluateAll.
     evaluateAll: async <R, A>(fn: (elements: unknown[], arg: A) => R, arg: A): Promise<R> => {
       roundTrips++;
-      return fn(sourceRows.map((row) => ({
+      const result = fn(source().map((row) => ({
         getBoundingClientRect: () => (row.visible ? { width: 10, height: 10 } : { width: 0, height: 0 }),
         checkVisibility: () => row.visible,
         closest: (selector: string) => fakeClosest(row, selector),
+        setAttribute: (attr: string, value: string) => {
+          // One live marker per page, as the in-page pass clears older ones.
+          for (const other of rows) if (other.attrs) delete other.attrs[attr];
+          row.attrs = { ...row.attrs, [attr]: value };
+        },
         get innerText() {
           innerTextReads.push(row.label);
           return row.label;
         },
       })), arg);
+      afterScan?.();
+      return result;
     },
     filter: (options?: { hasText?: string | RegExp }) => {
       if (typeof options?.hasText === "string") {
         const expected = options.hasText.toLocaleLowerCase();
-        return makeCandidates(sourceRows.filter((row) => row.label.toLocaleLowerCase().includes(expected)));
+        return makeCandidates(() => source().filter((row) => row.label.toLocaleLowerCase().includes(expected)));
       }
       return { first: () => devLoc() };
     },
@@ -178,6 +208,10 @@ function makePage() {
     setDevMode(on: boolean, onSelect: () => void): void {
       devMode = on;
       devSelect = onSelect;
+    },
+    /** Runs right after every lookup pass (a re-render between lookup and click). */
+    afterEachScan(hook: () => void): void {
+      afterScan = hook;
     },
     innerTextReads,
     get roundTrips(): number {
@@ -770,5 +804,63 @@ describe("connector clicks only ever target the @-picker row (P-035 2026-10-05)"
     await expect(setConnector(page, "connector")).resolves.toBeUndefined();
 
     expect(page.clickedLabels).toEqual(["picker"]);
+  });
+});
+
+describe("connector picker lookup marks the matched row (P-045 G7)", () => {
+  it("clicks the marked picker row even when a re-render shifts positions before the click", async () => {
+    const scenario = makePage();
+    const picked: FakeRow = {
+      id: "picker-row", label: "p035-low-risk-workstation", visible: true, attrs: {},
+      onSelected: () => {
+        current = [{ label: "p035-low-risk-workstation", visible: true, attrs: {}, inComposer: true }];
+        scenario.setRows(current);
+      },
+    };
+    let current: FakeRow[] = [picked];
+    scenario.setRows(current);
+    // After every lookup pass, before the click, the page re-renders and a
+    // left-rail entry with the same label lands in front of the matched row.
+    // A positional nth(index) would now click the rail entry (it navigates
+    // away); the marker still names the element the pass matched.
+    let n = 0;
+    scenario.afterEachScan(() => {
+      if (!current.includes(picked)) return;
+      current = [{ id: `rail-${n++}`, label: "p035-low-risk-workstation", visible: true, attrs: {}, inNav: true }, ...current];
+      scenario.setRows(current);
+    });
+
+    await expect(setConnector(scenario.page, "p035-low-risk-workstation")).resolves.toBeUndefined();
+
+    expect(scenario.page.clickedLabels).toEqual(["picker-row"]);
+  });
+
+  it("matches plain-text spans only inside the open picker, never a project-chat preview", async () => {
+    const scenario = makePage();
+    const inPicker = {
+      id: "picker-span", kind: "span" as const, inPicker: true,
+      label: "p035-low-risk-workstation", visible: true, attrs: {},
+      onSelected: () => scenario.setRows([{ label: "p035-low-risk-workstation", visible: true, attrs: {}, inComposer: true }]),
+    };
+    scenario.setRows([
+      // A project-chat preview renders the exact name in its own span.
+      { id: "preview-span", kind: "span", label: "p035-low-risk-workstation", visible: true, attrs: {} },
+      inPicker,
+    ]);
+
+    await expect(setConnector(scenario.page, "p035-low-risk-workstation")).resolves.toBeUndefined();
+
+    expect(scenario.page.clickedLabels).toEqual(["picker-span"]);
+  });
+
+  it("finds no row when the only exact-label span is a preview outside the picker", async () => {
+    const scenario = makePage();
+    scenario.setRows([
+      { id: "preview-span", kind: "span", label: "p035-low-risk-workstation", visible: true, attrs: {} },
+    ]);
+
+    await expect(setConnector(scenario.page, "p035-low-risk-workstation")).rejects.toThrow();
+
+    expect(scenario.page.clickedLabels).toEqual([]);
   });
 });
