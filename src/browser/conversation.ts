@@ -408,7 +408,9 @@ const LOWER_EFFORT_LABELS = new Set(["high", "medium", "low", "instant", "minima
  * A silent false positive cost this project a week once already; a loud refusal
  * costs one turn.
  */
-const NEWEST_MODEL_SENTINELS = new Set(["latest"]);
+// P-035 2026-10-29, Maik D2 a: "Default / Recommended set of models" is the app's successor to `Latest`
+// (its entry text reads "Default" + "Recommended set of models", whitespace dropped by the match).
+const NEWEST_MODEL_SENTINELS = new Set(["latest", "defaultrecommendedsetofmodels"]);
 
 /**
  * P-035 2026-10-08. The app renamed its `Latest` entry to the model's own name

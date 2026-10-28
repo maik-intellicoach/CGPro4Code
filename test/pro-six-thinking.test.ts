@@ -460,6 +460,15 @@ describe("6 Pro maximum thinking admission", () => {
     await expect(ensureProSixMaximum(s.page)).resolves.toEqual({ model: "GPT-6", power: 4 });
   });
 
+  // P-035 2026-10-29, Maik D2 a: "Default / Recommended set of models" replaces `Latest`.
+  it("accepts the checked Default (recommended set) entry and refuses a named model below it", async () => {
+    const entries = ["DefaultRecommended set of models", "GPT-6 Sol", "GPT-6.1 Sol", "GPT-6 Astra"];
+    await expect(ensureProSixMaximum(setup({ effortLabel: "Pro", pickerEntries: entries, pickerCheckedIndex: 0 }).page))
+      .resolves.toEqual({ model: "DefaultRecommended set of models", power: 4 });
+    await expect(ensureProSixMaximum(setup({ effortLabel: "Pro", pickerEntries: entries, pickerCheckedIndex: 1 }).page))
+      .rejects.toThrow(/has "GPT-6 Sol" selected/);
+  });
+
   it("refuses the renamed entry when the catalogue Pro model is a different one", async () => {
     fetchModels.mockResolvedValue([{ slug: "gpt-5-5-pro", title: "GPT-5.5 Pro" }]);
     const s = setup({ pickerEntries: ["GPT-6", "GPT-5.6 Sol"], pickerCheckedIndex: 0 });
