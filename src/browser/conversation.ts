@@ -2107,9 +2107,15 @@ type ComposerChipScope = "exclude" | "include";
 
 /** P-045 G7. One-shot marker on the element a picker lookup matched; see visibleComposerTool. */
 export const PICK_MARK_ATTRIBUTE = "data-cgpro-pick";
-/** Open picker / popover surfaces a plain-text (span) match must sit inside. */
+/**
+ * Open picker / popover surfaces a plain-text (span) match must sit inside.
+ * P-035 2026-10-29: the @ mention list is a role-less floating overlay
+ * (`data-composer-overlay-floating-ui`, rows under `data-mention-section-id`)
+ * whose row button repeats the name as a subtitle, so only its label span matches.
+ */
 export const OPEN_PICKER_SELECTOR =
-  '[role="listbox"], [role="menu"], [role="dialog"], [data-radix-popper-content-wrapper], [cmdk-root], [cmdk-list]';
+  '[role="listbox"], [role="menu"], [role="dialog"], [data-radix-popper-content-wrapper], [cmdk-root], [cmdk-list], ' +
+  '[data-composer-overlay-floating-ui="true"], [data-mention-list-scroll-area]';
 let pickNonce = 0;
 
 async function visibleComposerTool(page: Page, name: string, chips: ComposerChipScope = "exclude"): Promise<Locator | null> {

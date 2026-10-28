@@ -864,3 +864,9 @@ describe("connector picker lookup marks the matched row (P-045 G7)", () => {
     expect(scenario.page.clickedLabels).toEqual([]);
   });
 });
+
+it("counts the role-less @ mention overlay as an open picker surface (P-035 2026-10-29)", async () => {
+  const { OPEN_PICKER_SELECTOR } = await import("../src/browser/conversation.js");
+  expect(OPEN_PICKER_SELECTOR).toContain('[data-composer-overlay-floating-ui="true"]');
+  expect(OPEN_PICKER_SELECTOR).toContain("[data-mention-list-scroll-area]");
+});
