@@ -133,6 +133,8 @@ export interface StatusResponse {
   startedAt: string;
   uptimeSec: number;
   background: boolean;
+  /** Whether the daemon still has a live browser connection. */
+  browserConnected?: boolean;
   profile?: string;
   busy: boolean;
   /** Authenticated account facts captured when the daemon starts. */

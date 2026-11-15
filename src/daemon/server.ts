@@ -30,7 +30,7 @@ import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { appendFileSync, openSync, writeSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { Page } from "patchright";
+import type { Browser, Page } from "patchright";
 import { describeWindow, isP045LaneProfile, openSession, parkWindow, showWindow, type Session } from "../browser/session.js";
 import { profileDir } from "../store/paths.js";
 import { fetchAuthSessionInPage, goHome, isLoggedIn } from "../browser/chatgpt.js";
@@ -342,6 +342,7 @@ export interface SlotState {
 // Exported for the HTTP-level integration test (C-092 P-026 r2).
 export interface ServerState {
   session: Session;
+  browserLink?: LaneBrowserConnection;
   token: string;
   startedAt: Date;
   background: boolean;
@@ -591,6 +592,7 @@ async function slotPage(
   slot: SlotState,
   capture?: (page: Page) => void,
 ): Promise<Page> {
+  if (state.browserLink?.failure) throw state.browserLink.failure;
   if (slot.page && !slot.page.isClosed()) {
     capture?.(slot.page);
     return slot.page;
@@ -726,9 +728,110 @@ export async function closeDaemonSessionBeforeExit(
   session: Session,
   exit: (code: number) => never = process.exit,
   profile?: string,
+  exitCode = 0,
 ): Promise<never> {
-  await closeDaemonSession(session, profile);
-  return exit(0);
+  try {
+    await closeDaemonSession(session, profile);
+  } catch (error) {
+    if (!session.lane || exitCode === 0) throw error;
+    // A lost CDP link can also reject close(). It must not leave this dead
+    // daemon registered, and it never authorizes killing bcp's browser.
+    log.warn(`lane session cleanup failed: ${(error as Error).message}`);
+    clearDaemonInfo(process.pid);
+  }
+  return exit(exitCode);
+}
+
+const CLOSED_BROWSER_ERROR = "Target page, context or browser has been closed";
+
+/** One terminal link loss, shared by the event and request-error paths. */
+export class LaneBrowserConnection {
+  private readonly controller = new AbortController();
+  private readonly requests = new Set<Promise<void>>();
+  private disposed = false;
+  failure?: Error;
+  closing?: Promise<void>;
+
+  get signal(): AbortSignal {
+    return this.controller.signal;
+  }
+
+  constructor(
+    private readonly state: ServerState,
+    private readonly browser: Browser,
+    private readonly stop: () => Promise<void>,
+  ) {
+    browser.on("disconnected", this.onDisconnected);
+    // The connection may have dropped during the startup authentication probe.
+    if (!browser.isConnected()) this.lose();
+  }
+
+  private readonly onDisconnected = (): void => { this.lose(); };
+
+  dispose(): void {
+    this.disposed = true;
+    this.browser.off("disconnected", this.onDisconnected);
+  }
+
+  private lose(): void {
+    if (this.disposed || this.failure) return;
+    this.failure = new Error(`lane browser link lost (${this.state.session.lane}); daemon is exiting`);
+    log.error(`lane browser link lost lane=${this.state.session.lane}; exiting code=1`);
+    this.controller.abort();
+    this.closing = (async () => {
+      // Handlers race their browser work against the loss signal, send their
+      // error, and release leases before session cleanup or process exit.
+      await Promise.all([...this.requests]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      this.dispose();
+      await this.stop();
+    })();
+  }
+
+  loseIfClosed(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes(CLOSED_BROWSER_ERROR) &&
+        (!this.browser.isConnected() || message.startsWith("browserContext."))) this.lose();
+    return Boolean(this.failure);
+  }
+
+  async request(work: () => Promise<void>): Promise<void> {
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => { finish = resolve; });
+    this.requests.add(finished);
+    try {
+      await work();
+    } finally {
+      this.requests.delete(finished);
+      finish();
+    }
+  }
+
+  async race<T>(work: Promise<T>): Promise<T> {
+    let onLoss!: () => void;
+    try {
+      return await Promise.race([
+        work,
+        new Promise<never>((_resolve, reject) => {
+          onLoss = () => reject(this.failure);
+          if (this.failure) onLoss();
+          else this.controller.signal.addEventListener("abort", onLoss, { once: true });
+        }),
+      ]);
+    } finally {
+      this.controller.signal.removeEventListener("abort", onLoss);
+    }
+  }
+}
+
+function withBrowserConnection<T>(state: ServerState, work: Promise<T>): Promise<T> {
+  return state.browserLink ? state.browserLink.race(work) : work;
+}
+
+function browserConnected(state: ServerState): boolean {
+  if (state.browserLink?.failure) return false;
+  // Persistent contexts may have no Browser handle. Lane contexts always do.
+  return state.session.context?.browser?.()?.isConnected() ?? !state.session.page.isClosed();
 }
 
 /**
@@ -848,37 +951,53 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
     log.info(`attached to P-045 lane browser ${session.lane}; window posture off${headless ? ", CGPRO_HEADLESS ignored" : ""}`);
   } else if (headless) log.info("launched HEADLESS (CGPRO_HEADLESS=1)");
 
+  // Install before authentication: a link drop can also strand a startup probe.
+  // Lane/headless sessions never move windows; bcp owns lane window posture.
+  const state = createServerState(session, headless || session.lane ? { ...opts, background: false } : opts);
+  let closeListener = (): void => {};
+  if (session.lane) {
+    state.browserLink = new LaneBrowserConnection(state, session.context.browser()!, async () => {
+      closeListener();
+      await closeDaemonSessionBeforeExit(session, process.exit, opts.profile, 1);
+    });
+    if (state.browserLink.failure) return;
+  }
+
   let account: { email?: string; plan: string; proModelAvailable: boolean };
   try {
-    log.info("session open, going home…");
-    await goHome(session.page);
-    // Chromium still prefixes the product with "Headless" when the headless
-    // switch is set, so the UA is the single cheapest fingerprint fact worth
-    // having in the log. Recorded on every start, not only headless ones: a
-    // baseline you did not capture before the change is not a baseline.
-    const userAgent = await session.page
-      .evaluate(() => navigator.userAgent)
-      .catch(() => "unreadable");
-    log.info(`userAgent=${userAgent}`);
-    if (!(await isLoggedIn(session.page, 8_000))) {
-      // "not logged in" is where this daemon refuses to start, and on its own
-      // it cannot tell apart an expired profile, an anonymous /api/auth/session
-      // and an edge challenge holding the page. isLoggedIn already polled for
-      // 8s, so slowness is not the explanation by the time we get here; say
-      // what was actually on the page instead of leaving the next reader to
-      // guess. Every probe is best-effort: diagnostics must not mask the
-      // original refusal.
-      const url = session.page.url();
-      const title = await session.page.title().catch(() => "unreadable");
-      const probe = await fetchAuthSessionInPage(session.page).catch(() => null);
-      const identity = probe?.user?.id ? `user_id=${probe.user.id}` : "no user in session payload";
-      log.error(
-        `not logged in — refusing to start daemon (url=${url} title="${title}" ${identity})`,
-      );
-      throw new NotLoggedInError();
-    }
-    account = await probeAccountCapabilities(session.page);
+    account = await withBrowserConnection(state, (async () => {
+      log.info("session open, going home…");
+      await goHome(session.page);
+      // Chromium still prefixes the product with "Headless" when the headless
+      // switch is set, so the UA is the single cheapest fingerprint fact worth
+      // having in the log. Recorded on every start, not only headless ones: a
+      // baseline you did not capture before the change is not a baseline.
+      const userAgent = await session.page
+        .evaluate(() => navigator.userAgent)
+        .catch(() => "unreadable");
+      log.info(`userAgent=${userAgent}`);
+      if (!(await isLoggedIn(session.page, 8_000))) {
+        // "not logged in" is where this daemon refuses to start, and on its own
+        // it cannot tell apart an expired profile, an anonymous /api/auth/session
+        // and an edge challenge holding the page. isLoggedIn already polled for
+        // 8s, so slowness is not the explanation by the time we get here; say
+        // what was actually on the page instead of leaving the next reader to
+        // guess. Every probe is best-effort: diagnostics must not mask the
+        // original refusal.
+        const url = session.page.url();
+        const title = await session.page.title().catch(() => "unreadable");
+        const probe = await fetchAuthSessionInPage(session.page).catch(() => null);
+        const identity = probe?.user?.id ? `user_id=${probe.user.id}` : "no user in session payload";
+        log.error(
+          `not logged in — refusing to start daemon (url=${url} title="${title}" ${identity})`,
+        );
+        throw new NotLoggedInError();
+      }
+      return await probeAccountCapabilities(session.page);
+    })());
   } catch (error) {
+    if (state.browserLink?.loseIfClosed(error)) return;
+    state.browserLink?.dispose();
     // A failed pre-listener probe used to terminate Node while Chrome still
     // owned the persistent profile. Chrome then marked the profile as crashed
     // and showed "Restore pages?" on the next start.
@@ -886,11 +1005,8 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
     throw error;
   }
   log.info("auth verified, starting http listener");
-
-  // A headless lane has no window to show or park, so the work posture stays off
-  // (P-035 2026-10-05). Headed lanes get `opts` unchanged.
-  // P-045 G7: a lane session never moves windows either (bcp owns them).
-  const state = createServerState(session, headless || session.lane ? { ...opts, background: false } : opts, account);
+  state.account = account;
+  state.accountProbedAt = Date.now();
 
   const server = createServer((req, res) => {
     handleRequest(req, res, state).catch((err: unknown) => {
@@ -902,9 +1018,11 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
     });
   });
   applyServerTimeouts(server);
+  closeListener = () => { if (server.listening) server.close(); };
 
   // Bind on loopback only; the token covers same-host adversaries.
   server.listen(opts.port ?? 0, "127.0.0.1", () => {
+    if (state.browserLink?.failure) return;
     const addr = server.address();
     const port = typeof addr === "object" && addr ? addr.port : 0;
     const info: DaemonInfo = {
@@ -930,14 +1048,27 @@ export async function runDaemonServer(opts: DaemonServerOptions = {}): Promise<v
     log.info(
       `received ${signal} file=${DAEMON_FILE} ppid=${process.ppid} in_flight=${inFlight} — shutting down`,
     );
+    state.browserLink?.dispose();
     server.close();
-    return closeDaemonSessionBeforeExit(session, process.exit, opts.profile);
+    return closeDaemonSessionBeforeExit(session, process.exit, opts.profile, state.browserLink?.failure ? 1 : 0);
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
 export async function handleRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  state: ServerState,
+): Promise<void> {
+  const pathname = new URL(req.url ?? "/", "http://127.0.0.1/").pathname;
+  const work = () => handleDaemonRequest(req, res, state);
+  if (state.browserLink && ["/ask", "/preflight", "/archive-saved"].includes(pathname)) {
+    await state.browserLink.request(work);
+  } else await work();
+}
+
+async function handleDaemonRequest(
   req: IncomingMessage,
   res: ServerResponse,
   state: ServerState,
@@ -949,13 +1080,19 @@ export async function handleRequest(
   // "this port belongs to a cgpro daemon" before sending the token.
   if (method === "GET" && url.pathname === "/healthz") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ daemon: "cgpro", version: 1, queueDepth: state.queue.depth }));
+    res.end(JSON.stringify({ daemon: "cgpro", version: 1, queueDepth: state.queue.depth, browserConnected: browserConnected(state) }));
     return;
   }
 
   if (!hasValidToken(req, state.token)) {
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "unauthorized" }));
+    return;
+  }
+
+  if (state.browserLink?.failure && !(method === "GET" && url.pathname === "/status")) {
+    res.writeHead(503, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "lane_browser_disconnected", message: state.browserLink.failure.message }));
     return;
   }
 
@@ -1198,6 +1335,7 @@ export async function handleRequest(
     const refreshPage = openSlotPage(slots);
     if (
       state.account &&
+      !state.browserLink?.failure &&
       typeof state.accountProbedAt === "number" &&
       busySlots === 0 &&
       !state.queue.busy &&
@@ -1229,6 +1367,7 @@ export async function handleRequest(
       startedAt: state.startedAt.toISOString(),
       uptimeSec: Math.round((Date.now() - state.startedAt.getTime()) / 1000),
       background: state.background,
+      browserConnected: browserConnected(state),
       profile: state.profile,
       busy: state.queue.busy,
       account: state.account,
@@ -1300,6 +1439,7 @@ export async function handleRequest(
     // fire-and-exit path let the caller start a replacement against the same
     // profile while Chrome was still winding down, leaving crash markers and
     // the recurring "Restore pages?" bubble.
+    state.browserLink?.dispose();
     await closeDaemonSession(state.session, state.profile);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
@@ -1464,16 +1604,17 @@ export async function handleRequest(
     const settled = work.then(() => undefined, () => undefined);
     let release = true;
     try {
-      const result = await Promise.race([
+      const result = await withBrowserConnection(state, Promise.race([
         work,
         cancellation.then(() => { throw new Error(cancelled); }),
-      ]);
+      ]));
       if (cancelled) throw new Error(cancelled);
       slot.interaction = { state: "ready", checkedAt: new Date().toISOString() };
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, ...result }));
     } catch (error) {
       freezeTiming();
+      const linkLost = state.browserLink?.loseIfClosed(error);
       // P-035 2026-09-21. This diagnostic used to be emitted on the ask path only,
       // so the one sanctioned NO-SUBMIT probe -- this preflight -- could fail at a
       // selector gate and still leave the decisive evidence to be bought with a real
@@ -1485,14 +1626,14 @@ export async function handleRequest(
         // caught by the daemon-slots quarantine test, whose budget this must not
         // eat into.
         const diagPage = pageCaptured ? await ownedPage : null;
-        if (diagPage && !diagPage.isClosed()) {
+        if (!linkLost && diagPage && !diagPage.isClosed()) {
           log.error(`selector diagnostic: ${await describeFailure(diagPage, PREFLIGHT_DIAGNOSTIC_TIMEOUT_MS)}`);
         }
       } catch {
         /* never let diagnostics mask the real failure */
       }
       if (!cancelled) failure ??= classifyInteractionFailure(error);
-      if (cancelled) {
+      if (cancelled && !linkLost) {
         slot.interaction = { state: "degraded", checkedAt: new Date().toISOString(), failureCode: cancelled };
         // A timed-out promise is still running. Never release its page to a new
         // turn until exact-page closure AND original work settlement are proven.
@@ -1604,9 +1745,11 @@ export async function handleRequest(
     }
     const slot = leaseSlot(state, "archive");
     try {
-      const filing = await archiveSavedConversation(await slotPage(state, slot), body);
+      const filing = await withBrowserConnection(state, (async () =>
+        archiveSavedConversation(await slotPage(state, slot), body))());
       res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(filing));
     } catch (error) {
+      state.browserLink?.loseIfClosed(error);
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: (error as Error).message }));
     } finally { releaseSlot(state, slot, "archive"); state.queue.release(); }
@@ -1913,8 +2056,16 @@ export async function handleAsk(
   req.on("close", onEarlyDisconnect);
   req.on("aborted", onEarlyDisconnect);
   try {
-    await state.queue.acquire(disconnectController.signal);
+    const signal = state.browserLink
+      ? AbortSignal.any([disconnectController.signal, state.browserLink.signal])
+      : disconnectController.signal;
+    await state.queue.acquire(signal);
   } catch (err) {
+    if (state.browserLink?.failure) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: state.browserLink.failure.message }));
+      return;
+    }
     if (err instanceof QueueFullError) {
       res.writeHead(429, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "queue_full", depth: err.depth }));
@@ -1990,51 +2141,64 @@ export async function handleAsk(
     });
 
     try {
-      // A slot whose tab must first be opened (slots 1..N-1) fails here on a
-      // login check, so it takes the same error event path as the turn.
-      const runner = runAskOnSession(askOpts, slotSession(state, slot, await slotPage(state, slot)));
-      slot.currentInvocation = askOpts.invocationId ?? null;
-      slot.currentRunner = runner;
-      for await (const ev of runner.events) {
-        if (ev.type === "started" && ev.conversationId) {
-          slot.currentConversation = ev.conversationId;
+      await withBrowserConnection(state, (async () => {
+        // New-page failures take the same terminal SSE error path as the turn.
+        const page = await slotPage(state, slot);
+        if (state.browserLink?.failure) throw state.browserLink.failure;
+        const runner = runAskOnSession(askOpts, slotSession(state, slot, page));
+        // A disconnect can abandon the event iterator before result rejects.
+        if (state.browserLink) {
+          void runner.result.catch((error) => { state.browserLink?.loseIfClosed(error); });
         }
-        if (!clientGone) writeEvent(ev.type, ev);
-        if (ev.type === "tool" && ev.name === "connector-selected") connectorVerified = true;
-        if (ev.type === "tool" && ev.name === "model-thinking-verified" && connectorVerified) {
-          slot.interaction = { state: "ready", checkedAt: new Date().toISOString() };
+        slot.currentInvocation = askOpts.invocationId ?? null;
+        slot.currentRunner = runner;
+        for await (const ev of runner.events) {
+          if (state.browserLink?.failure) throw state.browserLink.failure;
+          if (state.browserLink && ev.type === "error" && ev.message.includes(CLOSED_BROWSER_ERROR)) {
+            throw new Error(ev.message);
+          }
+          if (ev.type === "started" && ev.conversationId) {
+            slot.currentConversation = ev.conversationId;
+          }
+          if (!clientGone) writeEvent(ev.type, ev);
+          if (ev.type === "tool" && ev.name === "connector-selected") connectorVerified = true;
+          if (ev.type === "tool" && ev.name === "model-thinking-verified" && connectorVerified) {
+            slot.interaction = { state: "ready", checkedAt: new Date().toISOString() };
+          }
+          if (ev.type === "error" && ev.promptSubmitted === false && ev.code) {
+            slot.interaction = {
+              state: "degraded",
+              checkedAt: new Date().toISOString(),
+              failureCode: ev.code,
+            };
+          }
         }
-        if (ev.type === "error" && ev.promptSubmitted === false && ev.code) {
-          slot.interaction = {
-            state: "degraded",
-            checkedAt: new Date().toISOString(),
-            failureCode: ev.code,
-          };
+        const summary = await runner.result;
+        if (state.browserLink?.failure) throw state.browserLink.failure;
+        slot.lastConversation = summary.conversationId ?? slot.currentConversation;
+        state.lastFinishedSlot = slot.id;
+        if (!clientGone) {
+          writeEvent("summary", {
+            conversationId: summary.conversationId,
+            finalText: summary.finalText,
+            filing: summary.filing,
+          });
+          res.end();
         }
-      }
-      const summary = await runner.result;
-      slot.lastConversation = summary.conversationId ?? slot.currentConversation;
-      state.lastFinishedSlot = slot.id;
-      if (!clientGone) {
-        writeEvent("summary", {
-          conversationId: summary.conversationId,
-          finalText: summary.finalText,
-          filing: summary.filing,
-        });
-        res.end();
-      }
+      })());
     } catch (err) {
+      const linkLost = state.browserLink?.loseIfClosed(err);
       slot.lastConversation = slot.currentConversation ?? slot.lastConversation;
       state.lastFinishedSlot = slot.id;
       // Every failed turn now names its lane, slot, invocation and page, and
       // a selector failure carries what the DOM actually looked like. Without
       // this the 2026-09-16 planning-lane incident was undiagnosable after the
       // fact: the log said "selector broke" and nothing else.
-      log.error(
+      if (!linkLost) log.error(
         `ask turn failed: ${(err as Error).message} slot=${slot.id} ` +
         `invocation=${slot.currentInvocation ?? "-"} url=${slot.page?.url() ?? "-"}`,
       );
-      if (slot.page && !slot.page.isClosed()) {
+      if (!linkLost && slot.page && !slot.page.isClosed()) {
         // P-035 2026-09-21. This used to await the unbounded capture. On a page
         // whose selectors stopped resolving, one capture took 20m41s (daemon.log
         // 01:13:34 -> 01:34:15, invocation 46c030c5) and held slot 0, askInFlight
@@ -2109,6 +2273,7 @@ export async function handleAsk(
             : { message: (err as Error).message });
         res.end();
       }
+      clientGone = true;
     } finally {
       slot.reloadConversation = null;
       slot.currentConversation = null;
