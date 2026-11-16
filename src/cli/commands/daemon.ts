@@ -21,6 +21,7 @@ import {
   readDaemonInfo,
   DAEMON_LOG,
   DAEMON_LOG_DIR,
+  type DaemonInfo,
 } from "../../daemon/protocol.js";
 import { killProfileBrowsers, runDaemonServer } from "../../daemon/server.js";
 
@@ -160,6 +161,23 @@ export async function daemonStopCmd(opts: DaemonStopOptions = {}): Promise<numbe
   return 0;
 }
 
+/**
+ * The registration fields `daemon status --json` may print. daemon.json also
+ * holds the bearer token every control request carries; it never belongs in
+ * output a tool transcript can capture (P-035 2026-11-16). Allow-listed, so a
+ * field added to DaemonInfo later stays private until someone opts it in.
+ */
+function publicDaemonInfo(info: DaemonInfo): Omit<DaemonInfo, "token"> {
+  return {
+    version: info.version,
+    pid: info.pid,
+    port: info.port,
+    startedAt: info.startedAt,
+    profile: info.profile,
+    background: info.background,
+  };
+}
+
 export async function daemonStatusCmd(opts: { json?: boolean }): Promise<number> {
   const info = readDaemonInfo();
   if (!info) {
@@ -173,7 +191,7 @@ export async function daemonStatusCmd(opts: { json?: boolean }): Promise<number>
   const live = await getLiveDaemon();
   if (!live) {
     if (opts.json) {
-      process.stdout.write(JSON.stringify({ running: false, stale: info }) + "\n");
+      process.stdout.write(JSON.stringify({ running: false, stale: publicDaemonInfo(info) }) + "\n");
     } else {
       console.log(chalk.yellow(`Daemon registered (pid ${info.pid}) but not responding.`));
       console.log(chalk.dim("  Run `cgpro daemon stop` to clear, then `cgpro daemon start`."));
@@ -182,7 +200,9 @@ export async function daemonStatusCmd(opts: { json?: boolean }): Promise<number>
   }
   const status = await getDaemonStatus(live);
   if (opts.json) {
-    process.stdout.write(JSON.stringify({ running: true, info: live, status }, null, 2) + "\n");
+    process.stdout.write(
+      JSON.stringify({ running: true, info: publicDaemonInfo(live), status }, null, 2) + "\n",
+    );
     return 0;
   }
   console.log(chalk.bold("Daemon: running"));
