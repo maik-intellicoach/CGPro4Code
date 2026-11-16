@@ -1012,6 +1012,108 @@ describe("bounded preflight lease lifecycle", () => {
       expect(logMessages().join("\n")).not.toContain("private detail");
     });
 
+    // Review debt N1/N2 (promise 245c35df): the remaining custody and fence paths.
+    it.each([
+      ["isConnected throws", () => ({ isConnected: () => { throw new Error("private detail"); } })],
+      ["isConnected is not a boolean", () => ({ isConnected: () => "true" })],
+    ])("stays fenced when %s at proof time", async (_label, browserAtProof) => {
+      const { state, page, session } = fixture();
+      const work = deferred();
+      runInteractionPreflight.mockReturnValue(work.promise);
+      const gate = gateClose(page);
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      Object.assign(session.context, { browser: browserAtProof });
+      gate.resolve();
+      work.resolve();
+      await drain();
+      expectFenced(state);
+      expect(lateLines()).toEqual([expect.stringContaining(" outcome=fenced custody=browser_lost ")]);
+      expect(logMessages().join("\n")).not.toContain("private detail");
+    });
+
+    it("stays fenced when the browser link failed though the browser still reports connected", async () => {
+      const { state, page } = fixture();
+      const work = deferred();
+      runInteractionPreflight.mockReturnValue(work.promise);
+      const gate = gateClose(page);
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      state.browserLink = { failure: new Error("private detail") } as any;
+      gate.resolve();
+      work.resolve();
+      await drain();
+      expectFenced(state);
+      expect(lateLines()).toEqual([expect.stringContaining(" outcome=fenced custody=browser_lost ")]);
+      expect(logMessages().join("\n")).not.toContain("private detail");
+    });
+
+    it.each([
+      ["the slot was released", (slot: any) => { slot.busy = false; }],
+      ["the slot was leased by someone else", (slot: any) => { slot.leasedBy = "other-owner"; }],
+    ])("stays fenced when %s before the proof", async (_label, change) => {
+      const { state, page } = fixture();
+      const work = deferred();
+      runInteractionPreflight.mockReturnValue(work.promise);
+      const gate = gateClose(page);
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      change(state.slots![0]);
+      gate.resolve();
+      work.resolve();
+      await drain();
+      expect(lateReleaseLines()).toEqual([]);
+      expect(state.queue.tryAcquire()).toBe(false);
+      expect(lateLines()).toEqual([expect.stringContaining(" outcome=fenced custody=lease_changed ")]);
+    });
+
+    it("releases a nonzero slot that never had a page once its stuck newPage rejects", async () => {
+      process.env.CGPRO_DAEMON_SLOTS = "2";
+      const { state, session } = fixture();
+      const paid = pendingRunner("paid-conversation");
+      runAskOnSession.mockReturnValue(paid.runner);
+      const paidRequest = ask(state, "paid-invocation");
+      await flush();
+      expect(state.slots![1].page).toBeNull();
+      const opening = deferred<any>();
+      vi.mocked(session.context.newPage).mockReturnValue(opening.promise);
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      expect(state.slots![1].leasedBy).toBe("preflight-quarantined");
+      opening.reject(new Error("private detail"));
+      await drain();
+      expect(lateReleaseLines()).toEqual(["slot released slot=1 by=preflight-late-proof"]);
+      expect(state.slots![1].page).toBeNull();
+      expect(lateLines()).toEqual([
+        expect.stringMatching(/^preflight late proof slot=1 outcome=released custody=held closure=no_page settlement=rejected /),
+      ]);
+      expect(state.slots![0].currentInvocation).toBe("paid-invocation");
+      paid.finish();
+      await paidRequest.pending;
+    });
+
+    it("logs exactly one fenced line when the close fails after work settled", async () => {
+      const { state, page } = fixture();
+      const work = deferred();
+      runInteractionPreflight.mockReturnValue(work.promise);
+      const gate = deferred<void>();
+      page.close.mockImplementation(async () => { await gate.promise; throw new Error("private detail"); });
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      work.resolve();
+      await drain();
+      expect(lateLines()).toEqual([]);
+      gate.resolve();
+      await drain();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await drain();
+      expectFenced(state);
+      expect(lateLines()).toEqual([
+        expect.stringMatching(/^preflight late proof slot=0 outcome=fenced custody=held closure=failed settlement=fulfilled /),
+      ]);
+      expect(logMessages().join("\n")).not.toContain("private detail");
+    });
+
     it("releases but does not overwrite an interaction status replaced after quarantine", async () => {
       const { state, page } = fixture();
       const work = deferred();
