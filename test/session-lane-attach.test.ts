@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
 import type { Session } from "../src/browser/session.js";
 
 // P-045 G7 (2026-10-28). CGPro attaches over CDP to a bcp-started, headed
@@ -24,8 +25,25 @@ const { closeDaemonSession, killProfileBrowsers, SESSION_CLOSE_TIMEOUT_MS } = aw
   "../src/daemon/server.js"
 );
 
+/** A tab with Page's native lifecycle: close() emits "close" once, as patchright does. */
+function fakeTab() {
+  const events = new EventEmitter();
+  let closed = false;
+  const tab = {
+    on: vi.fn((name: string, fn: (...args: unknown[]) => void) => { events.on(name, fn); return tab; }),
+    once: vi.fn((name: string, fn: (...args: unknown[]) => void) => { events.once(name, fn); return tab; }),
+    isClosed: () => closed,
+    close: vi.fn(async () => {
+      if (closed) return;
+      closed = true;
+      events.emit("close", tab);
+    }),
+  };
+  return tab;
+}
+
 function fakeLane() {
-  const page = { on: vi.fn(), close: vi.fn(async () => undefined) };
+  const page = fakeTab();
   const context = {
     pages: () => [{ on: vi.fn(), close: vi.fn() }],
     newPage: vi.fn(async () => page),
@@ -77,7 +95,7 @@ describe("P-045 lane attach (G7)", () => {
   it("on close drops only its own and adopted tabs plus the connection, never the context", async () => {
     const { page, context, browser } = fakeLane();
     const session = await openSession({ cdpEndpoint: "http://127.0.0.1:9252" });
-    const slotTab = { close: vi.fn(async () => undefined) };
+    const slotTab = fakeTab();
     session.adopt?.(slotTab as never);
     const foreign = context.pages()[0];
 
@@ -85,6 +103,33 @@ describe("P-045 lane attach (G7)", () => {
 
     expect(page.close).toHaveBeenCalled();
     expect(slotTab.close).toHaveBeenCalled();
+    expect(foreign.close).not.toHaveBeenCalled();
+    expect(browser.close).toHaveBeenCalled();
+    expect(context.close).not.toHaveBeenCalled();
+  });
+
+  it("forgets an owned tab once it closes natively, so recycled tabs do not accumulate", async () => {
+    const { page, context, browser } = fakeLane();
+    const session = await openSession({ cdpEndpoint: "http://127.0.0.1:9252" });
+    const recycled = fakeTab();
+    const live = fakeTab();
+    session.adopt?.(recycled as never);
+    session.adopt?.(live as never);
+    expect(recycled.once).toHaveBeenCalledWith("close", expect.any(Function));
+    // The daemon recycles a finished tab (and slot 0's first page) on its own.
+    await recycled.close();
+    await page.close();
+    recycled.close.mockClear();
+    page.close.mockClear();
+    const foreign = context.pages()[0];
+
+    await session.close();
+
+    // Closed tabs left the owned set: session close no longer touches them.
+    expect(recycled.close).not.toHaveBeenCalled();
+    expect(page.close).not.toHaveBeenCalled();
+    // A still-open owned tab is closed exactly as before; foreign tabs never.
+    expect(live.close).toHaveBeenCalledOnce();
     expect(foreign.close).not.toHaveBeenCalled();
     expect(browser.close).toHaveBeenCalled();
     expect(context.close).not.toHaveBeenCalled();

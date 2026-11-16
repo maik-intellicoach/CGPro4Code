@@ -80,11 +80,17 @@ async function attachLaneSession(endpoint: string): Promise<Session> {
     throw new Error(`lane browser at ${endpoint} has no default context`);
   }
   const owned = new Set<Page>();
+  // P-035 2026-11-16. A tab leaves the set on its own native close, so a
+  // long-lived lane that recycles finished tabs does not retain every one.
+  const own = (tab: Page): void => {
+    owned.add(tab);
+    tab.once("close", () => owned.delete(tab));
+  };
   try {
     await ensureInterceptorInstalled(context);
     // Our own tab only: the lane's other tabs (and Maik's sign-in tab) stay untouched.
     const page = await context.newPage();
-    owned.add(page);
+    own(page);
     installFileChooserGuard(context, page);
     if (process.env.CGPRO_DIAG === "1") installDiagnostics(context, page);
     // No parkWindow / showWindow here, ever: bcp owns the lane's windows.
@@ -93,16 +99,17 @@ async function attachLaneSession(endpoint: string): Promise<Session> {
       page,
       lane: endpoint,
       adopt(extra: Page) {
-        owned.add(extra);
+        own(extra);
       },
       async close() {
-        for (const tab of owned) await tab.close().catch(() => undefined);
+        // A snapshot: tabs closing below delete themselves from `owned`.
+        for (const tab of [...owned]) await tab.close().catch(() => undefined);
         // connectOverCDP: close() drops the websocket only; the lane browser keeps running.
         await browser.close();
       },
     };
   } catch (error) {
-    for (const tab of owned) await tab.close().catch(() => undefined);
+    for (const tab of [...owned]) await tab.close().catch(() => undefined);
     await browser.close().catch(() => undefined);
     throw error;
   }

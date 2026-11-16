@@ -87,6 +87,8 @@ const PROBE_PROMPT_MAX_CHARS = 200_000;
 const PREFLIGHT_TIMEOUT_MS = 140_000;
 const PROBE_PREFLIGHT_TIMEOUT_MS = 290_000;
 const PREFLIGHT_CLOSE_TIMEOUT_MS = 10_000;
+// P-035 2026-11-16. The lease a recycled tab's still-pending close holds.
+const RECYCLE_CLOSING = "archive-recycle-closing";
 // The preflight diagnostic budget stays where it was (3s): the daemon-slots
 // quarantine test's timing depends on it, and its whole point is a prompt 409.
 const PREFLIGHT_DIAGNOSTIC_TIMEOUT_MS = 3_000;
@@ -557,9 +559,14 @@ function applyWorkPosture(state: ServerState, slot: SlotState, show: boolean): v
     .catch(() => undefined);
 }
 
-/** Leases the lowest free slot. Callers hold queue capacity first, so one is always free. */
-function leaseSlot(state: ServerState, reason: string): SlotState {
-  const slot = slotsOf(state).find((s) => !s.busy);
+/**
+ * Leases the lowest free slot, or the lowest free one `prefer` admits. Callers
+ * hold queue capacity first, so one is always free. A preference only chooses
+ * among FREE slots; it never waits for, or takes, a busy one.
+ */
+function leaseSlot(state: ServerState, reason: string, prefer?: (slot: SlotState) => boolean): SlotState {
+  const free = slotsOf(state).filter((s) => !s.busy);
+  const slot = (prefer && free.find(prefer)) || free[0];
   if (!slot) throw new Error("no free slot despite free capacity");
   slot.busy = true;
   slot.leasedBy = reason;
@@ -579,8 +586,9 @@ function releaseSlot(state: ServerState, slot: SlotState, reason: string): void 
   // Park only when nothing is working: a sibling slot may share this window,
   // and parking it under a busy slot starved that slot's page (P-035 2026-09-23).
   // A quarantined preflight slot stays busy for the process's life and must not
-  // hold every other window up forever (P-035 2026-09-23 review).
-  if (!slotsOf(state).some((s) => s.busy && s.leasedBy !== "preflight-quarantined")) {
+  // hold every other window up forever (P-035 2026-09-23 review). Nor may a
+  // recycled tab whose close outlived its bound (P-035 2026-11-16).
+  if (!slotsOf(state).some((s) => s.busy && s.leasedBy !== "preflight-quarantined" && s.leasedBy !== RECYCLE_CLOSING)) {
     for (const idle of slotsOf(state)) applyWorkPosture(state, idle, false);
   }
   log.info(`slot released slot=${slot.id} by=${reason}`);
@@ -621,6 +629,148 @@ async function slotPage(
   });
   slot.page = page;
   return page;
+}
+
+/** True only when `page` is open and its URL names exactly `conversationId`; any read failure is false. */
+function pageShowsConversation(page: Page | null, conversationId: string): boolean {
+  try {
+    return page != null && !page.isClosed() && currentConversationId(page) === conversationId;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * P-035 2026-11-16. Recycle the tab of a conversation whose output is durably
+ * saved and whose archival /archive-saved just verified, so a long-lived lane
+ * stops retaining heavy finished conversation pages. Only the browser TAB is
+ * closed: the browser and its context stay warm (P-045 decision090), the
+ * conversation is never deleted or unarchived, and the next lease of this slot
+ * transparently reopens a page through `slotPage` (slot 0 rebinding
+ * `session.page` through its setter).
+ *
+ * Deliberately narrow. Runs while the archive lease is still held and closes
+ * only when every check holds, re-checked after each awaited inspection:
+ *   - the slot still holds this archive lease and this exact page, which the
+ *     daemon itself opened (slot 0's session page or a `slotPage` tab);
+ *   - the page URL still names exactly the archived conversation, so a page
+ *     merely borrowed as an API transport for another conversation stays;
+ *   - no ask on this slot, no other busy slot (quarantine included) and no
+ *     queued work;
+ *   - no generation is observed and the content-free composer guard PROVES the
+ *     composer empty; a draft, an unknown shape or any read failure keeps it.
+ * Slot 0 of a private (non-lane) profile is never closed: it is that persistent
+ * context's primary page, and `browserConnected` reads it when the context has
+ * no Browser handle. Unsaved, failed or ambiguous outputs never reach here and
+ * keep their pages.
+ *
+ * Never throws and is bounded by PREFLIGHT_CLOSE_TIMEOUT_MS: the archive answer
+ * was already sent, so a cleanup failure is logged content-free and changes
+ * nothing about it.
+ *
+ * Custody. Returns true when the caller must release the archive lease and its
+ * queue capacity as usual. An inspection that outlives the bound is abandoned
+ * and can no longer start a close. A close that already STARTED cannot be
+ * abandoned: a late close would interrupt whatever ask reused the page. That
+ * slot is then held as RECYCLE_CLOSING -- busy, its queue capacity still held,
+ * so no ask can lease it or overcount capacity -- and this function returns
+ * false; the lease and capacity are released exactly once, only when the close
+ * itself settles (resolved, rejected, or the browser gone). A close that never
+ * settles keeps the slot quarantined, like an unproven preflight close.
+ */
+async function recycleArchivedPage(
+  state: ServerState,
+  slot: SlotState,
+  page: Page,
+  conversationId: string,
+): Promise<boolean> {
+  let abandoned = false;
+  // Asserted, not inferred: `work` assigns it, which control flow cannot see.
+  let closing = null as Promise<void> | null;
+  const blocker = (): string | null => {
+    if (abandoned) return "timeout";
+    if (state.browserLink?.failure) return "browser_link";
+    if (!slot.busy || slot.leasedBy !== "archive") return "lease";
+    if (slot.page !== page || page.isClosed()) return "page_changed";
+    if (slot.id === 0 && !state.session.lane) return "primary_page";
+    if (slot.askInFlight || slot.currentInvocation !== null) return "ask";
+    if (slotsOf(state).some((s) => s !== slot && s.busy)) return "sibling_busy";
+    if (state.queue.depth > 0) return "queued";
+    if (!pageShowsConversation(page, conversationId)) return "not_target";
+    return null;
+  };
+  const work = async (): Promise<string> => {
+    let reason = blocker();
+    if (reason) return reason;
+    let working: boolean;
+    try {
+      working = await turnIsWorking(page);
+    } catch {
+      return "working_unknown";
+    }
+    if (working) return "generating";
+    if ((reason = blocker())) return reason;
+    try {
+      // No owned proof: admits only a composer proven empty. Its refusal line
+      // is already content-free; an evaluation failure is a refusal too.
+      await assertPreflightDraftSafe(page);
+    } catch {
+      return "composer_unproven";
+    }
+    if ((reason = blocker())) return reason;
+    try {
+      // Published synchronously with the call, so the timeout path below sees
+      // a started close in the same tick it would otherwise abandon.
+      closing = page.close({ runBeforeUnload: false });
+      await closing;
+    } catch {
+      return "close_failed";
+    }
+    if (!page.isClosed()) return "close_unverified";
+    forgetClosedPage(slot, page);
+    return "recycled";
+  };
+  const outcome = await withTimeout(work().catch(() => "inspect_failed"), PREFLIGHT_CLOSE_TIMEOUT_MS, "timeout");
+  if (outcome === "timeout") {
+    // Same tick as the check: from here no inspection can start a close.
+    abandoned = true;
+    if (closing) {
+      holdUntilCloseSettles(state, slot, page, closing);
+      return false;
+    }
+  }
+  if (outcome === "recycled") log.info(`archived page recycled slot=${slot.id}`);
+  else if (["close_failed", "close_unverified", "inspect_failed", "timeout"].includes(outcome)) {
+    log.error(`archived page recycle failed slot=${slot.id} reason=${outcome}`);
+  } else log.info(`archived page kept slot=${slot.id} reason=${outcome}`);
+  return true;
+}
+
+/** Slots 1..N-1 drop a closed page; slot 0's setter ignores null and `slotPage` recognises its closed page instead. */
+function forgetClosedPage(slot: SlotState, page: Page): void {
+  if (page.isClosed() && slot.id !== 0 && slot.page === page) slot.page = null;
+}
+
+/**
+ * Keeps the archive lease and its queue capacity on a slot whose recycle close
+ * started but outlived its bound, and hands both back exactly once when that
+ * close settles. Until then the slot is busy, so no ask leases it and the dying
+ * page can never be handed out or interrupted by the late close. Content-free.
+ */
+function holdUntilCloseSettles(state: ServerState, slot: SlotState, page: Page, closing: Promise<void>): void {
+  slot.leasedBy = RECYCLE_CLOSING;
+  log.error(`archived page recycle failed slot=${slot.id} reason=close_pending`);
+  void closing
+    .then(() => "settled", () => "rejected")
+    .then((how) => {
+      // Defensive: only the custody this function took is ever released.
+      if (!slot.busy || slot.leasedBy !== RECYCLE_CLOSING) return;
+      forgetClosedPage(slot, page);
+      log.info(`archived page late close ${how} slot=${slot.id} closed=${page.isClosed()}`);
+      releaseSlot(state, slot, "archive-recycle-settled");
+      state.queue.release();
+    })
+    .catch(() => undefined);
 }
 
 /** What a runner sees as its session: the daemon session for slot 0, a page-bound view otherwise. */
@@ -1743,16 +1893,32 @@ async function handleDaemonRequest(
     if (!state.queue.tryAcquire()) {
       res.writeHead(409); res.end(JSON.stringify({ error: "lane_busy" })); return;
     }
-    const slot = leaseSlot(state, "archive");
+    const target = body.conversationId;
+    // P-035 2026-11-16. Prefer the free slot whose page already shows this
+    // conversation, so a verified archive can recycle exactly that tab.
+    const slot = leaseSlot(state, "archive", (s) => pageShowsConversation(s.page, target));
+    // False only when a started recycle close outlived its bound: the lease and
+    // capacity then stay held until that close settles (holdUntilCloseSettles).
+    let release = true;
     try {
-      const filing = await withBrowserConnection(state, (async () =>
-        archiveSavedConversation(await slotPage(state, slot), body))());
-      res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(filing));
-    } catch (error) {
-      state.browserLink?.loseIfClosed(error);
-      res.writeHead(409, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: (error as Error).message }));
-    } finally { releaseSlot(state, slot, "archive"); state.queue.release(); }
+      let recyclable: Page | null = null;
+      try {
+        const { page, filing } = await withBrowserConnection(state, (async () => {
+          const page = await slotPage(state, slot);
+          return { page, filing: await archiveSavedConversation(page, body) };
+        })());
+        res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(filing));
+        if (filing.status === "verified" && filing.archived === true && filing.conversationId === target) recyclable = page;
+      } catch (error) {
+        state.browserLink?.loseIfClosed(error);
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: (error as Error).message }));
+      }
+      // After the answer is sent and before the lease is released; never throws.
+      if (recyclable) release = await recycleArchivedPage(state, slot, recyclable, target);
+    } finally {
+      if (release) { releaseSlot(state, slot, "archive"); state.queue.release(); }
+    }
     return;
   }
 
