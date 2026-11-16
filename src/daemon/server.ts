@@ -89,6 +89,20 @@ const PROBE_PREFLIGHT_TIMEOUT_MS = 290_000;
 const PREFLIGHT_CLOSE_TIMEOUT_MS = 10_000;
 // P-035 2026-11-16. The lease a recycled tab's still-pending close holds.
 const RECYCLE_CLOSING = "archive-recycle-closing";
+// The lease a cancelled preflight holds until its cleanup is proven (P-035 2026-09-21).
+const PREFLIGHT_QUARANTINED = "preflight-quarantined";
+// P-035 2026-11-16. Closed, content-free vocabulary of the preflight
+// quarantine and late-proof log lines. Nothing else is ever logged there.
+type PreflightCancelCause = "timeout" | "disconnected";
+type PreflightClosure = "awaiting_page" | "closing" | "verified" | "unverified" | "failed" | "no_page";
+type PreflightSettlement = "pending" | "fulfilled" | "rejected";
+type PreflightCustody = "held" | "lease_changed" | "page_changed" | "browser_lost" | "already_released";
+type PreflightLateOutcome = "released" | "fenced";
+function preflightCancelCause(
+  code: "interaction_preflight_timeout" | "interaction_preflight_disconnected",
+): PreflightCancelCause {
+  return code === "interaction_preflight_timeout" ? "timeout" : "disconnected";
+}
 // The preflight diagnostic budget stays where it was (3s): the daemon-slots
 // quarantine test's timing depends on it, and its whole point is a prompt 409.
 const PREFLIGHT_DIAGNOSTIC_TIMEOUT_MS = 3_000;
@@ -588,7 +602,7 @@ function releaseSlot(state: ServerState, slot: SlotState, reason: string): void 
   // A quarantined preflight slot stays busy for the process's life and must not
   // hold every other window up forever (P-035 2026-09-23 review). Nor may a
   // recycled tab whose close outlived its bound (P-035 2026-11-16).
-  if (!slotsOf(state).some((s) => s.busy && s.leasedBy !== "preflight-quarantined" && s.leasedBy !== RECYCLE_CLOSING)) {
+  if (!slotsOf(state).some((s) => s.busy && s.leasedBy !== PREFLIGHT_QUARANTINED && s.leasedBy !== RECYCLE_CLOSING)) {
     for (const idle of slotsOf(state)) applyWorkPosture(state, idle, false);
   }
   log.info(`slot released slot=${slot.id} by=${reason}`);
@@ -1685,6 +1699,9 @@ async function handleDaemonRequest(
       return;
     }
     const slot = leaseSlot(state, "preflight");
+    // The page this lease found, for the late proof's identity check when no
+    // page was ever captured (page creation failed).
+    const pageAtLease = slot.page;
     let phase: InteractionPreflightPhase | "slot-page" = "slot-page";
     let failedPhase: InteractionPreflightPhase | undefined;
     let failure: InteractionFailure | undefined;
@@ -1751,8 +1768,16 @@ async function handleDaemonRequest(
         capture(null); // Only used if page creation failed before capturing a page.
       }
     })();
-    const settled = work.then(() => undefined, () => undefined);
+    // Cleanup progress, read only by the content-free quarantine diagnostics.
+    let closure: PreflightClosure = "awaiting_page";
+    let settlement: PreflightSettlement = "pending";
+    // The exact page cancellation closed; undefined until ownedPage resolves.
+    let closedPage: Page | null | undefined;
+    const settled = work.then(() => { settlement = "fulfilled"; }, () => { settlement = "rejected"; });
     let release = true;
+    // Set only when release is suppressed; the finally below arms it after the
+    // 409 has been written (or skipped on disconnect).
+    let armLateRelease: (() => void) | undefined;
     try {
       const result = await withBrowserConnection(state, Promise.race([
         work,
@@ -1783,6 +1808,7 @@ async function handleDaemonRequest(
         /* never let diagnostics mask the real failure */
       }
       if (!cancelled) failure ??= classifyInteractionFailure(error);
+      let quarantined: { proof: Promise<boolean>; cause: NonNullable<typeof cancelled> } | undefined;
       if (cancelled && !linkLost) {
         slot.interaction = { state: "degraded", checkedAt: new Date().toISOString(), failureCode: cancelled };
         // A timed-out promise is still running. Never release its page to a new
@@ -1791,9 +1817,22 @@ async function handleDaemonRequest(
         let closeTimer: ReturnType<typeof setTimeout> | undefined;
         const quiesced = (async () => {
           const page = await ownedPage;
+          closedPage = page;
           if (page) {
-            await page.close({ runBeforeUnload: false });
-            if (!page.isClosed()) throw new Error("preflight page closure unverified");
+            closure = "closing";
+            try {
+              await page.close({ runBeforeUnload: false });
+            } catch (closeError) {
+              closure = "failed";
+              throw closeError;
+            }
+            if (!page.isClosed()) {
+              closure = "unverified";
+              throw new Error("preflight page closure unverified");
+            }
+            closure = "verified";
+          } else {
+            closure = "no_page";
           }
           await settled;
           return true;
@@ -1810,7 +1849,15 @@ async function handleDaemonRequest(
         }
         // ponytail: an unproven close stays quarantined; governed recovery owns
         // escalation instead of risking other paid turns in this browser.
-        if (!release) slot.leasedBy = "preflight-quarantined";
+        // P-035 2026-11-16. The same proof may still arrive after the bound;
+        // the finally below hands it to the late-proof observer.
+        if (!release) {
+          slot.leasedBy = PREFLIGHT_QUARANTINED;
+          quarantined = { proof: quiesced, cause: cancelled };
+          log.error(`preflight quarantined slot=${slot.id} cause=${preflightCancelCause(cancelled)} phase=${phase}`
+            + ` closure=${closure} settlement=${settlement} elapsed_ms=${Math.round(stoppedAt! - startedAt)}`
+            + ` phase_elapsed_ms=${Math.round(stoppedAt! - phaseStartedAt)}`);
+        }
       }
       // P-035 2026-09-28 r35. A primary failure already reported through
       // `onPhase` before the deadline/disconnect cancel outranks the cancel
@@ -1826,11 +1873,62 @@ async function handleDaemonRequest(
       const failureCode = !release ? "interaction_preflight_recovery_required"
         : primaryProLimit ? "pro_usage_limit_reached"
           : cancelled ?? failure?.code;
-      slot.interaction = {
+      const failureStatus: InteractionStatus = {
         state: "degraded",
         checkedAt: new Date().toISOString(),
         ...(failureCode ? { failureCode } : {}),
       };
+      slot.interaction = failureStatus;
+      if (quarantined) {
+        const { proof, cause } = quarantined;
+        // Exactly what a release proven within the bound reports; never ready.
+        const lateCode = primaryProLimit ? "pro_usage_limit_reached" : cause;
+        const cancelledAt = stoppedAt!;
+        // Connectivity must be affirmed, never assumed: no Browser handle, a
+        // throwing read or anything but isConnected() === true is browser_lost.
+        const browserAffirmed = (): boolean => {
+          if (state.browserLink?.failure) return false;
+          try {
+            return state.session.context?.browser?.()?.isConnected() === true;
+          } catch {
+            return false;
+          }
+        };
+        armLateRelease = () => {
+          let handedOff = false;
+          const observe = (proven: boolean): void => {
+            // Every custody fact must still be this request's own. A page that
+            // merely became null is not proof of identity; neither is a slot
+            // that changed hands. browserConnected() is not used: it reads
+            // slot 0's page, which this very cleanup closed.
+            const custody: PreflightCustody = handedOff ? "already_released"
+              : !browserAffirmed() ? "browser_lost"
+                : !slot.busy || slot.leasedBy !== PREFLIGHT_QUARANTINED ? "lease_changed"
+                  // The exact captured page, or the lease-time page when none was captured.
+                  : slot.page !== (closedPage ?? pageAtLease) || (proven && closedPage && !closedPage.isClosed())
+                    ? "page_changed"
+                    : "held";
+            const outcome: PreflightLateOutcome = proven && custody === "held" ? "released" : "fenced";
+            let reported: string = "unchanged";
+            if (outcome === "released") {
+              handedOff = true;
+              if (slot.interaction === failureStatus) {
+                slot.interaction = { state: "degraded", checkedAt: new Date().toISOString(), failureCode: lateCode };
+                reported = lateCode;
+              }
+              // Same order and single owner as the in-bound release below.
+              releaseSlot(state, slot, "preflight-late-proof");
+              state.queue.release();
+            }
+            const line = `preflight late proof slot=${slot.id} outcome=${outcome} custody=${custody}`
+              + ` closure=${closure} settlement=${settlement} cause=${preflightCancelCause(cause)}`
+              + ` status=${reported} since_cancel_ms=${Math.round(performance.now() - cancelledAt)}`;
+            if (outcome === "released") log.info(line);
+            else log.error(line);
+          };
+          void proof.then(() => observe(true), () => observe(false)).catch(() => undefined);
+        };
+      }
       if (!res.destroyed && cancelled !== "interaction_preflight_disconnected") {
         res.writeHead(409, { "Content-Type": "application/json" });
         // P-035 2026-09-21. The message travels with the code. Without it the
@@ -1865,6 +1963,8 @@ async function handleDaemonRequest(
       if (release) {
         releaseSlot(state, slot, "preflight");
         state.queue.release();
+      } else {
+        armLateRelease?.();
       }
     }
     return;

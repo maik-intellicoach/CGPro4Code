@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 // Same stubbing as test/daemon-http.test.ts: the runner drives real
@@ -352,10 +353,26 @@ describe("bounded preflight lease lifecycle", () => {
       isClosed: () => closed,
       close: vi.fn(async () => { closed = true; }),
     });
+    // P-035 2026-11-16. A late release needs affirmed connectivity, so the
+    // fixture's browser reports connected unless a test says otherwise.
+    Object.assign(session.context, { browser: () => ({ isConnected: () => true }) });
     const state = createServerState(session, { background: true });
     return { state, page, session };
   }
-  beforeEach(() => vi.useFakeTimers());
+  // Daemon log lines written during this test, without their timestamp/pid/level
+  // prefix. test/setup.ts redirects the log to a per-run temp file.
+  let logStart = 0;
+  const readLog = (): string => readFileSync(process.env.CGPRO_DAEMON_LOG!, "utf8");
+  const logMessages = (): string[] => readLog().slice(logStart).split("\n").filter(Boolean)
+    .map((line) => line.replace(/^\S+ \[pid=\d+\] \[[a-z]+\] /, ""));
+  const lateLines = (): string[] => logMessages().filter((m) => m.startsWith("preflight late proof "));
+  const quarantineLines = (): string[] => logMessages().filter((m) => m.startsWith("preflight quarantined "));
+  const lateReleaseLines = (): string[] => logMessages().filter((m) => m.includes("by=preflight-late-proof"));
+  const drain = async (): Promise<void> => { for (let i = 0; i < 200; i++) await Promise.resolve(); };
+  beforeEach(() => {
+    vi.useFakeTimers();
+    logStart = readLog().length;
+  });
   afterEach(() => vi.useRealTimers());
 
   it("normal success releases once without closing its page", async () => {
@@ -422,6 +439,14 @@ describe("bounded preflight lease lifecycle", () => {
     await flush();
     expect(state.queue.tryAcquire()).toBe(false);
     expect(state.interaction.state).toBe("degraded");
+    // P-035 2026-11-16. Settled work without a proven close is no late proof.
+    await vi.advanceTimersByTimeAsync(60_000);
+    await drain();
+    expect(state.slots![0].leasedBy).toBe("preflight-quarantined");
+    expect(state.queue.tryAcquire()).toBe(false);
+    expect(state.interaction.failureCode).toBe("interaction_preflight_recovery_required");
+    expect(lateReleaseLines()).toEqual([]);
+    expect(lateLines().every((line) => line.includes(" outcome=fenced "))).toBe(true);
   });
 
   it("keeps the fence when the page closes but original work never settles", async () => {
@@ -501,7 +526,7 @@ describe("bounded preflight lease lifecycle", () => {
     expect(state.queue.busy).toBe(false);
   });
 
-  it("quarantines a stuck newPage and closes it if it arrives after the cleanup budget", async () => {
+  it("quarantines a stuck newPage that never arrives", async () => {
     const { state, page, session } = fixture();
     await page.close();
     const opening = deferred<any>();
@@ -511,16 +536,42 @@ describe("bounded preflight lease lifecycle", () => {
     await vi.advanceTimersByTimeAsync(150_000);
     await request.pending;
     expect(state.slots![0].leasedBy).toBe("preflight-quarantined");
+    await vi.advanceTimersByTimeAsync(60_000);
+    await drain();
+    expect(state.slots![0].leasedBy).toBe("preflight-quarantined");
+    expect(state.queue.busy).toBe(true);
+    expect(state.interaction.failureCode).toBe("interaction_preflight_recovery_required");
+    expect(quarantineLines()).toEqual([expect.stringContaining(" closure=awaiting_page settlement=pending ")]);
+    expect(lateLines()).toEqual([]);
+  });
+
+  it("late proof: a very-late newPage is closed, its work settles, and the slot is released once", async () => {
+    const { state, page, session } = fixture();
+    await page.close();
+    const opening = deferred<any>();
+    vi.mocked(session.context.newPage).mockReturnValue(opening.promise);
+    const request = call(state, "POST", "/preflight", body);
+    await flush();
+    await vi.advanceTimersByTimeAsync(150_000);
+    await request.pending;
+    expect(state.slots![0].leasedBy).toBe("preflight-quarantined");
+    expect(state.queue.busy).toBe(true);
     let closed = false;
     const created = Object.assign(fakePage("very-late"), {
       close: vi.fn(async () => { closed = true; }), isClosed: () => closed,
     });
     opening.resolve(created);
-    await flush();
+    await drain();
     expect(created.close).toHaveBeenCalledOnce();
     expect(runInteractionPreflight).not.toHaveBeenCalled();
-    expect(state.queue.busy).toBe(true);
-    expect(state.interaction.failureCode).toBe("interaction_preflight_recovery_required");
+    expect(state.queue.busy).toBe(false);
+    expect(state.slots![0].busy).toBe(false);
+    expect(state.slots![0].leasedBy).toBeNull();
+    expect(state.interaction).toMatchObject({ state: "degraded", failureCode: "interaction_preflight_timeout" });
+    expect(lateReleaseLines()).toEqual(["slot released slot=0 by=preflight-late-proof"]);
+    expect(lateLines()).toEqual([
+      expect.stringMatching(/^preflight late proof slot=0 outcome=released custody=held closure=verified settlement=rejected cause=timeout status=interaction_preflight_timeout since_cancel_ms=\d+$/),
+    ]);
   });
 
 
@@ -732,4 +783,355 @@ describe("bounded preflight lease lifecycle", () => {
     expect(result.limitText).toBeUndefined();
   });
 
+  // P-035 2026-11-16. A quarantined slot is released exactly once when the
+  // same dual proof the bound waited for arrives late -- exact page closed and
+  // verified (or no page proven), AND the original work settled -- while this
+  // preflight still holds the lease and the exact page. Everything unproven or
+  // changed stays fenced, as before.
+  describe("late proof", () => {
+    /** Holds the fixture page's close until the test opens the gate. */
+    function gateClose(page: ReturnType<typeof fixture>["page"]): { resolve: () => void } {
+      const gate = deferred<void>();
+      const originalClose = page.close.getMockImplementation()!;
+      page.close.mockImplementation(async () => { await gate.promise; await originalClose(); });
+      return { resolve: () => gate.resolve() };
+    }
+    /** Runs past the 140s deadline and the 10s cleanup bound; the 409 has been written. */
+    async function quarantine(request: { pending: Promise<void> }): Promise<void> {
+      await flush();
+      await vi.advanceTimersByTimeAsync(160_000);
+      await request.pending;
+    }
+    function expectFenced(state: ServerState): void {
+      expect(state.slots![0].busy).toBe(true);
+      expect(state.slots![0].leasedBy).toBe("preflight-quarantined");
+      expect(state.queue.tryAcquire()).toBe(false);
+      expect(lateReleaseLines()).toEqual([]);
+    }
+    function expectReleasedOnce(state: ServerState): void {
+      expect(state.slots![0].busy).toBe(false);
+      expect(state.slots![0].leasedBy).toBeNull();
+      expect(state.queue.busy).toBe(false);
+      expect(lateReleaseLines()).toEqual(["slot released slot=0 by=preflight-late-proof"]);
+      expect(lateLines().filter((line) => line.includes(" outcome=released "))).toHaveLength(1);
+    }
+
+    it("releases once when the close is verified after the bound and work settles later", async () => {
+      const { state, page } = fixture();
+      const work = deferred();
+      runInteractionPreflight.mockReturnValue(work.promise);
+      const gate = gateClose(page);
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      expect(request.res.statusCode).toBe(409);
+      expect(JSON.parse(request.res.writes.join(""))).toMatchObject({ code: "interaction_preflight_recovery_required" });
+      expect(state.interaction.failureCode).toBe("interaction_preflight_recovery_required");
+      expectFenced(state);
+      const wire = request.res.writes.slice();
+      gate.resolve();
+      await drain();
+      expect(page.isClosed()).toBe(true);
+      expectFenced(state); // a closed page alone is insufficient
+      work.resolve();
+      await drain();
+      expectReleasedOnce(state);
+      expect(state.interaction).toMatchObject({ state: "degraded", failureCode: "interaction_preflight_timeout" });
+      expect(lateLines()).toEqual([
+        expect.stringMatching(/^preflight late proof slot=0 outcome=released custody=held closure=verified settlement=fulfilled cause=timeout status=interaction_preflight_timeout since_cancel_ms=\d+$/),
+      ]);
+      expect(page.close).toHaveBeenCalledOnce();
+      expect(request.res.writes).toEqual(wire);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("releases once when a close that hung past the bound resolves after work already settled", async () => {
+      const { state, page } = fixture();
+      const work = deferred();
+      runInteractionPreflight.mockReturnValue(work.promise);
+      const gate = gateClose(page);
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      work.resolve();
+      await drain();
+      expectFenced(state); // settled work alone is insufficient
+      gate.resolve();
+      await drain();
+      expectReleasedOnce(state);
+      expect(lateLines()).toEqual([expect.stringContaining(" closure=verified settlement=fulfilled ")]);
+    });
+
+    it("releases once when the close was verified in-bound and work settles after the bound", async () => {
+      const { state, page } = fixture();
+      const work = deferred();
+      runInteractionPreflight.mockReturnValue(work.promise);
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      expect(page.isClosed()).toBe(true);
+      expect(quarantineLines()).toEqual([expect.stringContaining(" closure=verified settlement=pending ")]);
+      expectFenced(state);
+      work.reject(new Error("private detail"));
+      await drain();
+      expectReleasedOnce(state);
+      expect(lateLines()).toEqual([expect.stringContaining(" closure=verified settlement=rejected ")]);
+      expect(logMessages().join("\n")).not.toContain("private detail");
+    });
+
+    it("releases with no_page when a stuck newPage rejects after the bound", async () => {
+      const { state, page, session } = fixture();
+      await page.close();
+      const opening = deferred<any>();
+      vi.mocked(session.context.newPage).mockReturnValue(opening.promise);
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      expectFenced(state);
+      opening.reject(new Error("private detail"));
+      await drain();
+      expectReleasedOnce(state);
+      expect(state.slots![0].page).toBe(page);
+      expect(runInteractionPreflight).not.toHaveBeenCalled();
+      expect(lateLines()).toEqual([
+        expect.stringMatching(/^preflight late proof slot=0 outcome=released custody=held closure=no_page settlement=rejected cause=timeout /),
+      ]);
+    });
+
+    it("releases exactly one slot and one unit of capacity beside a sibling paid ask", async () => {
+      process.env.CGPRO_DAEMON_SLOTS = "2";
+      const { state, session } = fixture();
+      const paid = pendingRunner("paid-conversation");
+      runAskOnSession.mockReturnValue(paid.runner);
+      const paidRequest = ask(state, "paid-invocation");
+      await flush();
+      const work = deferred();
+      const gate = deferred();
+      let probeClosed = false;
+      const probe = Object.assign(fakePage("probe"), {
+        isClosed: () => probeClosed,
+        close: vi.fn(async () => { await gate.promise; probeClosed = true; }),
+      });
+      vi.mocked(session.context.newPage).mockResolvedValue(probe as any);
+      runInteractionPreflight.mockReturnValue(work.promise);
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      expect(state.slots![1].leasedBy).toBe("preflight-quarantined");
+      expect(state.queue.tryAcquire()).toBe(false);
+      gate.resolve();
+      work.resolve();
+      await drain();
+      expect(lateReleaseLines()).toEqual(["slot released slot=1 by=preflight-late-proof"]);
+      expect(state.slots![1].busy).toBe(false);
+      expect(state.slots![1].leasedBy).toBeNull();
+      // Exactly one unit came back: one more admission, then full again.
+      expect(state.queue.tryAcquire()).toBe(true);
+      expect(state.queue.tryAcquire()).toBe(false);
+      state.queue.release();
+      expect(probe.close).toHaveBeenCalledOnce();
+      expect(paid.runner.cancel).not.toHaveBeenCalled();
+      expect(state.slots![0].currentInvocation).toBe("paid-invocation");
+      expect(state.slots![0].busy).toBe(true);
+      expect(state.slots![0].leasedBy).not.toBe("preflight-quarantined");
+      paid.finish();
+      await paidRequest.pending;
+    });
+
+    it("ends with exactly one release when the bound and the proof land on the same tick", async () => {
+      const { state, page } = fixture();
+      const work = deferred();
+      runInteractionPreflight.mockReturnValue(work.promise);
+      const originalClose = page.close.getMockImplementation()!;
+      page.close.mockImplementation(async () => {
+        // Registered just after the 10s cleanup timer with the same delay, so
+        // the bound wins the race and the proof arrives in the same tick.
+        await new Promise((resolve) => setTimeout(resolve, 10_000));
+        await originalClose();
+        work.resolve();
+      });
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      await drain();
+      expect(JSON.parse(request.res.writes.join(""))).toMatchObject({ code: "interaction_preflight_recovery_required" });
+      expect(quarantineLines()).toHaveLength(1);
+      expect(logMessages().filter((m) => m === "slot released slot=0 by=preflight")).toEqual([]);
+      expectReleasedOnce(state);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("stays fenced when the slot's page changed before the proof", async () => {
+      const { state, page } = fixture();
+      const work = deferred();
+      runInteractionPreflight.mockReturnValue(work.promise);
+      const gate = gateClose(page);
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      state.slots![0].page = fakePage("other") as any;
+      gate.resolve();
+      work.resolve();
+      await drain();
+      expectFenced(state);
+      expect(state.interaction.failureCode).toBe("interaction_preflight_recovery_required");
+      expect(lateLines()).toEqual([expect.stringContaining(" outcome=fenced custody=page_changed ")]);
+    });
+
+    it("stays fenced when the browser disconnected before the proof", async () => {
+      const { state, page, session } = fixture();
+      let connected = true;
+      Object.assign(session.context, { browser: () => ({ isConnected: () => connected }) });
+      const work = deferred();
+      runInteractionPreflight.mockReturnValue(work.promise);
+      const gate = gateClose(page);
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      connected = false;
+      gate.resolve();
+      work.resolve();
+      await drain();
+      expectFenced(state);
+      expect(state.queue.busy).toBe(true);
+      expect(lateLines()).toEqual([expect.stringContaining(" outcome=fenced custody=browser_lost ")]);
+    });
+
+    // Cross-family review B1: unknown connectivity is not connectivity. A
+    // context with no Browser handle, or one whose read throws, stays fenced.
+    it.each([
+      ["has no Browser handle", (): unknown => null],
+      ["throws on the Browser read", (): unknown => { throw new Error("private detail"); }],
+    ])("stays fenced when the context %s at proof time", async (_label, browserAtProof) => {
+      const { state, page, session } = fixture();
+      const work = deferred();
+      runInteractionPreflight.mockReturnValue(work.promise);
+      const gate = gateClose(page);
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      Object.assign(session.context, { browser: browserAtProof });
+      gate.resolve();
+      work.resolve();
+      await drain();
+      expectFenced(state);
+      expect(state.queue.busy).toBe(true);
+      expect(state.interaction.failureCode).toBe("interaction_preflight_recovery_required");
+      expect(lateLines()).toEqual([expect.stringContaining(" outcome=fenced custody=browser_lost ")]);
+      expect(logMessages().join("\n")).not.toContain("private detail");
+    });
+
+    it("releases but does not overwrite an interaction status replaced after quarantine", async () => {
+      const { state, page } = fixture();
+      const work = deferred();
+      runInteractionPreflight.mockReturnValue(work.promise);
+      const gate = gateClose(page);
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      const replaced = { state: "degraded" as const, checkedAt: "2026-11-16T00:00:00.000Z", failureCode: "other_owner" };
+      state.slots![0].interaction = replaced;
+      gate.resolve();
+      work.resolve();
+      await drain();
+      expectReleasedOnce(state);
+      expect(state.slots![0].interaction).toBe(replaced);
+      expect(lateLines()).toEqual([expect.stringContaining(" outcome=released custody=held ")]);
+      expect(lateLines()).toEqual([expect.stringContaining(" status=unchanged ")]);
+    });
+
+    it("ends a Pro limit latched before the cancel as degraded pro_usage_limit_reached, never ready", async () => {
+      const { state, page } = fixture();
+      const work = deferred();
+      runInteractionPreflight.mockImplementation((_opts, _session, report) => {
+        report("model", "model-catalogue-read", proLimitFailure);
+        return work.promise;
+      });
+      const gate = gateClose(page);
+      const request = call(state, "POST", "/preflight", body);
+      await quarantine(request);
+      expect(JSON.parse(request.res.writes.join(""))).toMatchObject({
+        code: "interaction_preflight_recovery_required",
+        availableAfter: proLimitFailure.availableAfter,
+        limitText: proLimitFailure.limitText,
+      });
+      gate.resolve();
+      work.reject(new Error("closed during cleanup"));
+      await drain();
+      expectReleasedOnce(state);
+      expect(state.interaction).toMatchObject({ state: "degraded", failureCode: "pro_usage_limit_reached" });
+      expect(lateLines()).toEqual([expect.stringContaining(" status=pro_usage_limit_reached ")]);
+    });
+
+    it("releases after a client disconnect with no response body", async () => {
+      const { state, page } = fixture();
+      const work = deferred();
+      runInteractionPreflight.mockReturnValue(work.promise);
+      const gate = gateClose(page);
+      const request = call(state, "POST", "/preflight", body);
+      await flush();
+      request.res.emit("close");
+      await vi.advanceTimersByTimeAsync(20_000);
+      await request.pending;
+      expect(request.res.writeHead).not.toHaveBeenCalled();
+      expect(request.res.end).not.toHaveBeenCalled();
+      expectFenced(state);
+      expect(quarantineLines()).toEqual([expect.stringContaining(" cause=disconnected ")]);
+      gate.resolve();
+      work.resolve();
+      await drain();
+      expectReleasedOnce(state);
+      expect(state.interaction).toMatchObject({ state: "degraded", failureCode: "interaction_preflight_disconnected" });
+      expect(lateLines()).toEqual([
+        expect.stringContaining(" cause=disconnected status=interaction_preflight_disconnected "),
+      ]);
+      expect(request.res.writes).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("logs only closed, content-free diagnostics and leaves the 409 timing frozen", async () => {
+      let now = 0;
+      const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+      try {
+        const { state, page } = fixture();
+        const work = deferred();
+        let report!: (phase: string, failed?: string, failure?: unknown) => void;
+        runInteractionPreflight.mockImplementation((_opts, _session, observer) => {
+          report = observer;
+          observer("model", "model-catalogue-read", proLimitFailure);
+          return work.promise;
+        });
+        const gate = gateClose(page);
+        const request = call(state, "POST", "/preflight", {
+          ...body, probePrompt: "private prompt", expectedAccountEmail: "private@private.example",
+        });
+        await flush();
+        now = 1_000;
+        report("project-row-wait");
+        now = 290_000;
+        await vi.advanceTimersByTimeAsync(290_000);
+        now = 300_000;
+        await vi.advanceTimersByTimeAsync(20_000);
+        await request.pending;
+        expect(JSON.parse(request.res.writes.join(""))).toMatchObject({
+          code: "interaction_preflight_recovery_required", elapsedMs: 290_000, phaseElapsedMs: 289_000,
+        });
+        const wire = request.res.writes.slice();
+        // After the cancel nothing may move the frozen evidence.
+        report("cleanup-composer", "connector");
+        now = 305_000;
+        gate.resolve();
+        work.reject(new Error("private prompt private@private.example https://private.example/"));
+        await drain();
+        expect(request.res.writes).toEqual(wire);
+        const lines = [...quarantineLines(), ...lateLines()];
+        expect(lines).toEqual([
+          "preflight quarantined slot=0 cause=timeout phase=project-row-wait closure=closing settlement=pending"
+            + " elapsed_ms=290000 phase_elapsed_ms=289000",
+          "preflight late proof slot=0 outcome=released custody=held closure=verified settlement=rejected"
+            + " cause=timeout status=pro_usage_limit_reached since_cancel_ms=15000",
+        ]);
+        for (const line of lines) {
+          expect(line).toMatch(/^preflight (quarantined|late proof) slot=\d+( [a-z_]+=[a-z0-9_-]+)+$/);
+          for (const secret of [
+            "private prompt", "private@private.example", "private.example",
+            proLimitFailure.limitText, proLimitFailure.availableAfter, "g-p-fixture", "fixture",
+          ]) {
+            expect(line).not.toContain(secret);
+          }
+        }
+        expect(vi.getTimerCount()).toBe(0);
+      } finally { clock.mockRestore(); }
+    });
+  });
 });
